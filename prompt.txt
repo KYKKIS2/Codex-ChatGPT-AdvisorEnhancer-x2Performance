@@ -6,7 +6,7 @@ When starting from a fresh clone:
 2. Tell the user to place their ChatGPT HAR file in `vendor\gpt4free\har_and_cookies`.
 3. Start the local g4f API with `.\start-g4f.ps1` on Windows or `./start-g4f.sh` on Ubuntu/Linux.
 4. Restart Codex so it discovers the `external-advisor` skill installed at `%USERPROFILE%\.codex\skills\external-advisor`.
-5. When the user asks for deeper advice, use the `external-advisor` skill.
+5. When the user asks for broader judgment rather than direct coding execution, use the `external-advisor` skill. This includes architecture decisions, what to do next, strategy, planning, tool or model choice, tradeoff analysis, design direction, high-impact recommendations, and important guidance. Do not use it for routine implementation/debugging that Codex can handle directly.
 
 Important behavior:
 
@@ -14,5 +14,6 @@ Important behavior:
 - The local API is expected at `http://localhost:8080/v1`.
 - Conversation state is saved per working directory at `.codex-advisor\conversation.json`.
 - A new Codex session in the same working directory should continue the same ChatGPT advisor chat.
+- The installed skill should be used automatically for broad guidance and judgment questions, not routine coding execution.
 - Do not commit or print HAR contents.
 - Treat advisor output as critique; verify facts before using it.

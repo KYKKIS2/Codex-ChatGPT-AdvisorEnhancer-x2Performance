@@ -1,6 +1,6 @@
 ---
 name: external-advisor
-description: Use when Codex should improve advice, plans, explanations, or important final answers by asking an authorized external reasoning model for second-pass critique through the bundled advisor script. Also use when the user asks to consult ChatGPT Pro, OpenAI API, a local OpenAI-compatible endpoint, or gpt4free/g4f for guidance before answering.
+description: "Use automatically when Codex is asked for broader judgment rather than direct coding execution: architecture decisions, what to do next, strategy, planning, tool or model choice, tradeoff analysis, design direction, high-impact recommendations, or important guidance where a second-pass critique from an external reasoning model would materially improve quality. Do not use for routine implementation/debugging that Codex can handle directly. Also use when the user asks to consult ChatGPT Pro, an external advisor, OpenAI API, a local OpenAI-compatible endpoint, or gpt4free/g4f before answering."
 ---
 
 # External Advisor
@@ -9,9 +9,19 @@ Use this skill as a second-pass critique layer. It does not replace Codex's judg
 
 ## Decision
 
-Use the advisor when the answer is high impact, strategic, ambiguous, user-facing, or when the user explicitly asks for ChatGPT/OpenAI/g4f guidance.
+Use the advisor when the answer is about judgment, direction, architecture, strategy, or tradeoffs rather than direct code execution, or when the user explicitly asks for ChatGPT/OpenAI/g4f guidance.
 
-Skip the advisor for routine code edits, simple terminal answers, fast status updates, or when it would require sending secrets, private keys, proprietary data, or unrelated user files to an external model.
+Default to using it for broad direction and judgment questions, such as:
+
+- "What should I do next?"
+- "Which direction should I take?"
+- "Can you advise me on this?"
+- "What is the better architecture or strategy?"
+- "What should I use for this?"
+- "What are the risks, tradeoffs, and best next steps?"
+- "I am unsure whether this approach is good."
+
+Skip the advisor for routine code edits, implementation work, direct debugging, simple terminal answers, fast status updates, or when it would require sending secrets, private keys, proprietary data, or unrelated user files to an external model.
 
 ## Workflow
 
@@ -47,4 +57,3 @@ python $HOME\.codex\skills\external-advisor\scripts\advisor.py --prompt "Review 
 ```
 
 Read `references/g4f.md` when the user specifically asks about using the local `gpt4free` checkout.
-

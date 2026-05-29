@@ -122,6 +122,14 @@ After setup, restart Codex so it discovers the skill. Then say:
 Use the external advisor for this answer.
 ```
 
+The skill is also configured to trigger automatically for broad judgment questions rather than routine coding execution, for example:
+
+```text
+I am not sure which direction to take. Can you advise me on the best approach and tradeoffs?
+```
+
+Codex should treat architecture, what-to-do-next, strategy, planning, tool/model choice, tradeoff, design direction, and high-impact recommendation questions as a good time to ask the advisor before answering. It should not use the advisor for ordinary implementation/debugging that Codex can handle directly. If you want to guarantee it for a specific message, explicitly say `Use the external advisor`.
+
 The skill uses these defaults:
 
 ```powershell
