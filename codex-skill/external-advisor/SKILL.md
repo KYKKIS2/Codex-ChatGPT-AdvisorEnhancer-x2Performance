@@ -52,7 +52,8 @@ $script = if (Test-Path $configPath) {
 } else {
     (Resolve-Path .\start-g4f.ps1).Path
 }
-Start-Process pwsh -WindowStyle Hidden -ArgumentList @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", $script)
+$shell = if (Get-Command pwsh -ErrorAction SilentlyContinue) { "pwsh" } else { "powershell" }
+Start-Process $shell -WindowStyle Hidden -ArgumentList @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "`"$script`"")
 ```
 
 Then poll `http://localhost:8080/v1/models` for up to 60 seconds before running `scripts/advisor.py`.
