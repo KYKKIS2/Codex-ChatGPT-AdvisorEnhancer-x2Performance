@@ -31,6 +31,12 @@ Use this shape:
 """
 
 
+def configure_stdio() -> None:
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(encoding="utf-8", errors="replace")
+
+
 def read_text(path: str) -> str:
     return Path(path).read_text(encoding="utf-8")
 
@@ -145,6 +151,7 @@ def call_compatible(prompt: str, model: str, timeout: int) -> str:
         "max_tokens": int(os.environ.get("ADVISOR_MAX_OUTPUT_TOKENS", "1800")),
     }
     persist = os.environ.get("ADVISOR_PERSIST_CONVERSATION", "true").lower() in ("1", "true", "yes")
+    conversation = None
     if persist:
         state_path = default_state_path()
         conversation = load_conversation(state_path)
@@ -160,7 +167,16 @@ def call_compatible(prompt: str, model: str, timeout: int) -> str:
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
     }
-    response = post_json(f"{base_url}/chat/completions", payload, headers, timeout)
+    try:
+        response = post_json(f"{base_url}/chat/completions", payload, headers, timeout)
+    except RuntimeError as exc:
+        if persist and conversation and "conversation_deleted" in str(exc):
+            if state_path is not None:
+                state_path.unlink(missing_ok=True)
+            payload.pop("conversation", None)
+            response = post_json(f"{base_url}/chat/completions", payload, headers, timeout)
+        else:
+            raise
     if persist and state_path is not None:
         save_conversation(state_path, response)
     return extract_chat_text(response)
@@ -182,6 +198,7 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> int:
+    configure_stdio()
     args = parse_args()
     prompt = args.prompt if args.prompt is not None else sys.stdin.read()
     prompt = build_prompt(prompt, args.context_file)
@@ -199,4 +216,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
