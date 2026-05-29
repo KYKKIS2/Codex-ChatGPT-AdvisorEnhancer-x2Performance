@@ -52,6 +52,7 @@ The installer will:
 - install Python dependencies
 - apply `patches/gpt4free-advisor.patch`
 - install the Codex skill to `%USERPROFILE%\.codex\skills\external-advisor` on Windows or `${CODEX_HOME:-$HOME/.codex}/skills/external-advisor` on Linux
+- write `advisor-config.json` into the installed skill so Codex knows the exact `start-g4f` script path
 - create `vendor/gpt4free/har_and_cookies`
 
 ## Add Your HAR
@@ -77,6 +78,8 @@ PowerShell:
 ```powershell
 .\start-g4f.ps1
 ```
+
+PowerShell requires the `.\` prefix for scripts in the current folder. `start-g4f.ps1` without `.\` will not run.
 
 Ubuntu/Linux:
 

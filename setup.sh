@@ -8,6 +8,7 @@ G4F="$VENDOR/gpt4free"
 PATCH="$ROOT/patches/gpt4free-advisor.patch"
 SKILL_SOURCE="$ROOT/codex-skill/external-advisor"
 SKILL_DEST="${CODEX_HOME:-$HOME/.codex}/skills/external-advisor"
+SKILL_CONFIG="$SKILL_DEST/advisor-config.json"
 
 mkdir -p "$VENDOR"
 
@@ -31,6 +32,14 @@ mkdir -p "$G4F/har_and_cookies"
 
 mkdir -p "$SKILL_DEST"
 cp -R "$SKILL_SOURCE"/. "$SKILL_DEST"/
+cat > "$SKILL_CONFIG" <<EOF
+{
+  "setup_dir": "$ROOT",
+  "start_g4f": "$ROOT/start-g4f.sh",
+  "base_url": "http://localhost:8080/v1",
+  "model": "gpt-5-thinking"
+}
+EOF
 
 cat <<EOF
 
@@ -40,4 +49,3 @@ Next steps:
 2. Start the local API: ./start-g4f.sh
 3. Restart Codex so it discovers the external-advisor skill.
 EOF
-

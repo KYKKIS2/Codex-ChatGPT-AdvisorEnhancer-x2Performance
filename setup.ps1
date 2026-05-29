@@ -9,6 +9,7 @@ $G4f = Join-Path $Vendor "gpt4free"
 $Patch = Join-Path $Root "patches\gpt4free-advisor.patch"
 $SkillSource = Join-Path $Root "codex-skill\external-advisor"
 $SkillDest = Join-Path $HOME ".codex\skills\external-advisor"
+$SkillConfig = Join-Path $SkillDest "advisor-config.json"
 
 New-Item -ItemType Directory -Force -Path $Vendor | Out-Null
 
@@ -38,6 +39,12 @@ finally {
 
 New-Item -ItemType Directory -Force -Path $SkillDest | Out-Null
 Copy-Item -Recurse -Force -Path (Join-Path $SkillSource "*") -Destination $SkillDest
+@{
+    setup_dir = $Root
+    start_g4f = (Join-Path $Root "start-g4f.ps1")
+    base_url = "http://localhost:8080/v1"
+    model = "gpt-5-thinking"
+} | ConvertTo-Json | Set-Content -Encoding UTF8 -Path $SkillConfig
 
 Write-Host ""
 Write-Host "Setup complete."
@@ -45,4 +52,3 @@ Write-Host "Next steps:"
 Write-Host "1. Put your ChatGPT HAR file in: $G4f\har_and_cookies"
 Write-Host "2. Start the local API: .\start-g4f.ps1"
 Write-Host "3. Restart Codex so it discovers the external-advisor skill."
-

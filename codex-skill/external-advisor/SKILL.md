@@ -29,9 +29,9 @@ Skip the advisor for routine code edits, implementation work, direct debugging, 
 2. If using a local OpenAI-compatible server, set `ADVISOR_PROVIDER=openai-compatible`, `ADVISOR_BASE_URL`, and `ADVISOR_MODEL`.
 3. Before calling the advisor, check whether `http://localhost:8080/v1/models` is reachable.
 4. If it is not reachable, automatically start the local g4f API before continuing:
-   - Prefer `.\start-g4f.ps1` in the current working directory.
-   - Otherwise search parent directories for `start-g4f.ps1`.
-   - If `ADVISOR_SETUP_DIR` is set, also check `$env:ADVISOR_SETUP_DIR\start-g4f.ps1`.
+   - First read `advisor-config.json` from this skill folder and use its `start_g4f` path if present.
+   - If `ADVISOR_SETUP_DIR` is set, check `$env:ADVISOR_SETUP_DIR\start-g4f.ps1`.
+   - Otherwise prefer `.\start-g4f.ps1` in the current working directory, then parent directories.
    - Start it in the background with `Start-Process` and `-WindowStyle Hidden`, then wait until `http://localhost:8080/v1/models` responds.
 5. If using official OpenAI, set `ADVISOR_PROVIDER=openai`, `OPENAI_API_KEY`, and optionally `ADVISOR_MODEL` plus `ADVISOR_REASONING_EFFORT`.
 6. Run `scripts/advisor.py` with `--prompt` or stdin.
@@ -45,7 +45,12 @@ Skip the advisor for routine code edits, implementation work, direct debugging, 
 Use this PowerShell pattern when the local endpoint is down and `start-g4f.ps1` is available:
 
 ```powershell
-$script = Resolve-Path .\start-g4f.ps1
+$configPath = Join-Path $HOME ".codex\skills\external-advisor\advisor-config.json"
+$script = if (Test-Path $configPath) {
+    (Get-Content -Raw $configPath | ConvertFrom-Json).start_g4f
+} else {
+    (Resolve-Path .\start-g4f.ps1).Path
+}
 Start-Process pwsh -WindowStyle Hidden -ArgumentList @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", $script)
 ```
 
