@@ -4,6 +4,8 @@ Portable setup for giving Codex a second-pass ChatGPT/g4f advisor.
 
 The repo installs a Codex skill named `external-advisor`, clones `gpt4free`, applies the small compatibility patch needed for current ChatGPT HAR captures, and provides helper scripts to start and test the local OpenAI-compatible API.
 
+`gpt4free` is not committed into this repository. `setup.ps1` / `setup.sh` download it into `vendor/gpt4free` when you install. This keeps this repo small, avoids copying upstream code into your repo, and makes it easier to update `gpt4free` later.
+
 The HAR file is intentionally not included. It is sensitive authentication material.
 
 ## What This Gives You
@@ -20,13 +22,24 @@ That means new Codex sessions in the same working directory continue the same Ch
 
 ## Install
 
+### Windows
+
 PowerShell:
 
 ```powershell
 .\setup.ps1
 ```
 
-Ubuntu/Linux:
+### Ubuntu/Linux
+
+Install basic prerequisites first:
+
+```bash
+sudo apt update
+sudo apt install -y git python3 python3-pip python3-venv
+```
+
+Then run:
 
 ```bash
 chmod +x setup.sh start-g4f.sh test-advisor.sh
@@ -38,7 +51,7 @@ The installer will:
 - clone `https://github.com/xtekky/gpt4free` into `vendor/gpt4free`
 - install Python dependencies
 - apply `patches/gpt4free-advisor.patch`
-- install the Codex skill to `%USERPROFILE%\.codex\skills\external-advisor`
+- install the Codex skill to `%USERPROFILE%\.codex\skills\external-advisor` on Windows or `${CODEX_HOME:-$HOME/.codex}/skills/external-advisor` on Linux
 - create `vendor/gpt4free/har_and_cookies`
 
 ## Add Your HAR
@@ -47,6 +60,12 @@ Put your ChatGPT HAR file here:
 
 ```text
 vendor\gpt4free\har_and_cookies\
+```
+
+On Ubuntu/Linux the same path is:
+
+```text
+vendor/gpt4free/har_and_cookies/
 ```
 
 Do not commit or share it.
