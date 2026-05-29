@@ -12,6 +12,7 @@ Important behavior:
 
 - The advisor defaults to `gpt-5-thinking` with `reasoning_effort=high`.
 - The local API is expected at `http://localhost:8080/v1`.
+- If the local API is not reachable, automatically start `start-g4f.ps1` in the background, then wait for `http://localhost:8080/v1/models` before calling the advisor.
 - Conversation state is saved per working directory at `.codex-advisor\conversation.json`.
 - A new Codex session in the same working directory should continue the same ChatGPT advisor chat.
 - The installed skill should be used automatically for broad guidance and judgment questions, not routine coding execution.

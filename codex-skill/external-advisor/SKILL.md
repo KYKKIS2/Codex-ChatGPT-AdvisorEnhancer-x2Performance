@@ -27,12 +27,29 @@ Skip the advisor for routine code edits, implementation work, direct debugging, 
 
 1. Gather the smallest useful context: the user's request, draft answer or plan, and only the files or snippets needed for critique.
 2. If using a local OpenAI-compatible server, set `ADVISOR_PROVIDER=openai-compatible`, `ADVISOR_BASE_URL`, and `ADVISOR_MODEL`.
-3. If using official OpenAI, set `ADVISOR_PROVIDER=openai`, `OPENAI_API_KEY`, and optionally `ADVISOR_MODEL` plus `ADVISOR_REASONING_EFFORT`.
-4. Run `scripts/advisor.py` with `--prompt` or stdin.
-5. For local OpenAI-compatible calls, the script persists the returned `conversation` object by default at `.codex-advisor/conversation.json` in the current working directory. Later Codex sessions in the same folder continue the same ChatGPT advisor chat.
-6. Set `ADVISOR_CONVERSATION_KEY` only when multiple advisor chats are needed in the same folder; keyed state is stored under `%USERPROFILE%\.codex\external-advisor`.
-7. Set `ADVISOR_TEMPORARY=true` for throwaway ChatGPT chats, or `ADVISOR_PERSIST_CONVERSATION=false` to avoid local continuation state.
-8. Treat the result as advisory. Verify facts, reject weak advice, and incorporate only the parts that improve the final answer.
+3. Before calling the advisor, check whether `http://localhost:8080/v1/models` is reachable.
+4. If it is not reachable, automatically start the local g4f API before continuing:
+   - Prefer `.\start-g4f.ps1` in the current working directory.
+   - Otherwise search parent directories for `start-g4f.ps1`.
+   - If `ADVISOR_SETUP_DIR` is set, also check `$env:ADVISOR_SETUP_DIR\start-g4f.ps1`.
+   - Start it in the background with `Start-Process` and `-WindowStyle Hidden`, then wait until `http://localhost:8080/v1/models` responds.
+5. If using official OpenAI, set `ADVISOR_PROVIDER=openai`, `OPENAI_API_KEY`, and optionally `ADVISOR_MODEL` plus `ADVISOR_REASONING_EFFORT`.
+6. Run `scripts/advisor.py` with `--prompt` or stdin.
+7. For local OpenAI-compatible calls, the script persists the returned `conversation` object by default at `.codex-advisor/conversation.json` in the current working directory. Later Codex sessions in the same folder continue the same ChatGPT advisor chat.
+8. Set `ADVISOR_CONVERSATION_KEY` only when multiple advisor chats are needed in the same folder; keyed state is stored under `%USERPROFILE%\.codex\external-advisor`.
+9. Set `ADVISOR_TEMPORARY=true` for throwaway ChatGPT chats, or `ADVISOR_PERSIST_CONVERSATION=false` to avoid local continuation state.
+10. Treat the result as advisory. Verify facts, reject weak advice, and incorporate only the parts that improve the final answer.
+
+## Auto-Start Command
+
+Use this PowerShell pattern when the local endpoint is down and `start-g4f.ps1` is available:
+
+```powershell
+$script = Resolve-Path .\start-g4f.ps1
+Start-Process pwsh -WindowStyle Hidden -ArgumentList @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", $script)
+```
+
+Then poll `http://localhost:8080/v1/models` for up to 60 seconds before running `scripts/advisor.py`.
 
 ## Commands
 

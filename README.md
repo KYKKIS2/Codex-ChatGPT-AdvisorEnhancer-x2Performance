@@ -130,6 +130,8 @@ I am not sure which direction to take. Can you advise me on the best approach an
 
 Codex should treat architecture, what-to-do-next, strategy, planning, tool/model choice, tradeoff, design direction, and high-impact recommendation questions as a good time to ask the advisor before answering. It should not use the advisor for ordinary implementation/debugging that Codex can handle directly. If you want to guarantee it for a specific message, explicitly say `Use the external advisor`.
 
+If the local advisor API is not already running, the skill tells Codex to start `start-g4f.ps1` automatically in the background, then wait for `http://localhost:8080/v1/models` before asking the advisor.
+
 The skill uses these defaults:
 
 ```powershell
