@@ -2,9 +2,9 @@ Use this repository to install and use the Codex external ChatGPT advisor.
 
 When starting from a fresh clone:
 
-1. Run `.\setup.ps1`.
+1. On Windows, run `.\setup.ps1`. On Ubuntu/Linux, run `chmod +x setup.sh start-g4f.sh test-advisor.sh && ./setup.sh`.
 2. Tell the user to place their ChatGPT HAR file in `vendor\gpt4free\har_and_cookies`.
-3. Start the local g4f API with `.\start-g4f.ps1`.
+3. Start the local g4f API with `.\start-g4f.ps1` on Windows or `./start-g4f.sh` on Ubuntu/Linux.
 4. Restart Codex so it discovers the `external-advisor` skill installed at `%USERPROFILE%\.codex\skills\external-advisor`.
 5. When the user asks for deeper advice, use the `external-advisor` skill.
 
@@ -16,4 +16,3 @@ Important behavior:
 - A new Codex session in the same working directory should continue the same ChatGPT advisor chat.
 - Do not commit or print HAR contents.
 - Treat advisor output as critique; verify facts before using it.
-

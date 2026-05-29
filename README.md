@@ -20,10 +20,17 @@ That means new Codex sessions in the same working directory continue the same Ch
 
 ## Install
 
-Open PowerShell in this repo:
+PowerShell:
 
 ```powershell
 .\setup.ps1
+```
+
+Ubuntu/Linux:
+
+```bash
+chmod +x setup.sh start-g4f.sh test-advisor.sh
+./setup.sh
 ```
 
 The installer will:
@@ -46,8 +53,16 @@ Do not commit or share it.
 
 ## Start The Local API
 
+PowerShell:
+
 ```powershell
 .\start-g4f.ps1
+```
+
+Ubuntu/Linux:
+
+```bash
+./start-g4f.sh
 ```
 
 Default model:
@@ -62,6 +77,10 @@ You can override it:
 .\start-g4f.ps1 -Model gpt-5-5-pro
 ```
 
+```bash
+./start-g4f.sh gpt-5-5-pro
+```
+
 Note: `gpt-5-thinking` returned final API text in testing. `gpt-5-5-pro` triggered ChatGPT thinking in the browser but may return only a thinking marker through the API.
 
 ## Test The Advisor
@@ -70,6 +89,10 @@ With `start-g4f.ps1` still running in another terminal:
 
 ```powershell
 .\test-advisor.ps1
+```
+
+```bash
+./test-advisor.sh
 ```
 
 ## Use From Codex
@@ -113,4 +136,3 @@ or set a different `ADVISOR_CONVERSATION_KEY`.
 - Do not commit `vendor/gpt4free/har_and_cookies`.
 - Do not use this to bypass access controls or share private session material.
 - Treat advisor output as critique, not ground truth.
-
