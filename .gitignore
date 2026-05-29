@@ -1,0 +1,9 @@
+vendor/
+har_and_cookies/
+.codex-advisor/
+*.har
+*.cookie.json
+__pycache__/
+*.pyc
+.env
+

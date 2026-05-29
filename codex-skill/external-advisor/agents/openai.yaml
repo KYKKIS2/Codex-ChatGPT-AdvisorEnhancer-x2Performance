@@ -1,0 +1,4 @@
+display_name: External Advisor
+short_description: Ask ChatGPT or another model for answer guidance.
+default_prompt: Use external advisor guidance to improve this answer.
+

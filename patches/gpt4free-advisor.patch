@@ -1,0 +1,54 @@
+diff --git a/g4f/Provider/openai/har_file.py b/g4f/Provider/openai/har_file.py
+index 98cbd139..c5fb9556 100644
+--- a/g4f/Provider/openai/har_file.py
++++ b/g4f/Provider/openai/har_file.py
+@@ -77,19 +77,19 @@ def readHAR(request_config: RequestConfig):
+                             request_config.access_token = match.group(1)
+                     except KeyError:
+                         pass
+-                    try:
+-                        if "openai-sentinel-proof-token" in v_headers:
+-                            request_config.headers = v_headers
++                    if "authorization" in v_headers:
++                        request_config.access_token = v_headers["authorization"].split(" ")[1]
++                    if v.get("request", {}).get("cookies"):
++                        request_config.cookies = {c['name']: c['value'] for c in v['request']['cookies']}
++                    if "openai-sentinel-turnstile-token" in v_headers:
++                        request_config.turnstile_token = v_headers["openai-sentinel-turnstile-token"]
++                    if "openai-sentinel-proof-token" in v_headers:
++                        try:
+                             request_config.proof_token = json.loads(base64.b64decode(
+                                 v_headers["openai-sentinel-proof-token"].split("gAAAAAB", 1)[-1].encode()
+                             ).decode())
+-                        if "openai-sentinel-turnstile-token" in v_headers:
+-                            request_config.turnstile_token = v_headers["openai-sentinel-turnstile-token"]
+-                        if "authorization" in v_headers:
+-                            request_config.access_token = v_headers["authorization"].split(" ")[1]
+-                        request_config.cookies = {c['name']: c['value'] for c in v['request']['cookies']}
+-                    except Exception as e:
+-                        debug.log(f"Error on read headers: {e}")
++                        except Exception as e:
++                            debug.log(f"Could not decode proof token from HAR; using generated proof token fallback: {e}")
+ 
+ def get_headers(entry) -> dict:
+     return {h['name'].lower(): h['value'] for h in entry['request']['headers'] if h['name'].lower() not in ['content-length', 'cookie'] and not h['name'].startswith(':')}
+@@ -158,5 +158,5 @@ async def get_request_config(request_config: RequestConfig, proxy: str) -> Reque
+     if request_config.arkose_request is not None:
+         request_config.arkose_token = await sendRequest(genArkReq(request_config.arkose_request), proxy)
+     if request_config.proof_token is None:
+-        raise NoValidHarFileError("No proof_token found in .har files")
++        debug.log("No decoded proof_token found in .har files; using generated proof token fallback")
+     return request_config
+diff --git a/g4f/api/stubs.py b/g4f/api/stubs.py
+index 662609dc..c495d082 100644
+--- a/g4f/api/stubs.py
++++ b/g4f/api/stubs.py
+@@ -50,6 +50,7 @@ class RequestConfig(BaseModel):
+     download_media: bool = False
+     raw: bool = False
+     extra_body: Optional[dict] = None
++    temporary: Optional[bool] = None
+     # When set (or when env G4F_TOOL_EMULATION=1), the server will attempt to
+     # emulate OpenAI tool_calls for providers that don't support tools natively.
+     tool_emulation: Optional[bool] = None
+
