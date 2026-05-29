@@ -8,8 +8,17 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 G4F="$ROOT/vendor/gpt4free"
 
 if [[ ! -d "$G4F/g4f" ]]; then
-  echo "gpt4free is not installed. Run ./setup.sh first." >&2
-  exit 1
+  SETUP="$ROOT/setup.sh"
+  if [[ ! -f "$SETUP" ]]; then
+    echo "gpt4free is not installed and setup.sh was not found." >&2
+    exit 1
+  fi
+  echo "gpt4free is not installed. Running setup.sh first..."
+  "$SETUP"
+  if [[ ! -d "$G4F/g4f" ]]; then
+    echo "setup.sh completed but gpt4free is still missing at $G4F" >&2
+    exit 1
+  fi
 fi
 
 export G4F_PROVIDER="$PROVIDER"
@@ -21,4 +30,3 @@ echo "Model: $MODEL"
 
 cd "$G4F"
 python3 -m g4f api --port "$PORT" --debug
-

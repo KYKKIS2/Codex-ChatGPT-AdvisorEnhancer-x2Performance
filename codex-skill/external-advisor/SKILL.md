@@ -32,6 +32,7 @@ Skip the advisor for routine code edits, implementation work, direct debugging, 
    - First read `advisor-config.json` from this skill folder and use its `start_g4f` path if present.
    - If `ADVISOR_SETUP_DIR` is set, check `$env:ADVISOR_SETUP_DIR\start-g4f.ps1`.
    - Otherwise prefer `.\start-g4f.ps1` in the current working directory, then parent directories.
+   - The starter script should install `vendor/gpt4free` automatically by running setup if it is missing.
    - Start it in the background with `Start-Process` and `-WindowStyle Hidden`, then wait until `http://localhost:8080/v1/models` responds.
 5. If using official OpenAI, set `ADVISOR_PROVIDER=openai`, `OPENAI_API_KEY`, and optionally `ADVISOR_MODEL` plus `ADVISOR_REASONING_EFFORT`.
 6. Run `scripts/advisor.py` with `--prompt` or stdin.

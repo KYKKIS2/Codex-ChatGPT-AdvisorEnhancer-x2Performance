@@ -9,7 +9,15 @@ $Root = Split-Path -Parent $MyInvocation.MyCommand.Path
 $G4f = Join-Path $Root "vendor\gpt4free"
 
 if (-not (Test-Path (Join-Path $G4f "g4f"))) {
-    throw "gpt4free is not installed. Run .\setup.ps1 first."
+    $Setup = Join-Path $Root "setup.ps1"
+    if (-not (Test-Path $Setup)) {
+        throw "gpt4free is not installed and setup.ps1 was not found."
+    }
+    Write-Host "gpt4free is not installed. Running setup.ps1 first..."
+    & $Setup
+    if (-not (Test-Path (Join-Path $G4f "g4f"))) {
+        throw "setup.ps1 completed but gpt4free is still missing at $G4f"
+    }
 }
 
 if ([string]::IsNullOrWhiteSpace($Model)) {
@@ -34,4 +42,3 @@ try {
 finally {
     Pop-Location
 }
-

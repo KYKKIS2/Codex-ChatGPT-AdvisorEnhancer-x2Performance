@@ -81,6 +81,8 @@ PowerShell:
 
 PowerShell requires the `.\` prefix for scripts in the current folder. `start-g4f.ps1` without `.\` will not run.
 
+If `vendor/gpt4free` is missing, `start-g4f.ps1` / `start-g4f.sh` will run setup automatically before starting the API.
+
 Ubuntu/Linux:
 
 ```bash
