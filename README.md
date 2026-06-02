@@ -8,6 +8,23 @@ The repo installs a Codex skill named `external-advisor`, clones `gpt4free`, app
 
 The HAR file is intentionally not included. It is sensitive authentication material.
 
+## Official Integration Idea
+
+This repository is a prototype of the workflow, not the ideal production design.
+
+The useful idea is not `g4f` itself. The useful idea is giving Codex an optional project-scoped advisor mode that can consult a stronger reasoning model before answering broad judgment questions such as architecture, strategy, planning, tradeoffs, model/tool choice, and what to do next.
+
+For a real Codex upgrade, OpenAI could replace the local `g4f`/HAR layer with official Codex/OpenAI-managed access to the appropriate reasoning model. In that version, Codex would not need browser HAR files, copied cookies, or local session material. It could instead use official authentication, policy controls, privacy boundaries, and project-scoped advisor memory.
+
+In other words, this repo demonstrates the behavior:
+
+```text
+Codex session for project A <-> advisor reasoning thread for project A
+Codex session for project B <-> advisor reasoning thread for project B
+```
+
+The production version should implement that behavior through official OpenAI infrastructure rather than through `g4f`.
+
 ## What This Gives You
 
 - Codex can ask a local ChatGPT-backed advisor before finalizing important answers.
