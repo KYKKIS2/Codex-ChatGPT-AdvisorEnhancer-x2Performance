@@ -51,4 +51,21 @@ index 662609dc..c495d082 100644
      # When set (or when env G4F_TOOL_EMULATION=1), the server will attempt to
      # emulate OpenAI tool_calls for providers that don't support tools natively.
      tool_emulation: Optional[bool] = None
-
+diff --git a/g4f/Provider/needs_auth/OpenaiChat.py b/g4f/Provider/needs_auth/OpenaiChat.py
+index 9f3e0a1d..dfef1c9a 100644
+--- a/g4f/Provider/needs_auth/OpenaiChat.py
++++ b/g4f/Provider/needs_auth/OpenaiChat.py
+@@ -452,8 +452,12 @@ class OpenaiChat(AsyncGeneratorProvider, ProviderModelMixin):
+                 else:
+                     conversation_mode = {"kind": "primary_assistant"}
+ 
+-            if getattr(auth_result, "cookies", {}).get("oai-did") != getattr(conversation, "user_id", None):
+-                conversation = Conversation(None, str(uuid.uuid4()))
++            current_user_id = getattr(auth_result, "cookies", {}).get("oai-did")
++            if getattr(conversation, "user_id", None) is None:
++                conversation.user_id = current_user_id
++            elif current_user_id != conversation.user_id:
++                conversation = Conversation(None, str(uuid.uuid4()), current_user_id)
+             if cls._api_key is None:
+                 auto_continue = False
+             conversation.finish_reason = None
