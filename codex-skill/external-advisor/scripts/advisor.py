@@ -77,6 +77,24 @@ def post_json(url: str, payload: dict[str, Any], headers: dict[str, str], timeou
         raise RuntimeError(f"Non-JSON response from {url}: {body[:500]}") from exc
 
 
+def get_json(url: str, headers: dict[str, str], timeout: int) -> dict[str, Any]:
+    request = urllib.request.Request(url, headers=headers, method="GET")
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            body = response.read().decode("utf-8")
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")
+        detail = redact_sensitive(detail)
+        raise RuntimeError(f"HTTP {exc.code} from {url}: {detail}") from exc
+    except urllib.error.URLError as exc:
+        raise RuntimeError(f"Could not reach {url}: {exc.reason}") from exc
+
+    try:
+        return json.loads(body)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"Non-JSON response from {url}: {body[:500]}") from exc
+
+
 def extract_responses_text(response: dict[str, Any]) -> str:
     output_text = response.get("output_text")
     if isinstance(output_text, str):
@@ -107,6 +125,14 @@ def default_state_path() -> Path:
     return Path.cwd() / ".codex-advisor" / "conversation.json"
 
 
+def transcript_json_path(state_path: Path) -> Path:
+    return state_path.with_name("transcript.json")
+
+
+def transcript_md_path(state_path: Path) -> Path:
+    return state_path.with_name("transcript.md")
+
+
 def load_conversation(path: Path) -> dict[str, Any] | None:
     if not path.exists():
         return None
@@ -124,6 +150,193 @@ def save_conversation(path: Path, response: dict[str, Any]) -> None:
         return
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps({"conversation": conversation}, indent=2), encoding="utf-8")
+
+
+def read_skill_config() -> dict[str, Any]:
+    config_path = Path(__file__).resolve().parents[1] / "advisor-config.json"
+    if not config_path.exists():
+        return {}
+    try:
+        return json.loads(config_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return {}
+
+
+def setup_dir_from_config() -> Path | None:
+    explicit = os.environ.get("ADVISOR_SETUP_DIR")
+    if explicit:
+        return Path(explicit)
+    config = read_skill_config()
+    setup_dir = config.get("setup_dir")
+    return Path(setup_dir) if isinstance(setup_dir, str) and setup_dir else None
+
+
+def auth_file_path() -> Path | None:
+    explicit = os.environ.get("ADVISOR_AUTH_FILE")
+    if explicit:
+        return Path(explicit)
+    setup_dir = setup_dir_from_config()
+    if not setup_dir:
+        return None
+    return setup_dir / "vendor" / "gpt4free" / "har_and_cookies" / "auth_OpenaiChat.json"
+
+
+def cookie_header(cookies: dict[str, Any]) -> str:
+    return "; ".join(f"{name}={value}" for name, value in cookies.items() if value is not None)
+
+
+def load_chatgpt_auth() -> dict[str, Any] | None:
+    path = auth_file_path()
+    if not path or not path.exists():
+        return None
+    try:
+        auth = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return None
+    api_key = auth.get("api_key")
+    cookies = auth.get("cookies")
+    if not isinstance(api_key, str) or not isinstance(cookies, dict):
+        return None
+    headers = auth.get("headers") if isinstance(auth.get("headers"), dict) else {}
+    safe_headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Cookie": cookie_header(cookies),
+        "Accept": "application/json",
+        "User-Agent": headers.get("user-agent", "Mozilla/5.0"),
+    }
+    return {"headers": safe_headers, "user_id": cookies.get("oai-did")}
+
+
+def message_text(message: dict[str, Any]) -> str:
+    content = message.get("content") or {}
+    parts = content.get("parts") or []
+    texts: list[str] = []
+    for part in parts:
+        if isinstance(part, str):
+            texts.append(part)
+        elif isinstance(part, dict):
+            if isinstance(part.get("text"), str):
+                texts.append(part["text"])
+            elif isinstance(part.get("content"), str):
+                texts.append(part["content"])
+    return "\n".join(text for text in texts if text)
+
+
+def ordered_nodes(conversation_data: dict[str, Any]) -> list[dict[str, Any]]:
+    mapping = conversation_data.get("mapping")
+    if not isinstance(mapping, dict):
+        return []
+    current = conversation_data.get("current_node") or conversation_data.get("current_node_id")
+    if not current:
+        candidates = [
+            node for node in mapping.values()
+            if isinstance(node, dict) and isinstance(node.get("message"), dict)
+        ]
+        candidates.sort(key=lambda node: node.get("message", {}).get("create_time") or 0)
+        return candidates
+
+    nodes: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    while current and current not in seen:
+        seen.add(current)
+        node = mapping.get(current)
+        if not isinstance(node, dict):
+            break
+        nodes.append(node)
+        current = node.get("parent")
+    nodes.reverse()
+    return nodes
+
+
+def transcript_from_conversation(conversation_data: dict[str, Any]) -> list[dict[str, Any]]:
+    transcript: list[dict[str, Any]] = []
+    for node in ordered_nodes(conversation_data):
+        message = node.get("message")
+        if not isinstance(message, dict):
+            continue
+        role = (message.get("author") or {}).get("role")
+        text = message_text(message).strip()
+        if role not in {"user", "assistant", "tool"} or not text:
+            continue
+        transcript.append({
+            "id": message.get("id") or node.get("id"),
+            "role": role,
+            "create_time": message.get("create_time"),
+            "status": message.get("status"),
+            "content": text,
+        })
+    return transcript
+
+
+def latest_message_id(conversation_data: dict[str, Any], transcript: list[dict[str, Any]]) -> str | None:
+    current = conversation_data.get("current_node") or conversation_data.get("current_node_id")
+    mapping = conversation_data.get("mapping")
+    if isinstance(current, str) and isinstance(mapping, dict):
+        node = mapping.get(current)
+        if isinstance(node, dict):
+            message = node.get("message")
+            if isinstance(message, dict) and isinstance(message.get("id"), str):
+                return message["id"]
+        return current
+    if transcript:
+        value = transcript[-1].get("id")
+        return value if isinstance(value, str) else None
+    return None
+
+
+def write_transcript(state_path: Path, conversation_data: dict[str, Any], transcript: list[dict[str, Any]]) -> None:
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "conversation_id": conversation_data.get("conversation_id"),
+        "title": conversation_data.get("title"),
+        "current_node": conversation_data.get("current_node") or conversation_data.get("current_node_id"),
+        "messages": transcript,
+    }
+    transcript_json_path(state_path).write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+    lines = [
+        f"# Advisor Transcript",
+        "",
+        f"Conversation ID: {payload.get('conversation_id') or ''}",
+        f"Title: {payload.get('title') or ''}",
+        "",
+    ]
+    for item in transcript:
+        role = str(item["role"]).title()
+        lines.extend([f"## {role}", "", str(item["content"]).strip(), ""])
+    transcript_md_path(state_path).write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
+
+
+def sync_remote_conversation(state_path: Path, conversation: dict[str, Any] | None, timeout: int) -> dict[str, Any] | None:
+    if not conversation:
+        return conversation
+    conversation_id = conversation.get("conversation_id")
+    if not isinstance(conversation_id, str) or not conversation_id:
+        return conversation
+    auth = load_chatgpt_auth()
+    if not auth:
+        return conversation
+    url = f"https://chatgpt.com/backend-api/conversation/{conversation_id}"
+    try:
+        conversation_data = get_json(url, auth["headers"], timeout)
+    except RuntimeError as exc:
+        if os.environ.get("ADVISOR_SYNC_STRICT", "false").lower() in ("1", "true", "yes"):
+            raise
+        print(f"Advisor remote sync skipped: {redact_sensitive(str(exc))}", file=sys.stderr)
+        return conversation
+
+    transcript = transcript_from_conversation(conversation_data)
+    latest_id = latest_message_id(conversation_data, transcript)
+    if latest_id:
+        conversation["message_id"] = latest_id
+        conversation["parent_message_id"] = latest_id
+    if auth.get("user_id"):
+        conversation["user_id"] = auth["user_id"]
+    conversation["conversation_id"] = conversation_id
+    write_transcript(state_path, conversation_data, transcript)
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    state_path.write_text(json.dumps({"conversation": conversation}, indent=2), encoding="utf-8")
+    return conversation
 
 
 def build_prompt(prompt: str, context_files: list[str]) -> str:
@@ -169,15 +382,19 @@ def call_compatible(prompt: str, model: str, timeout: int) -> str:
         "max_tokens": int(os.environ.get("ADVISOR_MAX_OUTPUT_TOKENS", "1800")),
     }
     persist = os.environ.get("ADVISOR_PERSIST_CONVERSATION", "true").lower() in ("1", "true", "yes")
+    temporary = os.environ.get("ADVISOR_TEMPORARY", "false").lower() in ("1", "true", "yes")
+    sync_remote = os.environ.get("ADVISOR_SYNC_REMOTE", "true").lower() in ("1", "true", "yes")
     conversation = None
     if persist:
         state_path = default_state_path()
         conversation = load_conversation(state_path)
+        if sync_remote and not temporary:
+            conversation = sync_remote_conversation(state_path, conversation, timeout)
         if conversation:
             payload["conversation"] = conversation
     else:
         state_path = None
-    if os.environ.get("ADVISOR_TEMPORARY", "false").lower() in ("1", "true", "yes"):
+    if temporary:
         payload["temporary"] = True
     if reasoning_effort:
         payload["reasoning_effort"] = reasoning_effort
@@ -197,6 +414,8 @@ def call_compatible(prompt: str, model: str, timeout: int) -> str:
             raise
     if persist and state_path is not None:
         save_conversation(state_path, response)
+        if sync_remote and not temporary:
+            sync_remote_conversation(state_path, load_conversation(state_path), timeout)
     return extract_chat_text(response)
 
 

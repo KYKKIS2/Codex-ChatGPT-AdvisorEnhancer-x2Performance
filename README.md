@@ -37,6 +37,15 @@ The production version should implement that behavior through official OpenAI in
 
 That means new Codex sessions in the same working directory continue the same ChatGPT advisor chat.
 
+When possible, the advisor also syncs the latest online ChatGPT advisor thread before and after each persistent call, then writes:
+
+```text
+<your project>\.codex-advisor\transcript.json
+<your project>\.codex-advisor\transcript.md
+```
+
+That lets Codex inspect advisor messages you added directly on `chatgpt.com`, as long as the same saved `conversation_id` and current HAR/session can still access that chat.
+
 ## Install
 
 ### Windows
@@ -164,6 +173,20 @@ $env:ADVISOR_REASONING_EFFORT = "high"
 ```
 
 For one persistent advisor chat per project, do not set `ADVISOR_CONVERSATION_KEY`. The conversation state is saved in the working directory.
+
+The local advisor state files are:
+
+```text
+.codex-advisor\conversation.json   # continuation state
+.codex-advisor\transcript.json     # synced structured transcript
+.codex-advisor\transcript.md       # synced readable transcript
+```
+
+Remote transcript sync is enabled by default for persistent local advisor calls. To skip it for one call:
+
+```powershell
+$env:ADVISOR_SYNC_REMOTE = "false"
+```
 
 For multiple separate advisor chats inside the same project, set:
 

@@ -37,9 +37,11 @@ Skip the advisor for routine code edits, implementation work, direct debugging, 
 5. If using official OpenAI, set `ADVISOR_PROVIDER=openai`, `OPENAI_API_KEY`, and optionally `ADVISOR_MODEL` plus `ADVISOR_REASONING_EFFORT`.
 6. Run `scripts/advisor.py` with `--prompt` or stdin.
 7. For local OpenAI-compatible calls, the script persists the returned `conversation` object by default at `.codex-advisor/conversation.json` in the current working directory. Later Codex sessions in the same folder continue the same ChatGPT advisor chat.
-8. Set `ADVISOR_CONVERSATION_KEY` only when multiple advisor chats are needed in the same folder; keyed state is stored under `%USERPROFILE%\.codex\external-advisor`.
-9. Set `ADVISOR_TEMPORARY=true` for throwaway ChatGPT chats, or `ADVISOR_PERSIST_CONVERSATION=false` to avoid local continuation state.
-10. Treat the result as advisory. Verify facts, reject weak advice, and incorporate only the parts that improve the final answer.
+8. Before and after each persistent local advisor call, the script syncs the remote ChatGPT conversation when possible and writes `.codex-advisor/transcript.json` plus `.codex-advisor/transcript.md`. Codex may inspect those files when it needs the advisor chat history.
+9. Set `ADVISOR_CONVERSATION_KEY` only when multiple advisor chats are needed in the same folder; keyed state is stored under `%USERPROFILE%\.codex\external-advisor`.
+10. Set `ADVISOR_TEMPORARY=true` for throwaway ChatGPT chats, or `ADVISOR_PERSIST_CONVERSATION=false` to avoid local continuation state.
+11. Set `ADVISOR_SYNC_REMOTE=false` to skip transcript sync for a call.
+12. Treat the result as advisory. Verify facts, reject weak advice, and incorporate only the parts that improve the final answer.
 
 ## Auto-Start Command
 
