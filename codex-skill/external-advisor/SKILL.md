@@ -67,7 +67,7 @@ Local OpenAI-compatible endpoint:
 ```powershell
 $env:ADVISOR_PROVIDER = "openai-compatible"
 $env:ADVISOR_BASE_URL = "http://localhost:8080/v1"
-$env:ADVISOR_MODEL = "gpt-5-thinking"
+$env:ADVISOR_MODEL = "gpt-5-5-thinking"
 $env:ADVISOR_REASONING_EFFORT = "high"
 python $HOME\.codex\skills\external-advisor\scripts\advisor.py --prompt "Review this draft answer: ..."
 ```

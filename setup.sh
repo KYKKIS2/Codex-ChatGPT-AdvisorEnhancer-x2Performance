@@ -37,7 +37,7 @@ cat > "$SKILL_CONFIG" <<EOF
   "setup_dir": "$ROOT",
   "start_g4f": "$ROOT/start-g4f.sh",
   "base_url": "http://localhost:8080/v1",
-  "model": "gpt-5-thinking"
+  "model": "gpt-5-5-thinking"
 }
 EOF
 

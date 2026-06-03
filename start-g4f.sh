@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-MODEL="${1:-${G4F_MODEL:-gpt-5-thinking}}"
+MODEL="${1:-${G4F_MODEL:-gpt-5-5-thinking}}"
 PROVIDER="${G4F_PROVIDER:-OpenaiAccount}"
 PORT="${G4F_PORT:-8080}"
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

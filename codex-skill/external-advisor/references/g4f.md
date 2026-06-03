@@ -19,7 +19,7 @@ Recommended local settings:
 ```powershell
 $env:ADVISOR_PROVIDER = "openai-compatible"
 $env:ADVISOR_BASE_URL = "http://localhost:8080/v1"
-$env:ADVISOR_MODEL = "gpt-5-thinking"
+$env:ADVISOR_MODEL = "gpt-5-5-thinking"
 $env:ADVISOR_REASONING_EFFORT = "high"
 ```
 
@@ -34,4 +34,3 @@ Boundary:
 - Do not commit or print HAR/cookie contents.
 - Do not assume local `g4f` behavior exactly matches official OpenAI API behavior.
 - Treat external output as advisory critique and verify important claims.
-

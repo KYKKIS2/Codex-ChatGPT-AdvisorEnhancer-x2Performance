@@ -1,5 +1,5 @@
 param(
-    [string]$Model = "gpt-5-thinking",
+    [string]$Model = "gpt-5-5-thinking",
     [int]$Port = 8080
 )
 
@@ -14,4 +14,3 @@ $env:ADVISOR_REASONING_EFFORT = "high"
 $env:ADVISOR_MAX_OUTPUT_TOKENS = "500"
 
 python $Advisor --prompt "Smoke test. Reply with ADVISOR_SETUP_OK and one short sentence."
-

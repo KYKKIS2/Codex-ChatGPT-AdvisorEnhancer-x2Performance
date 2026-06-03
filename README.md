@@ -118,7 +118,7 @@ Ubuntu/Linux:
 Default model:
 
 ```text
-gpt-5-thinking
+gpt-5-5-thinking
 ```
 
 You can override it:
@@ -131,7 +131,7 @@ You can override it:
 ./start-g4f.sh gpt-5-5-pro
 ```
 
-Note: `gpt-5-thinking` returned final API text in testing. `gpt-5-5-pro` triggered ChatGPT thinking in the browser but may return only a thinking marker through the API.
+Note: `gpt-5-5-thinking` returned final API text in testing. `gpt-5-5-pro` triggered ChatGPT thinking in the browser but may return only a thinking marker through the API.
 
 ## Test The Advisor
 
@@ -168,7 +168,7 @@ The skill uses these defaults:
 ```powershell
 $env:ADVISOR_PROVIDER = "openai-compatible"
 $env:ADVISOR_BASE_URL = "http://localhost:8080/v1"
-$env:ADVISOR_MODEL = "gpt-5-thinking"
+$env:ADVISOR_MODEL = "gpt-5-5-thinking"
 $env:ADVISOR_REASONING_EFFORT = "high"
 ```
 

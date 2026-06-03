@@ -423,7 +423,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--prompt", help="Prompt, question, draft, or plan. Reads stdin when omitted.")
     parser.add_argument("--context-file", action="append", default=[], help="Additional UTF-8 context file.")
-    parser.add_argument("--model", default=os.environ.get("ADVISOR_MODEL", "gpt-5-thinking"))
+    parser.add_argument("--model", default=os.environ.get("ADVISOR_MODEL", "gpt-5-5-thinking"))
     parser.add_argument(
         "--provider",
         choices=["openai", "openai-compatible"],

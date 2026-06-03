@@ -10,7 +10,7 @@ When starting from a fresh clone:
 
 Important behavior:
 
-- The advisor defaults to `gpt-5-thinking` with `reasoning_effort=high`.
+- The advisor defaults to `gpt-5-5-thinking` with `reasoning_effort=high`.
 - The local API is expected at `http://localhost:8080/v1`.
 - If the local API is not reachable, automatically start `start-g4f.ps1` in the background, then wait for `http://localhost:8080/v1/models` before calling the advisor.
 - Prefer the exact script path stored in `%USERPROFILE%\.codex\skills\external-advisor\advisor-config.json` or `${CODEX_HOME:-$HOME/.codex}/skills/external-advisor/advisor-config.json`; this is written by setup.
