@@ -12,6 +12,7 @@ This repo prototypes a simple idea:
 Codex handles execution.
 GPT-5.5 Thinking acts as a second-pass advisor.
 Each project keeps its own advisor memory.
+Hard tasks can escalate into a small advisor conclave.
 ```
 
 The result is a Codex workflow that feels sharper on high-impact decisions without slowing down routine implementation work.
@@ -41,6 +42,10 @@ It is intentionally not meant for every small bug fix. Codex should still handle
 - Persists one advisor conversation per working directory.
 - Syncs the online ChatGPT advisor chat before and after each persistent advisor call.
 - Writes local transcript files Codex can inspect later.
+- Adds optional conclave mode with role-specific planner, critic, security, verifier, and synthesis advisors.
+- Adds an advisor router for no-advisor, single-advisor, conclave, verifier, and machine-json verifier paths.
+- Adds critique-before-final mode for important answers.
+- Adds a verifier loop that asks what evidence to gather, runs safe local commands, then asks the verifier to interpret the actual output.
 - Lets you explicitly say `Use the external advisor` when you want a second opinion.
 
 Project-local memory looks like this:
@@ -51,6 +56,11 @@ your-project/
     conversation.json   # continuation state
     transcript.json     # synced structured transcript
     transcript.md       # readable synced transcript
+    roles/              # optional conclave role memories
+    conclave-runs/      # saved multi-advisor runs
+    verifier-runs/      # saved evidence-backed verifier loops
+    latest-conclave.md  # latest conclave synthesis
+    latest-verifier-loop.md
 ```
 
 That means:
@@ -81,12 +91,20 @@ An official Codex version could replace the local `g4f`/HAR layer with OpenAI-ma
 This repo currently uses:
 
 - Codex skill: `external-advisor`
-- Local API: `http://localhost:8080/v1`
+- Local API: `http://127.0.0.1:8080/v1`
 - Provider: `OpenaiAccount`
 - Default model: `gpt-5-5-thinking`
 - Reasoning effort: `high`
 - Backend bridge: `gpt4free`
 - Local transcript sync: `.codex-advisor/transcript.md`
+- Conclave runner: `codex-skill/external-advisor/scripts/conclave.py`
+- Router: `codex-skill/external-advisor/scripts/router.py`
+- Context pack builder: `codex-skill/external-advisor/scripts/context_pack.py`
+- Critique-before-final: `codex-skill/external-advisor/scripts/critique_final.py`
+- Evidence-backed verifier loop: `codex-skill/external-advisor/scripts/verifier_loop.py`
+- Searchable memory manager: `codex-skill/external-advisor/scripts/memory_manager.py`
+- Deterministic advisor ranking inside `conclave.py`
+- Local evaluation harness: `codex-skill/external-advisor/scripts/eval_harness.py`
 
 `gpt4free` is not committed into this repository. The setup scripts download it into:
 
@@ -120,7 +138,7 @@ sudo apt install -y git python3 python3-pip python3-venv
 Run setup:
 
 ```bash
-chmod +x setup.sh start-g4f.sh test-advisor.sh
+chmod +x setup.sh start-g4f.sh test-advisor.sh test-conclave.sh test-router.sh test-context-pack.sh test-verifier-loop.sh test-memory.sh test-ranking.sh test-eval-harness.sh
 ./setup.sh
 ```
 
@@ -199,6 +217,52 @@ Keep the local API running, then run:
 
 Expected behavior: the advisor returns a short `ADVISOR_SETUP_OK` response.
 
+## Test The Conclave
+
+Conclave mode is for harder judgment tasks. It asks several bounded advisor roles instead of one generic advisor.
+
+Keep the local API running, then run:
+
+```powershell
+.\test-conclave.ps1
+```
+
+```bash
+./test-conclave.sh
+```
+
+Expected behavior: the planner and critic roles answer, and a run is saved under:
+
+```text
+.codex-advisor/conclave-runs/
+```
+
+By default, conclave roles return readable Markdown/prose so the online ChatGPT advisor chats stay useful to read. Use machine JSON only when Codex needs strict parsing or validation.
+
+## Test The Router And Verifier Loop
+
+These tests do not require a live advisor endpoint:
+
+```powershell
+.\test-router.ps1
+.\test-context-pack.ps1
+.\test-verifier-loop.ps1
+.\test-memory.ps1
+.\test-ranking.ps1
+.\test-eval-harness.ps1
+```
+
+```bash
+./test-router.sh
+./test-context-pack.sh
+./test-verifier-loop.sh
+./test-memory.sh
+./test-ranking.sh
+./test-eval-harness.sh
+```
+
+The router test confirms task types map to the intended advisor path. The context-pack test creates `.codex-advisor/latest-context-pack.json`. The verifier-loop dry run creates `.codex-advisor/latest-verifier-loop.json` and runs a harmless local command as evidence. The memory test initializes searchable memory and records a sample decision/outcome. The ranking test confirms conclave JSON includes role rankings. The eval harness test confirms the benchmark structure.
+
 ## Use From Codex
 
 After setup, restart Codex so it discovers the skill.
@@ -224,6 +288,28 @@ Codex should use the advisor for:
 - tradeoff analysis
 - design direction
 - high-impact recommendations
+
+Codex should use conclave mode for:
+
+- architecture decisions that should be challenged
+- strategy/model/tool choices with several plausible paths
+- security/privacy-sensitive plans
+- important plans where a critic should attack Codex's first direction
+- complex code review or high-risk changes that need verifier thinking
+
+Codex can route automatically with:
+
+```powershell
+python .\codex-skill\external-advisor\scripts\router.py --prompt "Which architecture should this project use?"
+```
+
+For failed tests or verification-heavy work, the router points to `verifier_loop.py`, so the flow becomes:
+
+```text
+draft/patch -> verifier checklist -> local commands -> verifier interprets output -> Codex decides
+```
+
+When `router.py --execute` calls an advisor path, it automatically builds a compact context pack unless `--no-context-pack` is passed.
 
 Codex should skip the advisor for:
 
@@ -258,6 +344,252 @@ Files written locally:
 .codex-advisor\transcript.json
 .codex-advisor\transcript.md
 ```
+
+## Searchable Advisor Memory
+
+The transcript is useful, but full chat history is noisy. Searchable memory keeps compact summaries Codex can inspect quickly.
+
+Initialize memory:
+
+```powershell
+python .\codex-skill\external-advisor\scripts\memory_manager.py init
+```
+
+```bash
+python3 ./codex-skill/external-advisor/scripts/memory_manager.py init
+```
+
+Files created:
+
+```text
+.codex-advisor/project-profile.md
+.codex-advisor/decisions.json
+.codex-advisor/advisor-lessons.md
+.codex-advisor/open-questions.md
+.codex-advisor/outcomes.json
+.codex-advisor/memory-summary.md
+```
+
+Record an outcome:
+
+```powershell
+python .\codex-skill\external-advisor\scripts\memory_manager.py record-outcome --task "Architecture decision" --advisor-mode "conclave" --accepted-advice "Keep role memories separate" --outcome "Implemented and tests passed" --useful true --status accepted --confidence 0.8
+```
+
+Record a decision:
+
+```powershell
+python .\codex-skill\external-advisor\scripts\memory_manager.py record-decision --decision "Use verifier_loop.py for failed tests" --source "codex" --confidence 0.9 --status accepted
+```
+
+Decision memory includes source, confidence, accepted/rejected/superseded status, contradictions, superseded decision links, and age in summaries. This keeps stale advisor advice from silently becoming permanent truth.
+
+## Evaluation Harness
+
+The harness creates a small local benchmark with:
+
+- 10 architecture questions
+- 10 code-review tasks
+- 10 debugging tasks
+- 10 model/tool choice questions
+
+It compares these lanes:
+
+```text
+Codex only
+Codex + single advisor
+Codex + conclave
+Codex + critic/verifier
+```
+
+Dry-run the structure:
+
+```powershell
+python .\codex-skill\external-advisor\scripts\eval_harness.py --dry-run --limit-per-category 1 --strategy all
+```
+
+```bash
+python3 ./codex-skill/external-advisor/scripts/eval_harness.py --dry-run --limit-per-category 1 --strategy all
+```
+
+Live advisor lanes require the local API to be running. The script records latency and output size automatically. Quality scores and Codex-only answers still require manual review because this repo cannot honestly automate Codex itself.
+
+Files written:
+
+```text
+.codex-advisor/evaluations/
+.codex-advisor/latest-evaluation.json
+.codex-advisor/latest-evaluation.md
+```
+
+## Conclave Mode
+
+The normal advisor path is:
+
+```text
+Codex -> one persistent advisor chat -> Codex final answer
+```
+
+Conclave mode is:
+
+```text
+Codex -> planner / critic / security / verifier advisors -> synthesizer -> Codex final answer
+```
+
+Codex stays in control. The advisors do not edit files or make final decisions. They produce bounded critique, alternatives, risks, and verification ideas.
+
+Run it directly:
+
+```powershell
+python .\codex-skill\external-advisor\scripts\conclave.py --mode architecture --prompt "Should this project use one advisor chat or role-specific advisor memory?"
+```
+
+```bash
+python3 ./codex-skill/external-advisor/scripts/conclave.py --mode architecture --prompt "Should this project use one advisor chat or role-specific advisor memory?"
+```
+
+Available modes:
+
+```text
+general
+architecture
+strategy
+code-review
+security
+model-choice
+verification
+```
+
+`verification` mode asks the verifier role what commands, checks, edge cases, and evidence would prove or reject a recommendation. It is useful after Codex drafts a plan or patch.
+
+Each role gets its own project-local memory:
+
+```text
+.codex-advisor/
+  roles/
+    planner/text/conversation.json
+    planner/json/conversation.json
+    critic/text/conversation.json
+    critic/json/conversation.json
+    verifier/text/conversation.json
+    verifier/json/conversation.json
+  conclave-runs/
+  latest-conclave.md
+```
+
+Text and JSON role memories are intentionally separated so machine-format runs do not make the online readable ChatGPT chats awkward to use.
+
+By default, role calls run serially because browser-backed ChatGPT bridges can be fragile under concurrent calls. Add `--parallel` only after the local endpoint proves it can handle concurrency reliably.
+
+Conclave uses readable text by default. For machine parsing, validation, or internal automation, request JSON explicitly:
+
+```powershell
+python .\codex-skill\external-advisor\scripts\conclave.py --mode verification --machine-json --prompt "..."
+```
+
+Machine JSON uses this shape:
+
+```json
+{
+  "recommendation": "...",
+  "confidence": 0.8,
+  "risks": [],
+  "evidence": [],
+  "next_actions": [],
+  "verification": {
+    "commands": [],
+    "checks": [],
+    "expected_signals": []
+  },
+  "escalate": false
+}
+```
+
+Equivalent explicit form:
+
+```powershell
+python .\codex-skill\external-advisor\scripts\conclave.py --mode verification --output-format json --prompt "..."
+```
+
+Validate the latest structured conclave run:
+
+```powershell
+python .\codex-skill\external-advisor\scripts\validate_conclave.py
+```
+
+```bash
+python3 ./codex-skill/external-advisor/scripts/validate_conclave.py
+```
+
+Saved conclave JSON includes a deterministic `ranking` object. It compares advisor outputs by confidence, evidence count, risk severity, actionability, and user-intent conflict signals. This gives Codex a concrete ranking layer before it decides which advice to accept.
+
+## Critique Before Final
+
+For important answers, Codex can draft first and ask only the critic role to attack the draft:
+
+```powershell
+python .\codex-skill\external-advisor\scripts\critique_final.py --prompt "Original user request" --draft "Draft answer to critique"
+```
+
+```bash
+python3 ./codex-skill/external-advisor/scripts/critique_final.py --prompt "Original user request" --draft "Draft answer to critique"
+```
+
+This returns critique only. Codex still writes the final answer.
+
+## Context Packs
+
+Context packs are compact advisor inputs. They avoid dumping an entire transcript or unrelated files.
+
+Run one directly:
+
+```powershell
+python .\codex-skill\external-advisor\scripts\context_pack.py --prompt "Review this plan" --draft "Current plan..." --file README.md
+```
+
+```bash
+python3 ./codex-skill/external-advisor/scripts/context_pack.py --prompt "Review this plan" --draft "Current plan..." --file README.md
+```
+
+The pack can include:
+
+- task
+- current draft or plan
+- selected relevant files
+- git status, diff stat, diff check, and compact diff
+- test failures or error output
+- constraints
+- existing advisor memory summaries when present
+
+Files written:
+
+```text
+.codex-advisor/context-packs/
+.codex-advisor/latest-context-pack.json
+.codex-advisor/latest-context-pack.md
+```
+
+## Verifier Loop
+
+Use the verifier loop when a plan or patch needs evidence:
+
+```powershell
+python .\codex-skill\external-advisor\scripts\verifier_loop.py --prompt "Verify this patch" --draft "What changed..." --command "python -m py_compile codex-skill\external-advisor\scripts\verifier_loop.py"
+```
+
+```bash
+python3 ./codex-skill/external-advisor/scripts/verifier_loop.py --prompt "Verify this patch" --draft "What changed..." --command "python3 -m py_compile codex-skill/external-advisor/scripts/verifier_loop.py"
+```
+
+The loop writes:
+
+```text
+.codex-advisor/verifier-runs/
+.codex-advisor/latest-verifier-loop.json
+.codex-advisor/latest-verifier-loop.md
+```
+
+By default it runs explicit commands plus safe verifier-suggested commands such as tests, linters, `git status`, and `git diff`. Suspicious shell commands are skipped unless `--allow-unsafe-commands` is used.
 
 To skip remote transcript sync for one call:
 

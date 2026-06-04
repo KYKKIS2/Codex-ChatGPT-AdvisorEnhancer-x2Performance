@@ -30,13 +30,15 @@ fi
 
 mkdir -p "$G4F/har_and_cookies"
 
+chmod +x "$ROOT/start-g4f.sh" "$ROOT/test-advisor.sh" "$ROOT/test-conclave.sh" "$ROOT/test-router.sh" "$ROOT/test-context-pack.sh" "$ROOT/test-verifier-loop.sh" "$ROOT/test-memory.sh" "$ROOT/test-ranking.sh" "$ROOT/test-eval-harness.sh" 2>/dev/null || true
+
 mkdir -p "$SKILL_DEST"
 cp -R "$SKILL_SOURCE"/. "$SKILL_DEST"/
 cat > "$SKILL_CONFIG" <<EOF
 {
   "setup_dir": "$ROOT",
   "start_g4f": "$ROOT/start-g4f.sh",
-  "base_url": "http://localhost:8080/v1",
+  "base_url": "http://127.0.0.1:8080/v1",
   "model": "gpt-5-5-thinking"
 }
 EOF

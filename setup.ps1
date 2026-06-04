@@ -42,7 +42,7 @@ Copy-Item -Recurse -Force -Path (Join-Path $SkillSource "*") -Destination $Skill
 @{
     setup_dir = $Root
     start_g4f = (Join-Path $Root "start-g4f.ps1")
-    base_url = "http://localhost:8080/v1"
+    base_url = "http://127.0.0.1:8080/v1"
     model = "gpt-5-5-thinking"
 } | ConvertTo-Json | Set-Content -Encoding UTF8 -Path $SkillConfig
 

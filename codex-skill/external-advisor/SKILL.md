@@ -5,7 +5,9 @@ description: "Use automatically when Codex is asked for broader judgment rather 
 
 # External Advisor
 
-Use this skill as a second-pass critique layer. It does not replace Codex's judgment and it must not be used to bypass access controls or expose private credentials.
+Use this skill as a second-pass critique and verification layer. It does not replace Codex's judgment and it must not be used to bypass access controls or expose private credentials.
+
+For difficult judgment tasks, use the advisor as a bounded conclave rather than a single generic second opinion. Codex remains the orchestrator and final decision maker.
 
 ## Decision
 
@@ -23,25 +25,48 @@ Default to using it for broad direction and judgment questions, such as:
 
 Skip the advisor for routine code edits, implementation work, direct debugging, simple terminal answers, fast status updates, or when it would require sending secrets, private keys, proprietary data, or unrelated user files to an external model.
 
+Use `scripts/conclave.py` instead of `scripts/advisor.py` when the task would benefit from multiple specialist viewpoints, such as:
+
+- architecture or strategy decisions with meaningful tradeoffs
+- plans that should be attacked before implementation
+- security/privacy-sensitive design
+- model, framework, or tool choices with multiple plausible options
+- high-impact recommendations where Codex should compare alternatives before answering
+- evidence checks where a verifier should identify commands, tests, inspections, and expected signals
+
+Use `scripts/router.py` when Codex needs to decide the path from the task shape. It chooses among no-advisor, single-advisor, conclave, verifier loop, and machine-json verifier loop.
+
+Use `scripts/context_pack.py` before advisor calls that need repository context. It builds a compact task bundle with the task, draft/plan, selected files, git status/diff, failures, constraints, and existing advisor memory summaries.
+
+Use `scripts/critique_final.py` before sending important user-facing advice. Codex should draft, ask the critic advisor to attack the draft, then revise the final answer itself.
+
+Use `scripts/verifier_loop.py` when the work needs evidence, especially after failed tests or a risky patch. It asks the verifier for a checklist, runs explicit and safe suggested commands, then asks the verifier to interpret the real command output.
+
+Use `scripts/memory_manager.py` to initialize searchable advisor memory, record accepted/rejected advice and outcomes, and summarize stale or low-confidence decisions.
+
+Use `scripts/eval_harness.py` to compare Codex-only, single-advisor, conclave, and critic/verifier lanes across architecture, code-review, debugging, and model-choice tasks. Use `--dry-run` for structure checks; live advisor lanes require the local API.
+
 ## Workflow
 
 1. Gather the smallest useful context: the user's request, draft answer or plan, and only the files or snippets needed for critique.
 2. If using a local OpenAI-compatible server, set `ADVISOR_PROVIDER=openai-compatible`, `ADVISOR_BASE_URL`, and `ADVISOR_MODEL`.
-3. Before calling the advisor, check whether `http://localhost:8080/v1/models` is reachable.
+3. Before calling the advisor, check whether `http://127.0.0.1:8080/v1/models` is reachable.
 4. If it is not reachable, automatically start the local g4f API before continuing:
    - First read `advisor-config.json` from this skill folder and use its `start_g4f` path if present.
    - If `ADVISOR_SETUP_DIR` is set, check `$env:ADVISOR_SETUP_DIR\start-g4f.ps1`.
    - Otherwise prefer `.\start-g4f.ps1` in the current working directory, then parent directories.
    - The starter script should install `vendor/gpt4free` automatically by running setup if it is missing.
-   - Start it in the background with `Start-Process` and `-WindowStyle Hidden`, then wait until `http://localhost:8080/v1/models` responds.
+   - Start it in the background with `Start-Process` and `-WindowStyle Hidden`, then wait until `http://127.0.0.1:8080/v1/models` responds.
 5. If using official OpenAI, set `ADVISOR_PROVIDER=openai`, `OPENAI_API_KEY`, and optionally `ADVISOR_MODEL` plus `ADVISOR_REASONING_EFFORT`.
 6. Run `scripts/advisor.py` with `--prompt` or stdin.
 7. For local OpenAI-compatible calls, the script persists the returned `conversation` object by default at `.codex-advisor/conversation.json` in the current working directory. Later Codex sessions in the same folder continue the same ChatGPT advisor chat.
 8. Before and after each persistent local advisor call, the script syncs the remote ChatGPT conversation when possible and writes `.codex-advisor/transcript.json` plus `.codex-advisor/transcript.md`. Codex may inspect those files when it needs the advisor chat history.
 9. Set `ADVISOR_CONVERSATION_KEY` only when multiple advisor chats are needed in the same folder; keyed state is stored under `%USERPROFILE%\.codex\external-advisor`.
-10. Set `ADVISOR_TEMPORARY=true` for throwaway ChatGPT chats, or `ADVISOR_PERSIST_CONVERSATION=false` to avoid local continuation state.
-11. Set `ADVISOR_SYNC_REMOTE=false` to skip transcript sync for a call.
-12. Treat the result as advisory. Verify facts, reject weak advice, and incorporate only the parts that improve the final answer.
+10. Set `ADVISOR_STATE_PATH` when a caller needs an explicit project-local state file, such as `.codex-advisor\roles\critic\conversation.json`.
+11. Set `ADVISOR_TEMPORARY=true` for throwaway ChatGPT chats, or `ADVISOR_PERSIST_CONVERSATION=false` to avoid local continuation state.
+12. Set `ADVISOR_SYNC_REMOTE=false` to skip transcript sync for a call.
+13. For failed tests or evidence-heavy work, prefer `scripts/verifier_loop.py` over plain `conclave.py --mode verification` because it connects verifier advice to actual command output.
+14. Treat the result as advisory. Verify facts, reject weak advice, and incorporate only the parts that improve the final answer.
 
 ## Auto-Start Command
 
@@ -58,7 +83,7 @@ $shell = if (Get-Command pwsh -ErrorAction SilentlyContinue) { "pwsh" } else { "
 Start-Process $shell -WindowStyle Hidden -ArgumentList @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "`"$script`"")
 ```
 
-Then poll `http://localhost:8080/v1/models` for up to 60 seconds before running `scripts/advisor.py`.
+Then poll `http://127.0.0.1:8080/v1/models` for up to 60 seconds before running `scripts/advisor.py`.
 
 ## Commands
 
@@ -66,11 +91,100 @@ Local OpenAI-compatible endpoint:
 
 ```powershell
 $env:ADVISOR_PROVIDER = "openai-compatible"
-$env:ADVISOR_BASE_URL = "http://localhost:8080/v1"
+$env:ADVISOR_BASE_URL = "http://127.0.0.1:8080/v1"
 $env:ADVISOR_MODEL = "gpt-5-5-thinking"
 $env:ADVISOR_REASONING_EFFORT = "high"
 python $HOME\.codex\skills\external-advisor\scripts\advisor.py --prompt "Review this draft answer: ..."
 ```
+
+Bounded conclave for harder tasks:
+
+```powershell
+$env:ADVISOR_PROVIDER = "openai-compatible"
+$env:ADVISOR_BASE_URL = "http://127.0.0.1:8080/v1"
+$env:ADVISOR_MODEL = "gpt-5-5-thinking"
+$env:ADVISOR_REASONING_EFFORT = "high"
+python $HOME\.codex\skills\external-advisor\scripts\conclave.py --mode architecture --prompt "Evaluate this architecture decision: ..."
+```
+
+Automatic router:
+
+```powershell
+python $HOME\.codex\skills\external-advisor\scripts\router.py --prompt "Should this project use a verifier loop or keep manual checks?"
+```
+
+Context pack:
+
+```powershell
+python $HOME\.codex\skills\external-advisor\scripts\context_pack.py --prompt "Review this plan" --draft "Current plan..." --file README.md
+```
+
+Before-final critique:
+
+```powershell
+python $HOME\.codex\skills\external-advisor\scripts\critique_final.py --prompt "Original user request" --draft "Draft answer to critique"
+```
+
+Evidence-backed verifier loop:
+
+```powershell
+python $HOME\.codex\skills\external-advisor\scripts\verifier_loop.py --prompt "Verify this patch" --draft "Patch summary" --command "python -m py_compile codex-skill\external-advisor\scripts\verifier_loop.py"
+```
+
+Searchable memory:
+
+```powershell
+python $HOME\.codex\skills\external-advisor\scripts\memory_manager.py init
+python $HOME\.codex\skills\external-advisor\scripts\memory_manager.py record-outcome --task "Architecture decision" --advisor-mode "conclave" --accepted-advice "Keep role memories separate" --outcome "Implemented and tests passed" --useful true --status accepted --confidence 0.8
+python $HOME\.codex\skills\external-advisor\scripts\memory_manager.py summary
+```
+
+Evaluation harness:
+
+```powershell
+python $HOME\.codex\skills\external-advisor\scripts\eval_harness.py --dry-run --limit-per-category 1 --strategy all
+```
+
+`conclave.py` runs role-specific advisor calls and writes:
+
+```text
+.codex-advisor/
+  roles/
+    planner/text/conversation.json
+    planner/json/conversation.json
+    critic/text/conversation.json
+    critic/json/conversation.json
+  conclave-runs/
+  context-packs/
+  verifier-runs/
+  project-profile.md
+  decisions.json
+  advisor-lessons.md
+  open-questions.md
+  outcomes.json
+  evaluations/
+  memory-summary.md
+  latest-evaluation.md
+  latest-conclave.md
+  latest-context-pack.md
+  latest-verifier-loop.md
+```
+
+When `router.py --execute` uses an advisor path, it automatically builds a context pack and passes the Markdown pack to conclave/verifier routes. Use `--no-context-pack` only when the prompt is already self-contained or contains sensitive material that should not be packaged.
+
+Decision memory includes age, source, confidence, accepted/rejected/superseded status, contradictions, and superseded decision links. Treat old, low-confidence, contradicted, or superseded memory as weak context.
+
+Available modes: `general`, `architecture`, `strategy`, `code-review`, `security`, `model-choice`, and `verification`.
+
+`conclave.py` uses readable text by default so persistent online ChatGPT advisor chats remain useful to read. Use `--machine-json` or `--output-format json` only when Codex needs strict parsing, validation, or internal automation. Text and JSON role memories are stored separately so structured runs do not contaminate readable advisor chats. In JSON mode, Codex can inspect parsed fields such as `recommendation`, `confidence`, `risks`, `evidence`, `next_actions`, `verification.commands`, and `escalate`.
+
+Saved conclave JSON also includes `ranking.role_rankings`. The deterministic ranking compares role advice by confidence, evidence count, risk severity, actionability, and user-intent conflict signals. Use it to decide which advisor points deserve more weight; do not blindly follow the top score.
+
+The `verification` mode runs only the verifier role and is useful after Codex has a draft plan or patch. Treat plain verifier output as a checklist of evidence to gather, not proof by itself. For stronger verification, use `verifier_loop.py` so the verifier sees actual command output before Codex relies on the result.
+
+Use `scripts/validate_conclave.py` to validate the latest saved machine-JSON run before relying on parsed JSON fields.
+
+Default conclave behavior is serial for reliability with browser-backed local endpoints. Add `--parallel` only when the local endpoint handles concurrent ChatGPT calls reliably.
 
 Official OpenAI Responses API:
 

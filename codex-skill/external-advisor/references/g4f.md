@@ -18,7 +18,7 @@ Recommended local settings:
 
 ```powershell
 $env:ADVISOR_PROVIDER = "openai-compatible"
-$env:ADVISOR_BASE_URL = "http://localhost:8080/v1"
+$env:ADVISOR_BASE_URL = "http://127.0.0.1:8080/v1"
 $env:ADVISOR_MODEL = "gpt-5-5-thinking"
 $env:ADVISOR_REASONING_EFFORT = "high"
 ```

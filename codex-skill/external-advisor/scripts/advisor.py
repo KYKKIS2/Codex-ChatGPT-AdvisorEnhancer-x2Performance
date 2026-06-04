@@ -32,6 +32,10 @@ Use this shape:
 """
 
 
+def system_prompt() -> str:
+    return os.environ.get("ADVISOR_SYSTEM_PROMPT", SYSTEM_PROMPT)
+
+
 def configure_stdio() -> None:
     for stream in (sys.stdout, sys.stderr):
         if hasattr(stream, "reconfigure"):
@@ -39,7 +43,11 @@ def configure_stdio() -> None:
 
 
 def read_text(path: str) -> str:
-    return Path(path).read_text(encoding="utf-8")
+    return sanitize_text(Path(path).read_text(encoding="utf-8"))
+
+
+def sanitize_text(text: str) -> str:
+    return text.encode("utf-8", errors="replace").decode("utf-8")
 
 
 def redact_sensitive(text: str) -> str:
@@ -118,6 +126,9 @@ def extract_chat_text(response: dict[str, Any]) -> str:
 
 
 def default_state_path() -> Path:
+    explicit = os.environ.get("ADVISOR_STATE_PATH")
+    if explicit:
+        return Path(explicit)
     key = os.environ.get("ADVISOR_CONVERSATION_KEY")
     if key:
         root = Path(os.environ.get("ADVISOR_STATE_DIR", Path.home() / ".codex" / "external-advisor"))
@@ -355,7 +366,7 @@ def call_openai(prompt: str, model: str, timeout: int) -> str:
     payload: dict[str, Any] = {
         "model": model,
         "input": [
-            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "system", "content": system_prompt()},
             {"role": "user", "content": prompt},
         ],
         "reasoning": {"effort": os.environ.get("ADVISOR_REASONING_EFFORT", "high")},
@@ -369,13 +380,13 @@ def call_openai(prompt: str, model: str, timeout: int) -> str:
 
 
 def call_compatible(prompt: str, model: str, timeout: int) -> str:
-    base_url = os.environ.get("ADVISOR_BASE_URL", "http://localhost:8080/v1").rstrip("/")
+    base_url = os.environ.get("ADVISOR_BASE_URL", "http://127.0.0.1:8080/v1").rstrip("/")
     api_key = os.environ.get("ADVISOR_API_KEY", os.environ.get("OPENAI_API_KEY", "local"))
     reasoning_effort = os.environ.get("ADVISOR_REASONING_EFFORT")
     payload = {
         "model": model,
         "messages": [
-            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "system", "content": system_prompt()},
             {"role": "user", "content": prompt},
         ],
         "temperature": 0.2,
@@ -438,7 +449,7 @@ def main() -> int:
     configure_stdio()
     args = parse_args()
     prompt = args.prompt if args.prompt is not None else sys.stdin.read()
-    prompt = build_prompt(prompt, args.context_file)
+    prompt = sanitize_text(build_prompt(prompt, args.context_file))
     if not prompt.strip():
         print("Provide --prompt or pipe text on stdin.", file=sys.stderr)
         return 2

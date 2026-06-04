@@ -24,7 +24,7 @@ fi
 export G4F_PROVIDER="$PROVIDER"
 export G4F_MODEL="$MODEL"
 
-echo "Starting g4f API on http://localhost:$PORT/v1"
+echo "Starting g4f API on http://127.0.0.1:$PORT/v1"
 echo "Provider: $PROVIDER"
 echo "Model: $MODEL"
 

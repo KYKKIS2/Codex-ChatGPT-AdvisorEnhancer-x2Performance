@@ -31,7 +31,7 @@ if ([string]::IsNullOrWhiteSpace($Model)) {
 $env:G4F_PROVIDER = $Provider
 $env:G4F_MODEL = $Model
 
-Write-Host "Starting g4f API on http://localhost:$Port/v1"
+Write-Host "Starting g4f API on http://127.0.0.1:$Port/v1"
 Write-Host "Provider: $Provider"
 Write-Host "Model: $Model"
 

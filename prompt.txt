@@ -2,7 +2,7 @@ Use this repository to install and use the Codex external ChatGPT advisor.
 
 When starting from a fresh clone:
 
-1. On Windows, run `.\setup.ps1`. On Ubuntu/Linux, run `chmod +x setup.sh start-g4f.sh test-advisor.sh && ./setup.sh`.
+1. On Windows, run `.\setup.ps1`. On Ubuntu/Linux, run `chmod +x setup.sh start-g4f.sh test-advisor.sh test-conclave.sh test-router.sh test-context-pack.sh test-verifier-loop.sh test-memory.sh test-ranking.sh test-eval-harness.sh && ./setup.sh`.
 2. Tell the user to place their ChatGPT HAR file in `vendor\gpt4free\har_and_cookies`.
 3. Start the local g4f API with `.\start-g4f.ps1` on Windows or `./start-g4f.sh` on Ubuntu/Linux.
 4. Restart Codex so it discovers the `external-advisor` skill installed at `%USERPROFILE%\.codex\skills\external-advisor`.
@@ -11,11 +11,29 @@ When starting from a fresh clone:
 Important behavior:
 
 - The advisor defaults to `gpt-5-5-thinking` with `reasoning_effort=high`.
-- The local API is expected at `http://localhost:8080/v1`.
-- If the local API is not reachable, automatically start `start-g4f.ps1` in the background, then wait for `http://localhost:8080/v1/models` before calling the advisor.
+- The local API is expected at `http://127.0.0.1:8080/v1`.
+- If the local API is not reachable, automatically start `start-g4f.ps1` in the background, then wait for `http://127.0.0.1:8080/v1/models` before calling the advisor.
 - Prefer the exact script path stored in `%USERPROFILE%\.codex\skills\external-advisor\advisor-config.json` or `${CODEX_HOME:-$HOME/.codex}/skills/external-advisor/advisor-config.json`; this is written by setup.
 - Conversation state is saved per working directory at `.codex-advisor\conversation.json`.
 - A new Codex session in the same working directory should continue the same ChatGPT advisor chat.
 - The installed skill should be used automatically for broad guidance and judgment questions, not routine coding execution.
+- For harder judgment tasks, use conclave mode with `scripts/conclave.py`. It runs specialist advisor roles such as planner, critic, security, implementer, verifier, and synthesizer.
+- Conclave mode returns readable text by default so persistent online ChatGPT advisor chats remain useful to read.
+- Use `scripts/conclave.py --machine-json` or `--output-format json` only when Codex needs strict parsing, validation, or internal automation. In that mode Codex should prefer parsed fields such as `recommendation`, `risks`, `evidence`, `confidence`, `next_actions`, `verification`, and `escalate`.
+- Conclave run JSON includes `ranking.role_rankings`, comparing role advice by confidence, evidence count, risk severity, actionability, and user-intent conflict signals.
+- Use `scripts/router.py` when Codex should decide whether to skip advisor, ask one advisor, run a conclave, or run a verifier loop.
+- Use `scripts/context_pack.py` to build compact advisor context with task, draft/plan, selected files, git diff/status, failures, constraints, and advisor memory summaries.
+- Use `scripts/critique_final.py` before important final answers: Codex drafts first, the critic attacks the draft, then Codex revises the final answer.
+- Use `scripts/conclave.py --mode verification` when Codex only needs an evidence checklist: commands, checks, expected signals, and edge cases.
+- Use `scripts/verifier_loop.py` when Codex needs stronger verification: verifier checklist -> real local commands -> verifier interpretation of the actual command output.
+- Use `scripts/memory_manager.py` to initialize searchable memory, record accepted/rejected advisor advice, record outcomes, and summarize stale or low-confidence decisions.
+- Use `scripts/eval_harness.py --dry-run` to verify the local benchmark structure, or live mode to compare advisor strategies when the local API is running. Codex-only and quality scores require manual review.
+- Use `scripts/validate_conclave.py` to validate the latest saved machine-JSON conclave run before relying on parsed JSON fields.
+- Conclave role memory is saved per working directory under `.codex-advisor\roles\...\text` and `.codex-advisor\roles\...\json`, and run summaries are saved under `.codex-advisor\conclave-runs` plus `.codex-advisor\latest-conclave.md`.
+- Verifier loop runs are saved under `.codex-advisor\verifier-runs` plus `.codex-advisor\latest-verifier-loop.md/json`.
+- Context packs are saved under `.codex-advisor\context-packs` plus `.codex-advisor\latest-context-pack.md/json`.
+- Searchable memory files are `.codex-advisor\project-profile.md`, `.codex-advisor\decisions.json`, `.codex-advisor\advisor-lessons.md`, `.codex-advisor\open-questions.md`, and `.codex-advisor\outcomes.json`.
+- Evaluation runs are saved under `.codex-advisor\evaluations` plus `.codex-advisor\latest-evaluation.md/json`.
+- Prefer normal `advisor.py` for one second opinion. Prefer `conclave.py` when the task needs role disagreement, risk checking, architecture critique, strategy comparison, or verifier thinking.
 - Do not commit or print HAR contents.
 - Treat advisor output as critique; verify facts before using it.
