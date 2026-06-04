@@ -64,12 +64,13 @@ Use `scripts/eval_harness.py` to compare Codex-only, single-advisor, conclave, a
 9. If `.codex-advisor/project.json` exists, advisor calls should pass its normalized `chatgpt_project_id`/`g-p-...` id to g4f so new ChatGPT chats are created inside that ChatGPT Project. Default local state moves under `.codex-advisor/projects/<g-p-id>/`.
 10. If no project binding exists, persistent non-temporary local advisor calls auto-create a private ChatGPT Project named from the repo/folder and write `.codex-advisor/project.json`. Set `ADVISOR_AUTO_CREATE_PROJECT=false` to disable this.
 11. To create and bind manually, run `scripts/project_bind.py --create --name "my-project"`. To bind an existing Project, run `scripts/project_bind.py --url "https://chatgpt.com/g/g-p-.../project"`, or set `ADVISOR_CHATGPT_PROJECT_URL`/`ADVISOR_CHATGPT_PROJECT_ID` for one shell session.
-12. Set `ADVISOR_CONVERSATION_KEY` only when multiple advisor chats are needed in the same folder; keyed state is stored under `%USERPROFILE%\.codex\external-advisor`.
-13. Set `ADVISOR_STATE_PATH` when a caller needs an explicit project-local state file, such as `.codex-advisor\roles\critic\conversation.json`.
-14. Set `ADVISOR_TEMPORARY=true` for throwaway ChatGPT chats, or `ADVISOR_PERSIST_CONVERSATION=false` to avoid local continuation state.
-15. Set `ADVISOR_SYNC_REMOTE=false` to skip transcript sync for a call.
-16. For failed tests or evidence-heavy work, prefer `scripts/verifier_loop.py` over plain `conclave.py --mode verification` because it connects verifier advice to actual command output.
-17. Treat the result as advisory. Verify facts, reject weak advice, and incorporate only the parts that improve the final answer.
+12. To migrate old `.codex-advisor/conversation.json` state after pulling updates, run `scripts/project_migrate.py --url "https://chatgpt.com/g/g-p-.../project" --archive-root`, or omit `--url` to infer a Project id from old remote conversation metadata when possible. Use `--create-missing --archive-root` to create a new private Project when nothing can be inferred.
+13. Set `ADVISOR_CONVERSATION_KEY` only when multiple advisor chats are needed in the same folder; keyed state is stored under `%USERPROFILE%\.codex\external-advisor`.
+14. Set `ADVISOR_STATE_PATH` when a caller needs an explicit project-local state file, such as `.codex-advisor\roles\critic\conversation.json`.
+15. Set `ADVISOR_TEMPORARY=true` for throwaway ChatGPT chats, or `ADVISOR_PERSIST_CONVERSATION=false` to avoid local continuation state.
+16. Set `ADVISOR_SYNC_REMOTE=false` to skip transcript sync for a call.
+17. For failed tests or evidence-heavy work, prefer `scripts/verifier_loop.py` over plain `conclave.py --mode verification` because it connects verifier advice to actual command output.
+18. Treat the result as advisory. Verify facts, reject weak advice, and incorporate only the parts that improve the final answer.
 
 ## Auto-Start Command
 
@@ -127,6 +128,7 @@ Create or bind current directory to a ChatGPT Project:
 ```powershell
 python $HOME\.codex\skills\external-advisor\scripts\project_bind.py --create --name "my-project"
 python $HOME\.codex\skills\external-advisor\scripts\project_bind.py --url "https://chatgpt.com/g/g-p-.../project" --name "my-project"
+python $HOME\.codex\skills\external-advisor\scripts\project_migrate.py --url "https://chatgpt.com/g/g-p-.../project" --name "my-project" --archive-root
 ```
 
 Before-final critique:

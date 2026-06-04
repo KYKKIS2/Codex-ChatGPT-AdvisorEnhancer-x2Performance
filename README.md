@@ -371,6 +371,30 @@ This writes:
 .codex-advisor/project.json
 ```
 
+Migrate an older `.codex-advisor` folder after pulling repo updates:
+
+```powershell
+python .\codex-skill\external-advisor\scripts\project_migrate.py --url "https://chatgpt.com/g/g-p-.../project" --name "my-project" --archive-root
+```
+
+```bash
+python3 ./codex-skill/external-advisor/scripts/project_migrate.py --url "https://chatgpt.com/g/g-p-.../project" --name "my-project" --archive-root
+```
+
+If the old root `.codex-advisor/conversation.json` already belongs to a ChatGPT Project, the migrator can infer the `g-p-...` id from remote conversation metadata:
+
+```powershell
+python .\codex-skill\external-advisor\scripts\project_migrate.py --archive-root
+```
+
+If no Project can be inferred and you want a new private Project:
+
+```powershell
+python .\codex-skill\external-advisor\scripts\project_migrate.py --create-missing --archive-root
+```
+
+Migration only touches `.codex-advisor`. It writes `project.json`, copies old root conversation/transcript files under `.codex-advisor/projects/<g-p-id>/` when needed, and with `--archive-root` moves stale root files into `.codex-advisor/legacy-root/`.
+
 When a project binding exists, normal advisor calls pass the normalized `g-p-...` id to g4f and store the default local conversation state under:
 
 ```text
