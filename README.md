@@ -322,6 +322,54 @@ Codex should skip the advisor for:
 
 For one persistent advisor chat per project, do not set `ADVISOR_CONVERSATION_KEY`.
 
+## ChatGPT Project Binding
+
+You can bind a working directory to a ChatGPT Project so advisor chats created from that directory appear under the same Project on `chatgpt.com`.
+
+1. In ChatGPT, create a Project for the repo or working directory.
+2. Open the Project and copy its URL. It should contain a `g-p-...` id.
+3. Bind the current directory:
+
+```powershell
+python .\codex-skill\external-advisor\scripts\project_bind.py --url "https://chatgpt.com/g/g-p-.../project" --name "my-project"
+```
+
+```bash
+python3 ./codex-skill/external-advisor/scripts/project_bind.py --url "https://chatgpt.com/g/g-p-.../project" --name "my-project"
+```
+
+This writes:
+
+```text
+.codex-advisor/project.json
+```
+
+When a project binding exists, normal advisor calls pass the normalized `g-p-...` id to g4f and store the default local conversation state under:
+
+```text
+.codex-advisor/projects/<g-p-id>/conversation.json
+.codex-advisor/projects/<g-p-id>/transcript.json
+.codex-advisor/projects/<g-p-id>/transcript.md
+```
+
+You can also set it for one shell session without writing it manually:
+
+```powershell
+$env:ADVISOR_CHATGPT_PROJECT_URL = "https://chatgpt.com/g/g-p-.../project"
+```
+
+```bash
+export ADVISOR_CHATGPT_PROJECT_URL="https://chatgpt.com/g/g-p-.../project"
+```
+
+Remove the binding with:
+
+```powershell
+python .\codex-skill\external-advisor\scripts\project_bind.py --clear
+```
+
+ChatGPT Project support depends on the local g4f patch in this repo. If advisor calls work but Project placement does not, rerun setup and restart `start-g4f`.
+
 The default behavior is:
 
 ```text
@@ -344,6 +392,8 @@ Files written locally:
 .codex-advisor\transcript.json
 .codex-advisor\transcript.md
 ```
+
+When ChatGPT Project binding is enabled, those files move under `.codex-advisor\projects\<g-p-id>\`.
 
 ## Searchable Advisor Memory
 

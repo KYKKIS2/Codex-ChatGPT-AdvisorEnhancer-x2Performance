@@ -31,6 +31,8 @@ Use this shape:
 ## Key Details To Include
 """
 
+PROJECT_ID_RE = re.compile(r"(g-p-[A-Za-z0-9]+)")
+
 
 def system_prompt() -> str:
     return os.environ.get("ADVISOR_SYSTEM_PROMPT", SYSTEM_PROMPT)
@@ -125,6 +127,59 @@ def extract_chat_text(response: dict[str, Any]) -> str:
     return content if isinstance(content, str) else json.dumps(content, indent=2)
 
 
+def normalize_chatgpt_project_id(value: str | None) -> str | None:
+    if not value:
+        return None
+    match = PROJECT_ID_RE.search(value)
+    return match.group(1) if match else None
+
+
+def project_binding_path() -> Path:
+    return Path.cwd() / ".codex-advisor" / "project.json"
+
+
+def read_project_binding() -> dict[str, Any]:
+    path = project_binding_path()
+    if not path.exists():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def write_project_binding(project_id: str, source: str | None = None) -> None:
+    path = project_binding_path()
+    data = read_project_binding()
+    data["chatgpt_project_id"] = project_id
+    if source:
+        data.setdefault("chatgpt_project_source", source)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+
+
+def chatgpt_project_id() -> str | None:
+    explicit = (
+        os.environ.get("ADVISOR_CHATGPT_PROJECT_ID")
+        or os.environ.get("ADVISOR_GIZMO_ID")
+        or os.environ.get("ADVISOR_CHATGPT_PROJECT_URL")
+    )
+    project_id = normalize_chatgpt_project_id(explicit)
+    if project_id:
+        write_project_binding(project_id, explicit)
+        return project_id
+
+    binding = read_project_binding()
+    for key in ("chatgpt_project_id", "gizmo_id", "project_id", "chatgpt_project_url"):
+        value = binding.get(key)
+        if isinstance(value, str):
+            project_id = normalize_chatgpt_project_id(value)
+            if project_id:
+                return project_id
+    return None
+
+
 def default_state_path() -> Path:
     explicit = os.environ.get("ADVISOR_STATE_PATH")
     if explicit:
@@ -133,6 +188,9 @@ def default_state_path() -> Path:
     if key:
         root = Path(os.environ.get("ADVISOR_STATE_DIR", Path.home() / ".codex" / "external-advisor"))
         return root / f"{key}.conversation.json"
+    project_id = chatgpt_project_id()
+    if project_id:
+        return Path.cwd() / ".codex-advisor" / "projects" / project_id / "conversation.json"
     return Path.cwd() / ".codex-advisor" / "conversation.json"
 
 
@@ -155,12 +213,15 @@ def load_conversation(path: Path) -> dict[str, Any] | None:
     return conversation if isinstance(conversation, dict) else None
 
 
-def save_conversation(path: Path, response: dict[str, Any]) -> None:
+def save_conversation(path: Path, response: dict[str, Any], project_id: str | None = None) -> None:
     conversation = response.get("conversation")
     if not isinstance(conversation, dict):
         return
+    payload: dict[str, Any] = {"conversation": conversation}
+    if project_id:
+        payload["chatgpt_project_id"] = project_id
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps({"conversation": conversation}, indent=2), encoding="utf-8")
+    path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
 
 def read_skill_config() -> dict[str, Any]:
@@ -182,14 +243,35 @@ def setup_dir_from_config() -> Path | None:
     return Path(setup_dir) if isinstance(setup_dir, str) and setup_dir else None
 
 
+def setup_dir_candidates() -> list[Path]:
+    candidates: list[Path] = []
+    configured = setup_dir_from_config()
+    if configured:
+        candidates.append(configured)
+    candidates.append(Path(__file__).resolve().parents[3])
+    candidates.append(Path.cwd())
+    candidates.extend(Path.cwd().parents)
+
+    unique: list[Path] = []
+    seen: set[str] = set()
+    for candidate in candidates:
+        resolved = candidate.resolve()
+        key = str(resolved).lower()
+        if key not in seen:
+            seen.add(key)
+            unique.append(resolved)
+    return unique
+
+
 def auth_file_path() -> Path | None:
     explicit = os.environ.get("ADVISOR_AUTH_FILE")
     if explicit:
         return Path(explicit)
-    setup_dir = setup_dir_from_config()
-    if not setup_dir:
-        return None
-    return setup_dir / "vendor" / "gpt4free" / "har_and_cookies" / "auth_OpenaiChat.json"
+    for setup_dir in setup_dir_candidates():
+        path = setup_dir / "vendor" / "gpt4free" / "har_and_cookies" / "auth_OpenaiChat.json"
+        if path.exists():
+            return path
+    return None
 
 
 def cookie_header(cookies: dict[str, Any]) -> str:
@@ -318,7 +400,12 @@ def write_transcript(state_path: Path, conversation_data: dict[str, Any], transc
     transcript_md_path(state_path).write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
 
 
-def sync_remote_conversation(state_path: Path, conversation: dict[str, Any] | None, timeout: int) -> dict[str, Any] | None:
+def sync_remote_conversation(
+    state_path: Path,
+    conversation: dict[str, Any] | None,
+    timeout: int,
+    project_id: str | None = None,
+) -> dict[str, Any] | None:
     if not conversation:
         return conversation
     conversation_id = conversation.get("conversation_id")
@@ -346,7 +433,10 @@ def sync_remote_conversation(state_path: Path, conversation: dict[str, Any] | No
     conversation["conversation_id"] = conversation_id
     write_transcript(state_path, conversation_data, transcript)
     state_path.parent.mkdir(parents=True, exist_ok=True)
-    state_path.write_text(json.dumps({"conversation": conversation}, indent=2), encoding="utf-8")
+    payload: dict[str, Any] = {"conversation": conversation}
+    if project_id:
+        payload["chatgpt_project_id"] = project_id
+    state_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
     return conversation
 
 
@@ -395,12 +485,15 @@ def call_compatible(prompt: str, model: str, timeout: int) -> str:
     persist = os.environ.get("ADVISOR_PERSIST_CONVERSATION", "true").lower() in ("1", "true", "yes")
     temporary = os.environ.get("ADVISOR_TEMPORARY", "false").lower() in ("1", "true", "yes")
     sync_remote = os.environ.get("ADVISOR_SYNC_REMOTE", "true").lower() in ("1", "true", "yes")
+    project_id = chatgpt_project_id()
+    if project_id:
+        payload["gizmo_id"] = project_id
     conversation = None
     if persist:
         state_path = default_state_path()
         conversation = load_conversation(state_path)
         if sync_remote and not temporary:
-            conversation = sync_remote_conversation(state_path, conversation, timeout)
+            conversation = sync_remote_conversation(state_path, conversation, timeout, project_id)
         if conversation:
             payload["conversation"] = conversation
     else:
@@ -416,7 +509,8 @@ def call_compatible(prompt: str, model: str, timeout: int) -> str:
     try:
         response = post_json(f"{base_url}/chat/completions", payload, headers, timeout)
     except RuntimeError as exc:
-        if persist and conversation and "conversation_deleted" in str(exc):
+        stale_markers = ("conversation_deleted", "conversation_not_found", "conversation_inaccessible")
+        if persist and conversation and any(marker in str(exc) for marker in stale_markers):
             if state_path is not None:
                 state_path.unlink(missing_ok=True)
             payload.pop("conversation", None)
@@ -424,9 +518,9 @@ def call_compatible(prompt: str, model: str, timeout: int) -> str:
         else:
             raise
     if persist and state_path is not None:
-        save_conversation(state_path, response)
+        save_conversation(state_path, response, project_id)
         if sync_remote and not temporary:
-            sync_remote_conversation(state_path, load_conversation(state_path), timeout)
+            sync_remote_conversation(state_path, load_conversation(state_path), timeout, project_id)
     return extract_chat_text(response)
 
 

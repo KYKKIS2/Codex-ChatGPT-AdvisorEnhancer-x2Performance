@@ -13,8 +13,10 @@ $SkillConfig = Join-Path $SkillDest "advisor-config.json"
 
 New-Item -ItemType Directory -Force -Path $Vendor | Out-Null
 
-if (-not (Test-Path (Join-Path $G4f ".git"))) {
+if (-not (Test-Path $G4f)) {
     git clone $Gpt4FreeUrl $G4f
+} elseif (-not (Test-Path (Join-Path $G4f ".git"))) {
+    Write-Host "Using existing vendor\gpt4free directory without Git metadata."
 }
 
 Push-Location $G4f
@@ -28,7 +30,16 @@ try {
     if (-not ($hasTemporary -and $hasHarFallback)) {
         git apply $Patch
     } else {
-        Write-Host "gpt4free advisor patch already applied."
+        Write-Host "gpt4free base advisor patch already applied."
+    }
+
+    $hasGizmoId = Select-String -Path "g4f\api\stubs.py" -Pattern "gizmo_id: Optional\[str\]" -Quiet
+    if (-not $hasGizmoId) {
+        $stubsPath = "g4f\api\stubs.py"
+        $text = Get-Content -Raw -Path $stubsPath
+        $text = $text -replace '    extra_body: Optional\[dict\] = None\r?\n', "    extra_body: Optional[dict] = None`r`n    gizmo_id: Optional[str] = None`r`n    conversation_mode: Optional[dict] = None`r`n"
+        Set-Content -Encoding UTF8 -Path $stubsPath -Value $text
+        Write-Host "Added gpt4free ChatGPT Project passthrough fields."
     }
 
     New-Item -ItemType Directory -Force -Path "har_and_cookies" | Out-Null

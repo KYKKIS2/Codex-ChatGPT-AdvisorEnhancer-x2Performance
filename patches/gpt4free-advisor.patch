@@ -43,10 +43,12 @@ diff --git a/g4f/api/stubs.py b/g4f/api/stubs.py
 index 662609dc..c495d082 100644
 --- a/g4f/api/stubs.py
 +++ b/g4f/api/stubs.py
-@@ -50,6 +50,7 @@ class RequestConfig(BaseModel):
+@@ -50,6 +50,9 @@ class RequestConfig(BaseModel):
      download_media: bool = False
      raw: bool = False
      extra_body: Optional[dict] = None
++    gizmo_id: Optional[str] = None
++    conversation_mode: Optional[dict] = None
 +    temporary: Optional[bool] = None
      # When set (or when env G4F_TOOL_EMULATION=1), the server will attempt to
      # emulate OpenAI tool_calls for providers that don't support tools natively.
