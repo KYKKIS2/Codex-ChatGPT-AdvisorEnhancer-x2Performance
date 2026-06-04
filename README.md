@@ -324,11 +324,38 @@ For one persistent advisor chat per project, do not set `ADVISOR_CONVERSATION_KE
 
 ## ChatGPT Project Binding
 
-You can bind a working directory to a ChatGPT Project so advisor chats created from that directory appear under the same Project on `chatgpt.com`.
+Advisor calls can bind a repo to a ChatGPT Project so chats created from that repo appear under the same Project on `chatgpt.com`.
 
-1. In ChatGPT, create a Project for the repo or working directory.
-2. Open the Project and copy its URL. It should contain a `g-p-...` id.
-3. Bind the current directory:
+By default, when the advisor runs from a repo with no `.codex-advisor/project.json`, it will:
+
+1. derive a Project name from the nearest Git repo or current folder
+2. create a private ChatGPT Project through the local HAR-backed session
+3. save the returned `g-p-...` id in `.codex-advisor/project.json`
+4. route future advisor, critic, conclave, and verifier chats into that Project
+
+This is best-effort. If ChatGPT changes the private endpoint, the advisor skips Project creation and still answers normally.
+
+Disable automatic Project creation:
+
+```powershell
+$env:ADVISOR_AUTO_CREATE_PROJECT = "false"
+```
+
+```bash
+export ADVISOR_AUTO_CREATE_PROJECT=false
+```
+
+Manually create and bind a private Project:
+
+```powershell
+python .\codex-skill\external-advisor\scripts\project_bind.py --create --name "my-project"
+```
+
+```bash
+python3 ./codex-skill/external-advisor/scripts/project_bind.py --create --name "my-project"
+```
+
+Or manually bind an existing ChatGPT Project:
 
 ```powershell
 python .\codex-skill\external-advisor\scripts\project_bind.py --url "https://chatgpt.com/g/g-p-.../project" --name "my-project"
@@ -369,6 +396,8 @@ python .\codex-skill\external-advisor\scripts\project_bind.py --clear
 ```
 
 ChatGPT Project support depends on the local g4f patch in this repo. If advisor calls work but Project placement does not, rerun setup and restart `start-g4f`.
+
+Already-running Codex sessions only pick up this upgrade after they restart or reload the installed skill. Repos that already have `.codex-advisor/project.json` keep using the existing Project instead of creating a new one.
 
 The default behavior is:
 

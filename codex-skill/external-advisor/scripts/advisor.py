@@ -134,8 +134,34 @@ def normalize_chatgpt_project_id(value: str | None) -> str | None:
     return match.group(1) if match else None
 
 
+def bool_env(name: str, default: bool = False) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.lower() in ("1", "true", "yes", "on")
+
+
+def advisor_project_dir() -> Path:
+    explicit = os.environ.get("ADVISOR_PROJECT_DIR")
+    if explicit:
+        return Path(explicit).resolve()
+    current = Path.cwd().resolve()
+    for candidate in (current, *current.parents):
+        if (candidate / ".git").exists():
+            return candidate
+    return current
+
+
+def default_project_name() -> str:
+    explicit = os.environ.get("ADVISOR_CHATGPT_PROJECT_NAME")
+    if explicit and explicit.strip():
+        return explicit.strip()
+    name = advisor_project_dir().name.strip()
+    return name or "Codex Advisor"
+
+
 def project_binding_path() -> Path:
-    return Path.cwd() / ".codex-advisor" / "project.json"
+    return advisor_project_dir() / ".codex-advisor" / "project.json"
 
 
 def read_project_binding() -> dict[str, Any]:
@@ -149,17 +175,75 @@ def read_project_binding() -> dict[str, Any]:
     return data if isinstance(data, dict) else {}
 
 
-def write_project_binding(project_id: str, source: str | None = None) -> None:
+def write_project_binding(project_id: str, source: str | None = None, name: str | None = None) -> None:
     path = project_binding_path()
     data = read_project_binding()
     data["chatgpt_project_id"] = project_id
     if source:
         data.setdefault("chatgpt_project_source", source)
+    if name:
+        data.setdefault("name", name)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(data, indent=2), encoding="utf-8")
 
 
-def chatgpt_project_id() -> str | None:
+def find_gizmo(payload: Any) -> dict[str, Any] | None:
+    if isinstance(payload, dict):
+        gizmo = payload.get("gizmo")
+        if isinstance(gizmo, dict) and isinstance(gizmo.get("id"), str):
+            return gizmo
+        for value in payload.values():
+            found = find_gizmo(value)
+            if found:
+                return found
+    elif isinstance(payload, list):
+        for value in payload:
+            found = find_gizmo(value)
+            if found:
+                return found
+    return None
+
+
+def create_chatgpt_project(name: str, timeout: int) -> str | None:
+    auth = load_chatgpt_auth()
+    if not auth:
+        return None
+    headers = {
+        **auth["headers"],
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "files": [],
+        "sharing": [{"type": "private"}],
+        "instructions": "",
+        "display": {
+            "name": name,
+            "description": f"Advisor project for {name}.",
+        },
+        "gizmo_type": "snorlax",
+    }
+    try:
+        response = post_json("https://chatgpt.com/backend-api/gizmos/snorlax/upsert", payload, headers, timeout)
+    except RuntimeError as exc:
+        if bool_env("ADVISOR_PROJECT_CREATE_STRICT", False):
+            raise
+        print(f"Advisor project auto-create skipped: {redact_sensitive(str(exc))}", file=sys.stderr)
+        return None
+    gizmo = find_gizmo(response)
+    if not gizmo:
+        if bool_env("ADVISOR_PROJECT_CREATE_STRICT", False):
+            raise RuntimeError("ChatGPT Project create response did not include a gizmo id.")
+        print("Advisor project auto-create skipped: response did not include a project id.", file=sys.stderr)
+        return None
+    project_id = normalize_chatgpt_project_id(gizmo.get("id"))
+    if not project_id:
+        return None
+    write_project_binding(project_id, "auto-created", name)
+    print(f"Advisor ChatGPT Project auto-created: {name} ({project_id})", file=sys.stderr)
+    return project_id
+
+
+def chatgpt_project_id(timeout: int | None = None, allow_create: bool = True) -> str | None:
     explicit = (
         os.environ.get("ADVISOR_CHATGPT_PROJECT_ID")
         or os.environ.get("ADVISOR_GIZMO_ID")
@@ -167,7 +251,7 @@ def chatgpt_project_id() -> str | None:
     )
     project_id = normalize_chatgpt_project_id(explicit)
     if project_id:
-        write_project_binding(project_id, explicit)
+        write_project_binding(project_id, explicit, default_project_name())
         return project_id
 
     binding = read_project_binding()
@@ -177,6 +261,8 @@ def chatgpt_project_id() -> str | None:
             project_id = normalize_chatgpt_project_id(value)
             if project_id:
                 return project_id
+    if allow_create and bool_env("ADVISOR_AUTO_CREATE_PROJECT", True):
+        return create_chatgpt_project(default_project_name(), timeout or int(os.environ.get("ADVISOR_TIMEOUT", "300")))
     return None
 
 
@@ -188,10 +274,10 @@ def default_state_path() -> Path:
     if key:
         root = Path(os.environ.get("ADVISOR_STATE_DIR", Path.home() / ".codex" / "external-advisor"))
         return root / f"{key}.conversation.json"
-    project_id = chatgpt_project_id()
+    project_id = chatgpt_project_id(allow_create=False)
     if project_id:
-        return Path.cwd() / ".codex-advisor" / "projects" / project_id / "conversation.json"
-    return Path.cwd() / ".codex-advisor" / "conversation.json"
+        return advisor_project_dir() / ".codex-advisor" / "projects" / project_id / "conversation.json"
+    return advisor_project_dir() / ".codex-advisor" / "conversation.json"
 
 
 def transcript_json_path(state_path: Path) -> Path:
@@ -485,7 +571,7 @@ def call_compatible(prompt: str, model: str, timeout: int) -> str:
     persist = os.environ.get("ADVISOR_PERSIST_CONVERSATION", "true").lower() in ("1", "true", "yes")
     temporary = os.environ.get("ADVISOR_TEMPORARY", "false").lower() in ("1", "true", "yes")
     sync_remote = os.environ.get("ADVISOR_SYNC_REMOTE", "true").lower() in ("1", "true", "yes")
-    project_id = chatgpt_project_id()
+    project_id = chatgpt_project_id(timeout, allow_create=(persist and not temporary))
     if project_id:
         payload["gizmo_id"] = project_id
     conversation = None

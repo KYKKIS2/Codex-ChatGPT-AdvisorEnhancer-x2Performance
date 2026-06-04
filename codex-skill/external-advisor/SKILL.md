@@ -59,16 +59,17 @@ Use `scripts/eval_harness.py` to compare Codex-only, single-advisor, conclave, a
    - Start it in the background with `Start-Process` and `-WindowStyle Hidden`, then wait until `http://127.0.0.1:8080/v1/models` responds.
 5. If using official OpenAI, set `ADVISOR_PROVIDER=openai`, `OPENAI_API_KEY`, and optionally `ADVISOR_MODEL` plus `ADVISOR_REASONING_EFFORT`.
 6. Run `scripts/advisor.py` with `--prompt` or stdin.
-7. For local OpenAI-compatible calls, the script persists the returned `conversation` object by default at `.codex-advisor/conversation.json` in the current working directory. Later Codex sessions in the same folder continue the same ChatGPT advisor chat.
+7. For local OpenAI-compatible calls, the script persists the returned `conversation` object by default under `.codex-advisor` in the nearest Git repo root or current working directory. Later Codex sessions in the same repo continue the same ChatGPT advisor chat.
 8. Before and after each persistent local advisor call, the script syncs the remote ChatGPT conversation when possible and writes `.codex-advisor/transcript.json` plus `.codex-advisor/transcript.md`. Codex may inspect those files when it needs the advisor chat history.
 9. If `.codex-advisor/project.json` exists, advisor calls should pass its normalized `chatgpt_project_id`/`g-p-...` id to g4f so new ChatGPT chats are created inside that ChatGPT Project. Default local state moves under `.codex-advisor/projects/<g-p-id>/`.
-10. To bind a directory to a ChatGPT Project, run `scripts/project_bind.py --url "https://chatgpt.com/g/g-p-.../project"` from that directory, or set `ADVISOR_CHATGPT_PROJECT_URL`/`ADVISOR_CHATGPT_PROJECT_ID` for one shell session.
-11. Set `ADVISOR_CONVERSATION_KEY` only when multiple advisor chats are needed in the same folder; keyed state is stored under `%USERPROFILE%\.codex\external-advisor`.
-12. Set `ADVISOR_STATE_PATH` when a caller needs an explicit project-local state file, such as `.codex-advisor\roles\critic\conversation.json`.
-13. Set `ADVISOR_TEMPORARY=true` for throwaway ChatGPT chats, or `ADVISOR_PERSIST_CONVERSATION=false` to avoid local continuation state.
-14. Set `ADVISOR_SYNC_REMOTE=false` to skip transcript sync for a call.
-15. For failed tests or evidence-heavy work, prefer `scripts/verifier_loop.py` over plain `conclave.py --mode verification` because it connects verifier advice to actual command output.
-16. Treat the result as advisory. Verify facts, reject weak advice, and incorporate only the parts that improve the final answer.
+10. If no project binding exists, persistent non-temporary local advisor calls auto-create a private ChatGPT Project named from the repo/folder and write `.codex-advisor/project.json`. Set `ADVISOR_AUTO_CREATE_PROJECT=false` to disable this.
+11. To create and bind manually, run `scripts/project_bind.py --create --name "my-project"`. To bind an existing Project, run `scripts/project_bind.py --url "https://chatgpt.com/g/g-p-.../project"`, or set `ADVISOR_CHATGPT_PROJECT_URL`/`ADVISOR_CHATGPT_PROJECT_ID` for one shell session.
+12. Set `ADVISOR_CONVERSATION_KEY` only when multiple advisor chats are needed in the same folder; keyed state is stored under `%USERPROFILE%\.codex\external-advisor`.
+13. Set `ADVISOR_STATE_PATH` when a caller needs an explicit project-local state file, such as `.codex-advisor\roles\critic\conversation.json`.
+14. Set `ADVISOR_TEMPORARY=true` for throwaway ChatGPT chats, or `ADVISOR_PERSIST_CONVERSATION=false` to avoid local continuation state.
+15. Set `ADVISOR_SYNC_REMOTE=false` to skip transcript sync for a call.
+16. For failed tests or evidence-heavy work, prefer `scripts/verifier_loop.py` over plain `conclave.py --mode verification` because it connects verifier advice to actual command output.
+17. Treat the result as advisory. Verify facts, reject weak advice, and incorporate only the parts that improve the final answer.
 
 ## Auto-Start Command
 
@@ -121,9 +122,10 @@ Context pack:
 python $HOME\.codex\skills\external-advisor\scripts\context_pack.py --prompt "Review this plan" --draft "Current plan..." --file README.md
 ```
 
-Bind current directory to a ChatGPT Project:
+Create or bind current directory to a ChatGPT Project:
 
 ```powershell
+python $HOME\.codex\skills\external-advisor\scripts\project_bind.py --create --name "my-project"
 python $HOME\.codex\skills\external-advisor\scripts\project_bind.py --url "https://chatgpt.com/g/g-p-.../project" --name "my-project"
 ```
 

@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
+import sys
 from pathlib import Path
 
 
@@ -42,11 +44,31 @@ def clear_project(project_dir: Path) -> Path:
     return path
 
 
+def create_project(project_dir: Path, name: str, timeout: int) -> Path:
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    import advisor  # noqa: PLC0415
+
+    previous = os.environ.get("ADVISOR_PROJECT_DIR")
+    os.environ["ADVISOR_PROJECT_DIR"] = str(project_dir)
+    try:
+        project_id = advisor.create_chatgpt_project(name, timeout)
+    finally:
+        if previous is None:
+            os.environ.pop("ADVISOR_PROJECT_DIR", None)
+        else:
+            os.environ["ADVISOR_PROJECT_DIR"] = previous
+    if not project_id:
+        raise RuntimeError("Could not create ChatGPT Project. Check HAR/auth and ChatGPT endpoint availability.")
+    return project_path(project_dir)
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--project-dir", type=Path, default=Path.cwd())
     parser.add_argument("--url", "--id", dest="project", help="ChatGPT Project URL or g-p-... ID.")
     parser.add_argument("--name", help="Optional readable project name.")
+    parser.add_argument("--create", action="store_true", help="Create a private ChatGPT Project and bind it.")
+    parser.add_argument("--timeout", type=int, default=300)
     parser.add_argument("--clear", action="store_true", help="Remove the project binding.")
     return parser.parse_args()
 
@@ -58,8 +80,13 @@ def main() -> int:
         path = clear_project(project_dir)
         print(f"Removed ChatGPT Project binding: {path}")
         return 0
+    if args.create:
+        name = args.name or project_dir.name or "Codex Advisor"
+        path = create_project(project_dir, name, args.timeout)
+        print(f"ChatGPT Project created and bound: {path}")
+        return 0
     if not args.project:
-        print("Provide --url/--id or --clear.")
+        print("Provide --url/--id, --create, or --clear.")
         return 2
     path = bind_project(project_dir, args.project, args.name)
     print(f"ChatGPT Project binding written: {path}")
