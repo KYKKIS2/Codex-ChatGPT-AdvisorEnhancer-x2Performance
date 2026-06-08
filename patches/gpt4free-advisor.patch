@@ -57,7 +57,7 @@ diff --git a/g4f/Provider/needs_auth/OpenaiChat.py b/g4f/Provider/needs_auth/Ope
 index 9f3e0a1d..dfef1c9a 100644
 --- a/g4f/Provider/needs_auth/OpenaiChat.py
 +++ b/g4f/Provider/needs_auth/OpenaiChat.py
-@@ -452,8 +452,12 @@ class OpenaiChat(AsyncGeneratorProvider, ProviderModelMixin):
+@@ -452,8 +452,10 @@ class OpenaiChat(AsyncGeneratorProvider, ProviderModelMixin):
                  else:
                      conversation_mode = {"kind": "primary_assistant"}
  

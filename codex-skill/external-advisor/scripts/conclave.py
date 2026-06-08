@@ -226,8 +226,35 @@ def project_advisor_dir(project_dir: Path) -> Path:
     return project_dir / ".codex-advisor"
 
 
-def role_state_path(project_dir: Path, role: str, output_format: str) -> Path:
-    return project_advisor_dir(project_dir) / "roles" / safe_slug(role) / safe_slug(output_format) / "conversation.json"
+def resolve_project_dir(project_dir: Path | None) -> Path:
+    if project_dir is not None:
+        return project_dir.resolve()
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    import advisor  # noqa: PLC0415
+
+    return advisor.advisor_project_dir()
+
+
+def active_project_id(project_dir: Path, timeout: int, allow_create: bool) -> str | None:
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    import advisor  # noqa: PLC0415
+
+    previous = os.environ.get("ADVISOR_PROJECT_DIR")
+    os.environ["ADVISOR_PROJECT_DIR"] = str(project_dir)
+    try:
+        return advisor.chatgpt_project_id(timeout, allow_create=allow_create)
+    finally:
+        if previous is None:
+            os.environ.pop("ADVISOR_PROJECT_DIR", None)
+        else:
+            os.environ["ADVISOR_PROJECT_DIR"] = previous
+
+
+def role_state_path(project_dir: Path, role: str, output_format: str, project_id: str | None) -> Path:
+    root = project_advisor_dir(project_dir)
+    if project_id:
+        root = root / "projects" / project_id
+    return root / "roles" / safe_slug(role) / safe_slug(output_format) / "conversation.json"
 
 
 def build_shared_context(args: argparse.Namespace) -> str:
@@ -302,7 +329,7 @@ def run_advisor_role(args: argparse.Namespace, role: str, shared_context: str) -
     env["ADVISOR_REASONING_EFFORT"] = args.reasoning_effort
     env["ADVISOR_MAX_OUTPUT_TOKENS"] = str(args.max_output_tokens)
     env["ADVISOR_TIMEOUT"] = str(args.timeout)
-    env["ADVISOR_STATE_PATH"] = str(role_state_path(args.project_dir, role, args.output_format))
+    env["ADVISOR_STATE_PATH"] = str(role_state_path(args.project_dir, role, args.output_format, args.active_project_id))
     if args.output_format == "json":
         env["ADVISOR_SYSTEM_PROMPT"] = STRUCTURED_SYSTEM_PROMPT
     if args.base_url:
@@ -569,7 +596,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--reasoning-effort", default=os.environ.get("ADVISOR_REASONING_EFFORT", "high"))
     parser.add_argument("--max-output-tokens", type=int, default=int(os.environ.get("ADVISOR_MAX_OUTPUT_TOKENS", "1200")))
     parser.add_argument("--timeout", type=int, default=int(os.environ.get("ADVISOR_TIMEOUT", "300")))
-    parser.add_argument("--project-dir", type=Path, default=Path.cwd())
+    parser.add_argument("--project-dir", type=Path, help="Project directory. Defaults to the nearest Git repo root or current directory.")
     parser.add_argument("--parallel", action="store_true", help="Run specialist roles concurrently.")
     parser.add_argument("--max-workers", type=int, default=3)
     parser.add_argument("--no-synthesis", action="store_true", help="Skip the synthesizer advisor.")
@@ -582,11 +609,12 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     configure_stdio()
     args = parse_args()
-    args.project_dir = args.project_dir.resolve()
+    args.project_dir = resolve_project_dir(args.project_dir)
     if args.machine_json:
         args.output_format = "json"
     args.trace_id = args.trace_id or str(uuid.uuid4())
     args.task_id = args.task_id or str(uuid.uuid4())
+    args.active_project_id = None if args.dry_run or args.temporary else active_project_id(args.project_dir, args.timeout, allow_create=True)
     prompt = sanitize_text(args.prompt if args.prompt is not None else sys.stdin.read())
     if not prompt.strip():
         print("Provide --prompt or pipe text on stdin.", file=sys.stderr)

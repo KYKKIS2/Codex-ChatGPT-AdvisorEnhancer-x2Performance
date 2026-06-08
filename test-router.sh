@@ -3,6 +3,8 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROUTER="$ROOT/codex-skill/external-advisor/scripts/router.py"
+PROJECT="$(mktemp -d)"
+trap 'rm -rf "$PROJECT"' EXIT
 
 assert_route() {
   local expected="$1"
@@ -12,7 +14,7 @@ assert_route() {
   fi
   shift
   local data route kind
-  data="$(python3 "$ROUTER" --json "$@")"
+  data="$(python3 "$ROUTER" --project-dir "$PROJECT" --json "$@")"
   route="$(printf '%s' "$data" | python3 -c 'import json,sys; print(json.load(sys.stdin)["route"])')"
   if [[ "$route" != "$expected" ]]; then
     echo "Expected route '$expected' but got '$route' for args: $*" >&2
@@ -30,7 +32,8 @@ assert_route() {
 
 assert_route "no-advisor" "" --prompt "fix typo in README"
 assert_route "single-advisor" "" --prompt "Decide the architecture for advisor memory"
-assert_route "conclave" "" --prompt "Review security and privacy risks for token storage"
+assert_route "no-advisor" "" --prompt "Review security and privacy risks for token storage"
+assert_route "conclave" "" --allow-sensitive-advisor --prompt "Review security and privacy risks for token storage"
 assert_route "verifier" "verifier-loop" --failed-tests --prompt "pytest failed after the patch"
 assert_route "conclave" "" --prompt "Which model or framework should I use for training?"
 assert_route "single-advisor" "" --before-final --draft "Draft answer" --prompt "Review before final"

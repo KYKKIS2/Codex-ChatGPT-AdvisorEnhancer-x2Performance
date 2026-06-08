@@ -3,7 +3,15 @@ har_and_cookies/
 .codex-advisor/
 *.har
 *.cookie.json
+*.cookies.json
+auth_*.json
+conversation.json
+transcript.json
+transcript.md
 __pycache__/
 *.pyc
 .env
-
+.env.*
+!.env.example
+secrets.env
+*.log

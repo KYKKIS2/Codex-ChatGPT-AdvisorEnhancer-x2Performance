@@ -6,9 +6,12 @@ $ErrorActionPreference = "Stop"
 $Root = Split-Path -Parent $MyInvocation.MyCommand.Path
 $Vendor = Join-Path $Root "vendor"
 $G4f = Join-Path $Vendor "gpt4free"
+$Venv = Join-Path $G4f ".venv"
+$Py = Join-Path $Venv "Scripts\python.exe"
 $Patch = Join-Path $Root "patches\gpt4free-advisor.patch"
 $SkillSource = Join-Path $Root "codex-skill\external-advisor"
-$SkillDest = Join-Path $HOME ".codex\skills\external-advisor"
+$CodexHome = if ([string]::IsNullOrWhiteSpace($env:CODEX_HOME)) { Join-Path $HOME ".codex" } else { $env:CODEX_HOME }
+$SkillDest = Join-Path $CodexHome "skills\external-advisor"
 $SkillConfig = Join-Path $SkillDest "advisor-config.json"
 
 New-Item -ItemType Directory -Force -Path $Vendor | Out-Null
@@ -21,14 +24,18 @@ if (-not (Test-Path $G4f)) {
 
 Push-Location $G4f
 try {
-    python -m pip install --upgrade pip
-    python -m pip install -r requirements.txt
-    python -m pip install python-multipart a2wsgi Brotli pycryptodome python-dotenv
+    if (-not (Test-Path $Py)) {
+        python -m venv $Venv
+    }
+    & $Py -m pip install --upgrade pip
+    & $Py -m pip install -r requirements.txt
+    & $Py -m pip install python-multipart a2wsgi Brotli pycryptodome python-dotenv
 
     $hasTemporary = Select-String -Path "g4f\api\stubs.py" -Pattern "temporary: Optional\[bool\]" -Quiet
     $hasHarFallback = Select-String -Path "g4f\Provider\openai\har_file.py" -Pattern "using generated proof token fallback" -Quiet
     if (-not ($hasTemporary -and $hasHarFallback)) {
-        git apply $Patch
+        git apply --check --recount $Patch
+        git apply --recount $Patch
     } else {
         Write-Host "gpt4free base advisor patch already applied."
     }

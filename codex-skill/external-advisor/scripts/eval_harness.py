@@ -272,14 +272,23 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--reasoning-effort", default=os.environ.get("ADVISOR_REASONING_EFFORT", "high"))
     parser.add_argument("--max-output-tokens", type=int, default=int(os.environ.get("ADVISOR_MAX_OUTPUT_TOKENS", "1000")))
     parser.add_argument("--timeout", type=int, default=int(os.environ.get("ADVISOR_TIMEOUT", "300")))
-    parser.add_argument("--project-dir", type=Path, default=Path.cwd())
+    parser.add_argument("--project-dir", type=Path, help="Project directory. Defaults to the nearest Git repo root or current directory.")
     return parser.parse_args()
+
+
+def resolve_project_dir(project_dir: Path | None) -> Path:
+    if project_dir is not None:
+        return project_dir.resolve()
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    import advisor  # noqa: PLC0415
+
+    return advisor.advisor_project_dir()
 
 
 def main() -> int:
     configure_stdio()
     args = parse_args()
-    args.project_dir = args.project_dir.resolve()
+    args.project_dir = resolve_project_dir(args.project_dir)
     strategies = list(STRATEGIES) if args.strategy == "all" else [args.strategy]
     results: list[EvalResult] = []
     for category, index, task in select_tasks(args.limit_per_category):

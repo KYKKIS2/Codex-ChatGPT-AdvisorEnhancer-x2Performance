@@ -87,6 +87,15 @@ def advisor_dir(project_dir: Path) -> Path:
     return project_dir / ".codex-advisor"
 
 
+def resolve_project_dir(project_dir: Path | None) -> Path:
+    if project_dir is not None:
+        return project_dir.resolve()
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    import advisor  # noqa: PLC0415
+
+    return advisor.advisor_project_dir()
+
+
 def verifier_runs_dir(project_dir: Path) -> Path:
     return advisor_dir(project_dir) / "verifier-runs"
 
@@ -406,7 +415,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--draft-file", help="Read Codex draft/current plan/patch from a file.")
     parser.add_argument("--context-file", action="append", default=[], help="Additional UTF-8 context file.")
     parser.add_argument("--command", action="append", default=[], help="Evidence command to run. Repeat for multiple commands.")
-    parser.add_argument("--no-run-suggested", action="store_true", help="Only run commands passed with --command.")
+    parser.add_argument("--no-run-suggested", action="store_true", default=True, help="Only run commands passed with --command. This is the default.")
+    parser.add_argument("--run-suggested", dest="no_run_suggested", action="store_false", help="Also run allowed commands suggested by the verifier advisor.")
     parser.add_argument("--allow-unsafe-commands", action="store_true", help="Run commands even when they fail the safe allowlist.")
     parser.add_argument("--provider", choices=["openai", "openai-compatible"], default=os.environ.get("ADVISOR_PROVIDER", "openai-compatible"))
     parser.add_argument("--base-url", default=os.environ.get("ADVISOR_BASE_URL", "http://127.0.0.1:8080/v1"))
@@ -416,7 +426,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--timeout", type=int, default=int(os.environ.get("ADVISOR_TIMEOUT", "300")))
     parser.add_argument("--command-timeout", type=int, default=120)
     parser.add_argument("--output-chars", type=int, default=6000)
-    parser.add_argument("--project-dir", type=Path, default=Path.cwd())
+    parser.add_argument("--project-dir", type=Path, help="Project directory. Defaults to the nearest Git repo root or current directory.")
     parser.add_argument("--trace-id", default=os.environ.get("ADVISOR_TRACE_ID"))
     parser.add_argument("--task-id", default=os.environ.get("ADVISOR_TASK_ID"))
     parser.add_argument("--no-sync", action="store_true")
@@ -427,7 +437,7 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     configure_stdio()
     args = parse_args()
-    args.project_dir = args.project_dir.resolve()
+    args.project_dir = resolve_project_dir(args.project_dir)
     args.trace_id = args.trace_id or str(uuid.uuid4())
     args.task_id = args.task_id or str(uuid.uuid4())
     if args.draft_file:

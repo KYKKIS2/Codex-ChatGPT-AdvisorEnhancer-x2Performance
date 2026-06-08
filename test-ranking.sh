@@ -3,9 +3,12 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CONCLAVE="$ROOT/codex-skill/external-advisor/scripts/conclave.py"
-RUNS="$ROOT/.codex-advisor/conclave-runs"
+PROJECT="$(mktemp -d)"
+trap 'rm -rf "$PROJECT"' EXIT
+RUNS="$PROJECT/.codex-advisor/conclave-runs"
 
 python3 "$CONCLAVE" \
+  --project-dir "$PROJECT" \
   --dry-run \
   --machine-json \
   --no-synthesis \

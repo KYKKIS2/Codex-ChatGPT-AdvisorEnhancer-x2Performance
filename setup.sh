@@ -5,6 +5,8 @@ GPT4FREE_URL="${GPT4FREE_URL:-https://github.com/xtekky/gpt4free.git}"
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 VENDOR="$ROOT/vendor"
 G4F="$VENDOR/gpt4free"
+VENV="$G4F/.venv"
+PY="$VENV/bin/python"
 PATCH="$ROOT/patches/gpt4free-advisor.patch"
 SKILL_SOURCE="$ROOT/codex-skill/external-advisor"
 SKILL_DEST="${CODEX_HOME:-$HOME/.codex}/skills/external-advisor"
@@ -20,14 +22,18 @@ fi
 
 cd "$G4F"
 
-python3 -m pip install --upgrade pip
-python3 -m pip install -r requirements.txt
-python3 -m pip install python-multipart a2wsgi Brotli pycryptodome python-dotenv
+if [[ ! -x "$PY" ]]; then
+  python3 -m venv "$VENV"
+fi
+"$PY" -m pip install --upgrade pip
+"$PY" -m pip install -r requirements.txt
+"$PY" -m pip install python-multipart a2wsgi Brotli pycryptodome python-dotenv
 
 if grep -q 'temporary: Optional\[bool\]' g4f/api/stubs.py && grep -q 'using generated proof token fallback' g4f/Provider/openai/har_file.py; then
   echo "gpt4free base advisor patch already applied."
 else
-  git apply "$PATCH"
+  git apply --check --recount "$PATCH"
+  git apply --recount "$PATCH"
 fi
 
 if ! grep -q 'gizmo_id: Optional\[str\]' g4f/api/stubs.py; then

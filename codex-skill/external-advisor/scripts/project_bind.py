@@ -24,6 +24,15 @@ def project_path(project_dir: Path) -> Path:
     return project_dir / ".codex-advisor" / "project.json"
 
 
+def resolve_project_dir(project_dir: Path | None) -> Path:
+    if project_dir is not None:
+        return project_dir.resolve()
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    import advisor  # noqa: PLC0415
+
+    return advisor.advisor_project_dir()
+
+
 def bind_project(project_dir: Path, value: str, name: str | None) -> Path:
     project_id = normalize_project_id(value)
     path = project_path(project_dir)
@@ -64,7 +73,7 @@ def create_project(project_dir: Path, name: str, timeout: int) -> Path:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--project-dir", type=Path, default=Path.cwd())
+    parser.add_argument("--project-dir", type=Path, help="Project directory. Defaults to the nearest Git repo root or current directory.")
     parser.add_argument("--url", "--id", dest="project", help="ChatGPT Project URL or g-p-... ID.")
     parser.add_argument("--name", help="Optional readable project name.")
     parser.add_argument("--create", action="store_true", help="Create a private ChatGPT Project and bind it.")
@@ -75,7 +84,7 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
-    project_dir = args.project_dir.resolve()
+    project_dir = resolve_project_dir(args.project_dir)
     if args.clear:
         path = clear_project(project_dir)
         print(f"Removed ChatGPT Project binding: {path}")

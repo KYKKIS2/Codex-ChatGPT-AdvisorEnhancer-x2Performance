@@ -1,6 +1,8 @@
 $ErrorActionPreference = "Stop"
 $Root = Split-Path -Parent $MyInvocation.MyCommand.Path
 $Router = Join-Path $Root "codex-skill\external-advisor\scripts\router.py"
+$Project = Join-Path $env:TEMP ("advisor-router-test-" + [guid]::NewGuid())
+New-Item -ItemType Directory -Force -Path $Project | Out-Null
 
 function Assert-Route {
     param(
@@ -8,7 +10,7 @@ function Assert-Route {
         [string[]]$RouteArgs,
         [string]$ExpectedCommandKind = ""
     )
-    $json = python $Router --json @RouteArgs
+    $json = python $Router --project-dir $Project --json @RouteArgs
     if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
     $data = $json | ConvertFrom-Json
     $route = $data.route
@@ -23,10 +25,16 @@ function Assert-Route {
     Write-Host "Route OK: $Expected"
 }
 
-Assert-Route "no-advisor" @("--prompt", "fix typo in README")
-Assert-Route "single-advisor" @("--prompt", "Decide the architecture for advisor memory")
-Assert-Route "conclave" @("--prompt", "Review security and privacy risks for token storage")
-Assert-Route "verifier" @("--failed-tests", "--prompt", "pytest failed after the patch") "verifier-loop"
-Assert-Route "conclave" @("--prompt", "Which model or framework should I use for training?")
-Assert-Route "single-advisor" @("--before-final", "--draft", "Draft answer", "--prompt", "Review before final")
-Assert-Route "machine-json-verifier" @("--machine-verify", "--prompt", "Verify this patch") "verifier-loop"
+try {
+    Assert-Route "no-advisor" @("--prompt", "fix typo in README")
+    Assert-Route "single-advisor" @("--prompt", "Decide the architecture for advisor memory")
+    Assert-Route "no-advisor" @("--prompt", "Review security and privacy risks for token storage")
+    Assert-Route "conclave" @("--allow-sensitive-advisor", "--prompt", "Review security and privacy risks for token storage")
+    Assert-Route "verifier" @("--failed-tests", "--prompt", "pytest failed after the patch") "verifier-loop"
+    Assert-Route "conclave" @("--prompt", "Which model or framework should I use for training?")
+    Assert-Route "single-advisor" @("--before-final", "--draft", "Draft answer", "--prompt", "Review before final")
+    Assert-Route "machine-json-verifier" @("--machine-verify", "--prompt", "Verify this patch") "verifier-loop"
+}
+finally {
+    Remove-Item -Recurse -Force -LiteralPath $Project -ErrorAction SilentlyContinue
+}

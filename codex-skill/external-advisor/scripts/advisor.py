@@ -170,8 +170,8 @@ def read_project_binding() -> dict[str, Any]:
         return {}
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
-    except json.JSONDecodeError:
-        return {}
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"Malformed advisor project binding at {path}. Repair or delete it before continuing.") from exc
     return data if isinstance(data, dict) else {}
 
 
@@ -272,7 +272,15 @@ def default_state_path() -> Path:
         return Path(explicit)
     key = os.environ.get("ADVISOR_CONVERSATION_KEY")
     if key:
-        root = Path(os.environ.get("ADVISOR_STATE_DIR", Path.home() / ".codex" / "external-advisor"))
+        explicit_root = os.environ.get("ADVISOR_STATE_DIR")
+        if explicit_root:
+            root = Path(explicit_root)
+        else:
+            project_id = chatgpt_project_id(allow_create=False)
+            root = advisor_project_dir() / ".codex-advisor"
+            if project_id:
+                root = root / "projects" / project_id
+            root = root / "conversations"
         return root / f"{key}.conversation.json"
     project_id = chatgpt_project_id(allow_create=False)
     if project_id:
@@ -293,10 +301,26 @@ def load_conversation(path: Path) -> dict[str, Any] | None:
         return None
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
-    except json.JSONDecodeError:
-        return None
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"Malformed advisor conversation state at {path}. Repair or delete it before continuing.") from exc
     conversation = data.get("conversation")
     return conversation if isinstance(conversation, dict) else None
+
+
+def saved_project_id(path: Path) -> str | None:
+    if not path.exists():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"Malformed advisor conversation state at {path}. Repair or delete it before continuing.") from exc
+    value = data.get("chatgpt_project_id")
+    return normalize_chatgpt_project_id(value) if isinstance(value, str) else None
+
+
+def remove_state_files(state_path: Path) -> None:
+    for path in (state_path, transcript_json_path(state_path), transcript_md_path(state_path)):
+        path.unlink(missing_ok=True)
 
 
 def save_conversation(path: Path, response: dict[str, Any], project_id: str | None = None) -> None:
@@ -578,6 +602,13 @@ def call_compatible(prompt: str, model: str, timeout: int) -> str:
     if persist:
         state_path = default_state_path()
         conversation = load_conversation(state_path)
+        previous_project_id = saved_project_id(state_path)
+        if previous_project_id and project_id and previous_project_id != project_id:
+            raise RuntimeError(
+                f"Advisor state at {state_path} belongs to {previous_project_id}, "
+                f"but the active ChatGPT Project is {project_id}. "
+                "Clear or migrate this state before continuing."
+            )
         if sync_remote and not temporary:
             conversation = sync_remote_conversation(state_path, conversation, timeout, project_id)
         if conversation:
@@ -598,7 +629,7 @@ def call_compatible(prompt: str, model: str, timeout: int) -> str:
         stale_markers = ("conversation_deleted", "conversation_not_found", "conversation_inaccessible")
         if persist and conversation and any(marker in str(exc) for marker in stale_markers):
             if state_path is not None:
-                state_path.unlink(missing_ok=True)
+                remove_state_files(state_path)
             payload.pop("conversation", None)
             response = post_json(f"{base_url}/chat/completions", payload, headers, timeout)
         else:

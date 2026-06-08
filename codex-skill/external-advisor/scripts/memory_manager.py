@@ -260,7 +260,7 @@ def write_summary(project_dir: Path, data: dict[str, Any]) -> Path:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--project-dir", type=Path, default=Path.cwd())
+    parser.add_argument("--project-dir", type=Path, help="Project directory. Defaults to the nearest Git repo root or current directory.")
     sub = parser.add_subparsers(dest="command", required=True)
 
     sub.add_parser("init")
@@ -304,10 +304,19 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def resolve_project_dir(project_dir: Path | None) -> Path:
+    if project_dir is not None:
+        return project_dir.resolve()
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    import advisor  # noqa: PLC0415
+
+    return advisor.advisor_project_dir()
+
+
 def main() -> int:
     configure_stdio()
     args = parse_args()
-    args.project_dir = args.project_dir.resolve()
+    args.project_dir = resolve_project_dir(args.project_dir)
     if args.command == "init":
         init_memory(args.project_dir)
         print(f"Advisor memory initialized: {advisor_dir(args.project_dir)}")

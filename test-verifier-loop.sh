@@ -3,7 +3,9 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 VERIFIER_LOOP="$ROOT/codex-skill/external-advisor/scripts/verifier_loop.py"
-LATEST="$ROOT/.codex-advisor/latest-verifier-loop.json"
+PROJECT="$(mktemp -d)"
+trap 'rm -rf "$PROJECT"' EXIT
+LATEST="$PROJECT/.codex-advisor/latest-verifier-loop.json"
 
 export ADVISOR_PROVIDER="openai-compatible"
 export ADVISOR_BASE_URL="${ADVISOR_BASE_URL:-http://127.0.0.1:8080/v1}"
@@ -12,6 +14,7 @@ export ADVISOR_REASONING_EFFORT="high"
 export ADVISOR_MAX_OUTPUT_TOKENS="700"
 
 python3 "$VERIFIER_LOOP" \
+  --project-dir "$PROJECT" \
   --dry-run \
   --no-sync \
   --prompt "Smoke test the evidence-backed verifier loop." \

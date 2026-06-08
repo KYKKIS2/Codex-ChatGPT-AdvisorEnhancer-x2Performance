@@ -28,8 +28,8 @@ def load_json(path: Path) -> dict[str, Any]:
         return {}
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
-    except json.JSONDecodeError:
-        return {}
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"Malformed JSON at {path}. Repair or delete it before continuing.") from exc
     return data if isinstance(data, dict) else {}
 
 
@@ -149,9 +149,15 @@ def archive_root_state(project_dir: Path) -> list[Path]:
     return moved
 
 
+def resolve_project_dir(project_dir: Path | None) -> Path:
+    if project_dir is not None:
+        return project_dir.resolve()
+    return advisor.advisor_project_dir()
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--project-dir", type=Path, default=Path.cwd())
+    parser.add_argument("--project-dir", type=Path, help="Project directory. Defaults to the nearest Git repo root or current directory.")
     parser.add_argument("--url", "--id", dest="project", help="Existing ChatGPT Project URL or g-p-... ID to bind.")
     parser.add_argument("--name", help="Readable Project name for local metadata or auto-create.")
     parser.add_argument("--create-missing", action="store_true", help="Create a private ChatGPT Project if no binding can be inferred.")
@@ -163,11 +169,17 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
-    project_dir = args.project_dir.resolve()
+    project_dir = resolve_project_dir(args.project_dir)
     os.environ["ADVISOR_PROJECT_DIR"] = str(project_dir)
     name = args.name or project_dir.name or "Codex Advisor"
 
-    project_id = advisor.normalize_chatgpt_project_id(args.project) if args.project else existing_project_id(project_dir)
+    if args.project:
+        project_id = advisor.normalize_chatgpt_project_id(args.project)
+        if not project_id:
+            print("Invalid ChatGPT Project URL/ID. Expected a value containing g-p-...", file=sys.stderr)
+            return 2
+    else:
+        project_id = existing_project_id(project_dir)
     source = "existing-binding" if project_id else ""
 
     if not project_id:
@@ -183,12 +195,15 @@ def main() -> int:
         return 1
 
     binding = write_binding(project_dir, project_id, name, source)
-    copied = copy_root_state(project_dir, project_id, args.overwrite)
+    copy_allowed = source != "auto-created-by-migration"
+    copied = copy_root_state(project_dir, project_id, args.overwrite) if copy_allowed else []
     archived = archive_root_state(project_dir) if args.archive_root else []
 
     print(f"Project binding: {binding}")
     print(f"Project id: {project_id}")
     print(f"Copied root state files: {len(copied)}")
+    if not copy_allowed:
+        print("Skipped copying old root chat state because the Project was newly created.")
     if archived:
         print(f"Archived root state files: {len(archived)}")
     elif args.archive_root:

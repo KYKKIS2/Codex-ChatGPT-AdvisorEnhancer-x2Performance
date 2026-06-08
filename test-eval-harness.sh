@@ -3,9 +3,11 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 EVAL_HARNESS="$ROOT/codex-skill/external-advisor/scripts/eval_harness.py"
-LATEST="$ROOT/.codex-advisor/latest-evaluation.json"
+PROJECT="$(mktemp -d)"
+trap 'rm -rf "$PROJECT"' EXIT
+LATEST="$PROJECT/.codex-advisor/latest-evaluation.json"
 
-python3 "$EVAL_HARNESS" --dry-run --limit-per-category 1 --strategy all
+python3 "$EVAL_HARNESS" --project-dir "$PROJECT" --dry-run --limit-per-category 1 --strategy all
 
 python3 - "$LATEST" <<'PY'
 import json

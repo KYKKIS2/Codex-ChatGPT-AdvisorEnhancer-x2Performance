@@ -3,9 +3,14 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CONTEXT_PACK="$ROOT/codex-skill/external-advisor/scripts/context_pack.py"
-LATEST="$ROOT/.codex-advisor/latest-context-pack.json"
+PROJECT="$(mktemp -d)"
+trap 'rm -rf "$PROJECT"' EXIT
+mkdir -p "$PROJECT/.git"
+cp "$ROOT/README.md" "$PROJECT/README.md"
+LATEST="$PROJECT/.codex-advisor/latest-context-pack.json"
 
 python3 "$CONTEXT_PACK" \
+  --project-dir "$PROJECT" \
   --prompt "Smoke test context pack generation." \
   --draft "Plan: include README and git context." \
   --file "README.md" \

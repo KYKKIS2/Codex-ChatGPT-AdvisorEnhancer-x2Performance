@@ -97,12 +97,22 @@ def validate_run(path: Path) -> list[str]:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("run_json", nargs="?", help="Conclave run JSON file. Defaults to latest project run.")
-    parser.add_argument("--project-dir", type=Path, default=Path.cwd())
+    parser.add_argument("--project-dir", type=Path, help="Project directory. Defaults to the nearest Git repo root or current directory.")
     return parser.parse_args()
+
+
+def resolve_project_dir(project_dir: Path | None) -> Path:
+    if project_dir is not None:
+        return project_dir.resolve()
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    import advisor  # noqa: PLC0415
+
+    return advisor.advisor_project_dir()
 
 
 def main() -> int:
     args = parse_args()
+    args.project_dir = resolve_project_dir(args.project_dir)
     path = Path(args.run_json) if args.run_json else latest_run(args.project_dir)
     errors = validate_run(path)
     if errors:

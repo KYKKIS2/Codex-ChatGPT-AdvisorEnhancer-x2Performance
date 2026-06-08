@@ -28,6 +28,15 @@ def conclave_script_path() -> Path:
     return Path(__file__).resolve().with_name("conclave.py")
 
 
+def resolve_project_dir(project_dir: Path | None) -> Path:
+    if project_dir is not None:
+        return project_dir.resolve()
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    import advisor  # noqa: PLC0415
+
+    return advisor.advisor_project_dir()
+
+
 def build_prompt(args: argparse.Namespace) -> str:
     blocks = [
         "Critique this Codex draft before the final answer is sent.",
@@ -57,7 +66,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--reasoning-effort", default=os.environ.get("ADVISOR_REASONING_EFFORT", "high"))
     parser.add_argument("--max-output-tokens", type=int, default=int(os.environ.get("ADVISOR_MAX_OUTPUT_TOKENS", "1200")))
     parser.add_argument("--timeout", type=int, default=int(os.environ.get("ADVISOR_TIMEOUT", "300")))
-    parser.add_argument("--project-dir", type=Path, default=Path.cwd())
+    parser.add_argument("--project-dir", type=Path, help="Project directory. Defaults to the nearest Git repo root or current directory.")
     parser.add_argument("--machine-json", action="store_true", help="Request machine-readable JSON critique.")
     parser.add_argument("--no-sync", action="store_true", help="Skip remote transcript sync.")
     parser.add_argument("--dry-run", action="store_true", help="Print the generated prompt without calling the model.")
@@ -67,7 +76,7 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     configure_stdio()
     args = parse_args()
-    args.project_dir = args.project_dir.resolve()
+    args.project_dir = resolve_project_dir(args.project_dir)
     if args.draft_file:
         args.draft = read_text(args.draft_file)
     elif args.draft is None:

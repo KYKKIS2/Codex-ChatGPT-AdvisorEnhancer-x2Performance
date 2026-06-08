@@ -53,10 +53,8 @@ Project-local memory looks like this:
 ```text
 your-project/
   .codex-advisor/
-    conversation.json   # continuation state
-    transcript.json     # synced structured transcript
-    transcript.md       # readable synced transcript
-    roles/              # optional conclave role memories
+    project.json        # ChatGPT Project binding
+    projects/<g-p-id>/  # continuation state, transcripts, keyed chats, and role memories
     conclave-runs/      # saved multi-advisor runs
     verifier-runs/      # saved evidence-backed verifier loops
     latest-conclave.md  # latest conclave synthesis
@@ -145,7 +143,7 @@ chmod +x setup.sh start-g4f.sh test-advisor.sh test-conclave.sh test-router.sh t
 Setup will:
 
 - clone `https://github.com/xtekky/gpt4free` into `vendor/gpt4free`
-- install Python dependencies
+- create `vendor/gpt4free/.venv` and install Python dependencies there
 - apply `patches/gpt4free-advisor.patch`
 - install the Codex skill into your Codex skills folder
 - write `advisor-config.json` so Codex knows the exact local start script path
@@ -184,6 +182,8 @@ Ubuntu/Linux:
 ```
 
 If `vendor/gpt4free` is missing, the start script will run setup automatically before starting the API.
+If port `8080` is already in use, stop the existing server or start on another port with `.\start-g4f.ps1 -Port 8081` or `G4F_PORT=8081 ./start-g4f.sh`.
+Debug logging is off by default. Use `.\start-g4f.ps1 -DebugLog` or `G4F_DEBUG=true ./start-g4f.sh` only when troubleshooting.
 
 Default model:
 
@@ -393,7 +393,7 @@ If no Project can be inferred and you want a new private Project:
 python .\codex-skill\external-advisor\scripts\project_migrate.py --create-missing --archive-root
 ```
 
-Migration only touches `.codex-advisor`. It writes `project.json`, copies old root conversation/transcript files under `.codex-advisor/projects/<g-p-id>/` when needed, and with `--archive-root` moves stale root files into `.codex-advisor/legacy-root/`.
+Migration writes local `.codex-advisor` files. With `--create-missing`, it can also create a private remote ChatGPT Project. It writes `project.json`, copies old root conversation/transcript files under `.codex-advisor/projects/<g-p-id>/` when that Project was inferred or supplied, and with `--archive-root` moves stale root files into `.codex-advisor/legacy-root/`. It does not copy an old root chat into a newly created Project because that remote conversation cannot belong to the new Project.
 
 When a project binding exists, normal advisor calls pass the normalized `g-p-...` id to g4f and store the default local conversation state under:
 
@@ -403,7 +403,7 @@ When a project binding exists, normal advisor calls pass the normalized `g-p-...
 .codex-advisor/projects/<g-p-id>/transcript.md
 ```
 
-You can also set it for one shell session without writing it manually:
+You can also bind from an environment variable. The advisor persists the normalized Project id into `.codex-advisor/project.json` on use:
 
 ```powershell
 $env:ADVISOR_CHATGPT_PROJECT_URL = "https://chatgpt.com/g/g-p-.../project"
@@ -569,7 +569,7 @@ Each role gets its own project-local memory:
 
 ```text
 .codex-advisor/
-  roles/
+  projects/<g-p-id>/roles/
     planner/text/conversation.json
     planner/json/conversation.json
     critic/text/conversation.json
@@ -692,7 +692,7 @@ The loop writes:
 .codex-advisor/latest-verifier-loop.md
 ```
 
-By default it runs explicit commands plus safe verifier-suggested commands such as tests, linters, `git status`, and `git diff`. Suspicious shell commands are skipped unless `--allow-unsafe-commands` is used.
+By default it runs only explicit commands passed with `--command`. Advisor-suggested commands are recorded but not executed unless `--run-suggested` is used. Suspicious shell commands are skipped unless `--allow-unsafe-commands` is used.
 
 To skip remote transcript sync for one call:
 
@@ -705,6 +705,8 @@ For multiple separate advisor chats inside the same project:
 ```powershell
 $env:ADVISOR_CONVERSATION_KEY = "my-topic"
 ```
+
+Keyed conversations default to `.codex-advisor/conversations/` or `.codex-advisor/projects/<g-p-id>/conversations/`, so the same key does not collide across repositories. Set `ADVISOR_STATE_DIR` only when you intentionally want a custom state directory.
 
 ## Fresh Advisor Chat
 
@@ -753,7 +755,15 @@ har_and_cookies/
 .codex-advisor/
 *.har
 *.cookie.json
+*.cookies.json
+auth_*.json
+conversation.json
+transcript.json
+transcript.md
 .env
+.env.*
+secrets.env
+*.log
 ```
 
 The public repo should contain only the skill, scripts, docs, and patch files. Your HAR, cookies, and local advisor transcripts stay on your machine.

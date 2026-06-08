@@ -22,6 +22,23 @@ MEMORY_FILES = (
     "outcomes.json",
 )
 
+SENSITIVE_FILE_NAMES = {
+    ".env",
+    ".env.local",
+    "auth_openaichat.json",
+    "conversation.json",
+    "transcript.json",
+    "transcript.md",
+}
+
+SENSITIVE_SUFFIXES = (
+    ".har",
+    ".cookie.json",
+    ".cookies.json",
+    ".pem",
+    ".key",
+)
+
 
 @dataclass
 class CommandCapture:
@@ -52,12 +69,35 @@ def read_text(path: Path, limit: int) -> str:
     return truncate(path.read_text(encoding="utf-8", errors="replace"), limit)
 
 
+def resolve_input_file(project_dir: Path, raw: str, allow_outside_project: bool) -> Path:
+    path = (project_dir / raw).resolve() if not Path(raw).is_absolute() else Path(raw).resolve()
+    try:
+        path.relative_to(project_dir)
+        in_project = True
+    except ValueError:
+        in_project = False
+    if not in_project and not allow_outside_project:
+        raise RuntimeError(f"Refusing to include file outside the project: {path}")
+    if is_sensitive_path(project_dir, path):
+        raise RuntimeError(f"Refusing to include sensitive advisor/auth/env/key file: {path}")
+    return path
+
+
 def advisor_dir(project_dir: Path) -> Path:
     return project_dir / ".codex-advisor"
 
 
 def packs_dir(project_dir: Path) -> Path:
     return advisor_dir(project_dir) / "context-packs"
+
+
+def resolve_project_dir(project_dir: Path | None) -> Path:
+    if project_dir is not None:
+        return project_dir.resolve()
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    import advisor  # noqa: PLC0415
+
+    return advisor.advisor_project_dir()
 
 
 def run_capture(project_dir: Path, command: list[str], limit: int) -> CommandCapture:
@@ -95,7 +135,27 @@ def git_context(project_dir: Path, diff_chars: int) -> dict[str, Any]:
     }
 
 
-def file_context(project_dir: Path, paths: list[str], max_chars: int) -> list[dict[str, Any]]:
+def is_sensitive_path(project_dir: Path, path: Path) -> bool:
+    lower_parts = [part.lower() for part in path.parts]
+    name = path.name.lower()
+    try:
+        relative_parts = [part.lower() for part in path.relative_to(project_dir).parts]
+    except ValueError:
+        relative_parts = lower_parts
+    if ".codex-advisor" in relative_parts:
+        return True
+    if "har_and_cookies" in relative_parts:
+        return True
+    if name in SENSITIVE_FILE_NAMES:
+        return True
+    if name.startswith(".env."):
+        return True
+    if name.startswith("auth_") and name.endswith(".json"):
+        return True
+    return any(name.endswith(suffix) for suffix in SENSITIVE_SUFFIXES)
+
+
+def file_context(project_dir: Path, paths: list[str], max_chars: int, allow_outside_project: bool) -> list[dict[str, Any]]:
     items: list[dict[str, Any]] = []
     for raw in paths:
         path = (project_dir / raw).resolve() if not Path(raw).is_absolute() else Path(raw).resolve()
@@ -104,7 +164,18 @@ def file_context(project_dir: Path, paths: list[str], max_chars: int) -> list[di
         except ValueError:
             relative = str(path)
         item: dict[str, Any] = {"path": relative}
-        if not path.exists():
+        in_project = True
+        try:
+            path.relative_to(project_dir)
+        except ValueError:
+            in_project = False
+        if not in_project and not allow_outside_project:
+            item["ok"] = False
+            item["error"] = "Refusing to include a file outside the project. Pass --allow-outside-project to override."
+        elif is_sensitive_path(project_dir, path):
+            item["ok"] = False
+            item["error"] = "Refusing to include advisor state, HAR/cookie/auth, env, or key material."
+        elif not path.exists():
             item["ok"] = False
             item["error"] = "File does not exist."
         elif not path.is_file():
@@ -143,8 +214,8 @@ def build_pack(args: argparse.Namespace, prompt: str) -> dict[str, Any]:
         "draft_or_plan": args.draft.strip() if args.draft else "",
         "constraints": args.constraint,
         "test_failures": args.failure.strip() if args.failure else "",
-        "relevant_files": file_context(args.project_dir, args.file, args.max_file_chars),
-        "extra_context_files": file_context(args.project_dir, args.context_file, args.max_file_chars),
+        "relevant_files": file_context(args.project_dir, args.file, args.max_file_chars, args.allow_outside_project),
+        "extra_context_files": file_context(args.project_dir, args.context_file, args.max_file_chars, args.allow_outside_project),
         "git": git_context(args.project_dir, args.diff_chars) if not args.no_git else {"available": False, "reason": "Disabled by --no-git."},
         "memory": memory_context(args.project_dir, args.memory_chars) if not args.no_memory else [],
     }
@@ -235,7 +306,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--file", action="append", default=[], help="Relevant file to include. Repeat for multiple files.")
     parser.add_argument("--context-file", action="append", default=[], help="Additional context file to include.")
     parser.add_argument("--constraint", action="append", default=[], help="Constraint to include.")
-    parser.add_argument("--project-dir", type=Path, default=Path.cwd())
+    parser.add_argument("--project-dir", type=Path, help="Project directory. Defaults to the nearest Git repo root or current directory.")
+    parser.add_argument("--allow-outside-project", action="store_true", help="Allow explicit file/context paths outside the project directory.")
     parser.add_argument("--trace-id", default="")
     parser.add_argument("--task-id", default="")
     parser.add_argument("--max-file-chars", type=int, default=12000)
@@ -250,13 +322,13 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     configure_stdio()
     args = parse_args()
-    args.project_dir = args.project_dir.resolve()
+    args.project_dir = resolve_project_dir(args.project_dir)
     args.trace_id = args.trace_id or str(uuid.uuid4())
     args.task_id = args.task_id or str(uuid.uuid4())
     if args.draft_file:
-        args.draft = read_text(Path(args.draft_file), args.max_file_chars)
+        args.draft = read_text(resolve_input_file(args.project_dir, args.draft_file, args.allow_outside_project), args.max_file_chars)
     if args.failure_file:
-        args.failure = read_text(Path(args.failure_file), args.max_file_chars)
+        args.failure = read_text(resolve_input_file(args.project_dir, args.failure_file, args.allow_outside_project), args.max_file_chars)
     if args.draft:
         args.draft = sanitize_text(args.draft)
     if args.failure:

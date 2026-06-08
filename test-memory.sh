@@ -3,10 +3,12 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 MEMORY="$ROOT/codex-skill/external-advisor/scripts/memory_manager.py"
-ADVISOR_DIR="$ROOT/.codex-advisor"
+PROJECT="$(mktemp -d)"
+trap 'rm -rf "$PROJECT"' EXIT
+ADVISOR_DIR="$PROJECT/.codex-advisor"
 
-python3 "$MEMORY" init
-python3 "$MEMORY" record-decision \
+python3 "$MEMORY" --project-dir "$PROJECT" init
+python3 "$MEMORY" --project-dir "$PROJECT" record-decision \
   --id "memory-smoke-decision" \
   --decision "Use evidence-backed verifier loops for failed tests." \
   --rationale "Verifier advice should be connected to command output." \
@@ -14,7 +16,7 @@ python3 "$MEMORY" record-decision \
   --confidence 0.9 \
   --status "accepted" \
   --tag "verifier"
-python3 "$MEMORY" record-outcome \
+python3 "$MEMORY" --project-dir "$PROJECT" record-outcome \
   --id "memory-smoke-outcome" \
   --task "Smoke test memory manager." \
   --advisor-mode "verifier-loop" \
@@ -25,7 +27,7 @@ python3 "$MEMORY" record-outcome \
   --source "test-memory.sh" \
   --confidence 0.8 \
   --status "accepted"
-python3 "$MEMORY" summary
+python3 "$MEMORY" --project-dir "$PROJECT" summary
 
 python3 - "$ADVISOR_DIR" <<'PY'
 import json

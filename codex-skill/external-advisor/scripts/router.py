@@ -91,6 +91,15 @@ def script_path(name: str) -> Path:
     return Path(__file__).resolve().with_name(name)
 
 
+def resolve_project_dir(project_dir: Path | None) -> Path:
+    if project_dir is not None:
+        return project_dir.resolve()
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    import advisor  # noqa: PLC0415
+
+    return advisor.advisor_project_dir()
+
+
 def command_preview(decision: RouteDecision, args: argparse.Namespace) -> list[str]:
     if decision.route == "no-advisor":
         return []
@@ -146,6 +155,20 @@ def route_task(args: argparse.Namespace, prompt: str) -> RouteDecision:
     ]).strip()
     words = re.findall(r"\w+", text)
     reasons: list[str] = []
+    security_hits = contains_any(text, SECURITY_TERMS)
+
+    if security_hits and not args.allow_sensitive_advisor:
+        reasons.append("security/privacy terms: " + ", ".join(security_hits[:6]))
+        return RouteDecision(
+            "no-advisor",
+            "none",
+            None,
+            [],
+            False,
+            0.9,
+            reasons,
+            "Sensitive/security-related task. Handle locally or rerun with --allow-sensitive-advisor after redacting context.",
+        )
 
     explicit = args.force_route
     if explicit:
@@ -164,9 +187,8 @@ def route_task(args: argparse.Namespace, prompt: str) -> RouteDecision:
         reasons.append("failed tests or error output present")
         return RouteDecision("verifier", "verifier-loop", "verification", ["verifier"], False, 0.88, reasons)
 
-    security_hits = contains_any(text, SECURITY_TERMS)
     if security_hits:
-        reasons.append("security/privacy terms: " + ", ".join(security_hits[:6]))
+        reasons.append("security/privacy terms allowed by --allow-sensitive-advisor: " + ", ".join(security_hits[:6]))
         return RouteDecision("conclave", "conclave", "security", ["security", "critic", "verifier"], False, 0.9, reasons)
 
     model_hits = contains_any(text, MODEL_CHOICE_TERMS)
@@ -232,6 +254,7 @@ def build_payload(args: argparse.Namespace, prompt: str, decision: RouteDecision
         "before_final": args.before_final,
         "context_files": args.context_file,
         "auto_context_pack": not args.no_context_pack,
+        "allow_sensitive_advisor": args.allow_sensitive_advisor,
         "route": decision.route,
         "command_kind": decision.command_kind,
         "mode": decision.mode,
@@ -365,7 +388,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--reasoning-effort", default=os.environ.get("ADVISOR_REASONING_EFFORT", "high"))
     parser.add_argument("--max-output-tokens", type=int, default=int(os.environ.get("ADVISOR_MAX_OUTPUT_TOKENS", "1200")))
     parser.add_argument("--timeout", type=int, default=int(os.environ.get("ADVISOR_TIMEOUT", "300")))
-    parser.add_argument("--project-dir", type=Path, default=Path.cwd())
+    parser.add_argument("--project-dir", type=Path, help="Project directory. Defaults to the nearest Git repo root or current directory.")
+    parser.add_argument("--allow-sensitive-advisor", action="store_true", help="Allow advisor routing for security/privacy/auth/token tasks after caller redaction.")
     parser.add_argument("--trace-id", default=os.environ.get("ADVISOR_TRACE_ID"))
     parser.add_argument("--task-id", default=os.environ.get("ADVISOR_TASK_ID"))
     parser.add_argument("--no-sync", action="store_true")
@@ -377,7 +401,7 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     configure_stdio()
     args = parse_args()
-    args.project_dir = args.project_dir.resolve()
+    args.project_dir = resolve_project_dir(args.project_dir)
     args.trace_id = args.trace_id or str(uuid.uuid4())
     args.task_id = args.task_id or str(uuid.uuid4())
     prompt = sanitize_text(args.prompt if args.prompt is not None else sys.stdin.read())
