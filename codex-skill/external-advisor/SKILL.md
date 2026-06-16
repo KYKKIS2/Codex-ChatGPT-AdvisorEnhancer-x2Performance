@@ -101,6 +101,10 @@ $env:ADVISOR_REASONING_EFFORT = "high"
 python $HOME\.codex\skills\external-advisor\scripts\advisor.py --prompt "Review this draft answer: ..."
 ```
 
+For ChatGPT web Intelligence/thinking choices, set the private ChatGPT field explicitly with `ADVISOR_THINKING_EFFORT` or `--thinking-effort`. Examples: `extended`, `pro-extended`, `xhigh`, `extra-high`, `high`, `medium`, or `none`. This is separate from `ADVISOR_REASONING_EFFORT`; the advisor does not infer private ChatGPT values from the OpenAI-compatible reasoning value.
+
+`extended` was observed in local HAR captures for Pro Extended, but current g4f/OpenaiChat returns an empty API response for that mode because ChatGPT streams the turn over a conversation-turn WebSocket. Treat that as unsupported until the provider implements the WebSocket handoff path.
+
 Bounded conclave for harder tasks:
 
 ```powershell
@@ -108,6 +112,7 @@ $env:ADVISOR_PROVIDER = "openai-compatible"
 $env:ADVISOR_BASE_URL = "http://127.0.0.1:8080/v1"
 $env:ADVISOR_MODEL = "gpt-5-5-thinking"
 $env:ADVISOR_REASONING_EFFORT = "high"
+$env:ADVISOR_THINKING_EFFORT = "none"
 python $HOME\.codex\skills\external-advisor\scripts\conclave.py --mode architecture --prompt "Evaluate this architecture decision: ..."
 ```
 

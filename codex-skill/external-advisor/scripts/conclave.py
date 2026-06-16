@@ -327,6 +327,8 @@ def run_advisor_role(args: argparse.Namespace, role: str, shared_context: str) -
     env["ADVISOR_PROVIDER"] = args.provider
     env["ADVISOR_MODEL"] = args.model
     env["ADVISOR_REASONING_EFFORT"] = args.reasoning_effort
+    if args.thinking_effort is not None:
+        env["ADVISOR_THINKING_EFFORT"] = args.thinking_effort
     env["ADVISOR_MAX_OUTPUT_TOKENS"] = str(args.max_output_tokens)
     env["ADVISOR_TIMEOUT"] = str(args.timeout)
     env["ADVISOR_STATE_PATH"] = str(role_state_path(args.project_dir, role, args.output_format, args.active_project_id))
@@ -347,6 +349,7 @@ def run_advisor_role(args: argparse.Namespace, role: str, shared_context: str) -
         args.provider,
         "--model",
         args.model,
+        *([] if args.thinking_effort is None else ["--thinking-effort", args.thinking_effort]),
         "--timeout",
         str(args.timeout),
     ]
@@ -594,6 +597,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--base-url", default=os.environ.get("ADVISOR_BASE_URL", "http://127.0.0.1:8080/v1"))
     parser.add_argument("--model", default=os.environ.get("ADVISOR_MODEL", "gpt-5-5-thinking"))
     parser.add_argument("--reasoning-effort", default=os.environ.get("ADVISOR_REASONING_EFFORT", "high"))
+    parser.add_argument(
+        "--thinking-effort",
+        default=(
+            os.environ.get("ADVISOR_THINKING_EFFORT")
+            or os.environ.get("ADVISOR_CHATGPT_THINKING_EFFORT")
+            or os.environ.get("ADVISOR_INTELLIGENCE")
+        ),
+        help="ChatGPT web intelligence/thinking effort, e.g. high, xhigh, pro-extended, or extended.",
+    )
     parser.add_argument("--max-output-tokens", type=int, default=int(os.environ.get("ADVISOR_MAX_OUTPUT_TOKENS", "1200")))
     parser.add_argument("--timeout", type=int, default=int(os.environ.get("ADVISOR_TIMEOUT", "300")))
     parser.add_argument("--project-dir", type=Path, help="Project directory. Defaults to the nearest Git repo root or current directory.")

@@ -28,10 +28,48 @@ form of guidance.
 """
 
 PROJECT_ID_RE = re.compile(r"(g-p-[A-Za-z0-9]+)")
+THINKING_EFFORT_ALIASES = {
+    "": None,
+    "none": None,
+    "off": None,
+    "default": None,
+    "instant": None,
+    "low": "low",
+    "medium": "medium",
+    "high": "high",
+    "extra high": "xhigh",
+    "extra-high": "xhigh",
+    "extra_high": "xhigh",
+    "xhigh": "xhigh",
+    "pro": "pro",
+    "pro extended": "extended",
+    "pro-extended": "extended",
+    "pro_extended": "extended",
+    "extended": "extended",
+}
 
 
 def system_prompt() -> str:
     return os.environ.get("ADVISOR_SYSTEM_PROMPT", SYSTEM_PROMPT)
+
+
+def normalize_thinking_effort(value: str | None) -> str | None:
+    if value is None:
+        return None
+    normalized = value.strip().lower()
+    return THINKING_EFFORT_ALIASES.get(normalized, value.strip() or None)
+
+
+def configured_thinking_effort(reasoning_effort: str | None) -> str | None:
+    del reasoning_effort
+    explicit = (
+        os.environ.get("ADVISOR_THINKING_EFFORT")
+        or os.environ.get("ADVISOR_CHATGPT_THINKING_EFFORT")
+        or os.environ.get("ADVISOR_INTELLIGENCE")
+    )
+    if explicit is not None:
+        return normalize_thinking_effort(explicit)
+    return None
 
 
 def configure_stdio() -> None:
@@ -579,6 +617,7 @@ def call_compatible(prompt: str, model: str, timeout: int) -> str:
     base_url = os.environ.get("ADVISOR_BASE_URL", "http://127.0.0.1:8080/v1").rstrip("/")
     api_key = os.environ.get("ADVISOR_API_KEY", os.environ.get("OPENAI_API_KEY", "local"))
     reasoning_effort = os.environ.get("ADVISOR_REASONING_EFFORT")
+    thinking_effort = configured_thinking_effort(reasoning_effort)
     payload = {
         "model": model,
         "messages": [
@@ -615,6 +654,8 @@ def call_compatible(prompt: str, model: str, timeout: int) -> str:
         payload["temporary"] = True
     if reasoning_effort:
         payload["reasoning_effort"] = reasoning_effort
+    if thinking_effort:
+        payload["thinking_effort"] = thinking_effort
     headers = {
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
@@ -634,7 +675,14 @@ def call_compatible(prompt: str, model: str, timeout: int) -> str:
         save_conversation(state_path, response, project_id)
         if sync_remote and not temporary:
             sync_remote_conversation(state_path, load_conversation(state_path), timeout, project_id)
-    return extract_chat_text(response)
+    text = extract_chat_text(response)
+    if thinking_effort and not text.strip():
+        raise RuntimeError(
+            f"ChatGPT returned an empty response for thinking_effort={thinking_effort!r}. "
+            "This likely needs g4f/OpenaiChat support for ChatGPT's WebSocket stream handoff "
+            "used by Pro/extended thinking turns."
+        )
+    return text
 
 
 def parse_args() -> argparse.Namespace:
@@ -642,6 +690,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--prompt", help="Prompt, question, draft, or plan. Reads stdin when omitted.")
     parser.add_argument("--context-file", action="append", default=[], help="Additional UTF-8 context file.")
     parser.add_argument("--model", default=os.environ.get("ADVISOR_MODEL", "gpt-5-5-thinking"))
+    parser.add_argument(
+        "--thinking-effort",
+        default=(
+            os.environ.get("ADVISOR_THINKING_EFFORT")
+            or os.environ.get("ADVISOR_CHATGPT_THINKING_EFFORT")
+            or os.environ.get("ADVISOR_INTELLIGENCE")
+        ),
+        help="ChatGPT web intelligence/thinking effort, e.g. high, xhigh, pro-extended, or extended.",
+    )
     parser.add_argument(
         "--provider",
         choices=["openai", "openai-compatible"],
@@ -655,6 +712,8 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     configure_stdio()
     args = parse_args()
+    if args.thinking_effort is not None:
+        os.environ["ADVISOR_THINKING_EFFORT"] = args.thinking_effort
     prompt = args.prompt if args.prompt is not None else sys.stdin.read()
     prompt = sanitize_text(build_prompt(prompt, args.context_file))
     if not prompt.strip():

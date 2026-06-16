@@ -40,10 +40,18 @@ index 98cbd139..c5fb9556 100644
 +        debug.log("No decoded proof_token found in .har files; using generated proof token fallback")
      return request_config
 diff --git a/g4f/api/stubs.py b/g4f/api/stubs.py
-index 662609dc..c495d082 100644
+index 662609dc..f6b6cf15 100644
 --- a/g4f/api/stubs.py
 +++ b/g4f/api/stubs.py
-@@ -50,6 +50,9 @@ class RequestConfig(BaseModel):
+@@ -41,6 +41,7 @@ class RequestConfig(BaseModel):
+         ],
+     )
+     reasoning_effort: Optional[Literal["low", "medium", "high"]] = None
++    thinking_effort: Optional[str] = None
+     logit_bias: Optional[dict] = None
+     audio: Optional[dict] = None
+     response_format: Optional[dict] = None
+@@ -50,6 +51,9 @@ class RequestConfig(BaseModel):
      download_media: bool = False
      raw: bool = False
      extra_body: Optional[dict] = None
@@ -54,10 +62,18 @@ index 662609dc..c495d082 100644
      # emulate OpenAI tool_calls for providers that don't support tools natively.
      tool_emulation: Optional[bool] = None
 diff --git a/g4f/Provider/needs_auth/OpenaiChat.py b/g4f/Provider/needs_auth/OpenaiChat.py
-index 9f3e0a1d..dfef1c9a 100644
+index 9f3e0a1d..dc2a9b9e 100644
 --- a/g4f/Provider/needs_auth/OpenaiChat.py
 +++ b/g4f/Provider/needs_auth/OpenaiChat.py
-@@ -452,8 +452,10 @@ class OpenaiChat(AsyncGeneratorProvider, ProviderModelMixin):
+@@ -381,6 +381,7 @@ class OpenaiChat(AsyncGeneratorProvider, ProviderModelMixin):
+         temporary: Optional[bool] = None,
+         conversation_id: Optional[str] = None,
+         reasoning_effort: Optional[str] = None,
++        thinking_effort: Optional[str] = None,
+         **kwargs
+     ) -> AsyncResult:
+         """
+@@ -452,14 +453,17 @@ class OpenaiChat(AsyncGeneratorProvider, ProviderModelMixin):
                  else:
                      conversation_mode = {"kind": "primary_assistant"}
  
@@ -71,3 +87,29 @@ index 9f3e0a1d..dfef1c9a 100644
              if cls._api_key is None:
                  auto_continue = False
              conversation.finish_reason = None
+             sources = OpenAISources([])
+             references = ContentReferences()
+             system_hints = ["picture_v2"] if image_model else []
+-            if reasoning_effort == "high":
++            if reasoning_effort == "high" and thinking_effort is None:
+                 system_hints.append("reason")
+             if web_search:
+                 system_hints.append("search")
+@@ -489,6 +495,8 @@ class OpenaiChat(AsyncGeneratorProvider, ProviderModelMixin):
+                     }
+                     if temporary:
+                         data["history_and_training_disabled"] = True
++                    if thinking_effort:
++                        data["thinking_effort"] = thinking_effort
+                     if conversation.conversation_id is not None and not temporary:
+                         data["conversation_id"] = conversation.conversation_id
+                     async with session.post(
+@@ -552,6 +560,8 @@ class OpenaiChat(AsyncGeneratorProvider, ProviderModelMixin):
+                 }
+                 if temporary:
+                     data["history_and_training_disabled"] = True
++                if thinking_effort:
++                    data["thinking_effort"] = thinking_effort
+ 
+                 if conversation.conversation_id is not None and not temporary:
+                     data["conversation_id"] = conversation.conversation_id
