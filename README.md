@@ -215,7 +215,7 @@ ADVISOR_THINKING_EFFORT=extended \
 python3 ~/.codex/skills/external-advisor/scripts/advisor.py --prompt "Review this carefully: ..."
 ```
 
-Aliases include `pro-extended` -> `extended`, `extra-high` -> `xhigh`, and `instant`/`none` to omit the private field. Only `extended` has been observed in the local HAR so far, and it currently reaches ChatGPT but returns an empty API response because that mode uses ChatGPT's conversation-turn WebSocket stream. The advisor now reports that clearly instead of silently accepting an empty answer.
+Aliases include `pro-extended` -> `extended`, `extra-high` -> `xhigh`, and `instant`/`none` to omit the private field. `extended` has been observed in local HAR captures for Pro Extended. The setup patch adds g4f/OpenaiChat support for ChatGPT's conversation-turn WebSocket handoff, so extended turns can continue after ChatGPT moves the response stream from the initial SSE request to a per-turn WebSocket topic.
 
 ## Test The Advisor
 

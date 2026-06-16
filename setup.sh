@@ -153,11 +153,196 @@ if text.count("data[\"thinking_effort\"] = thinking_effort") < 2:
     text = text.replace(needle, replacement, 1)
     changed = True
 
+needle = (
+    "                async with session.post(\n"
+    "                    backend_anon_url\n"
+)
+replacement = (
+    "                turn_topic_id = None\n"
+    "                async with session.post(\n"
+    "                    backend_anon_url\n"
+)
+if "turn_topic_id = None" not in text:
+    if needle not in text:
+        raise SystemExit("Could not find OpenaiChat conversation POST block")
+    text = text.replace(needle, replacement, 1)
+    changed = True
+
+needle = (
+    "                    async for line in response.iter_lines():\n"
+    "                        pattern = re.compile(r\"file-service://[\\w-]+\")\n"
+)
+replacement = (
+    "                    async for line in response.iter_lines():\n"
+    "                        turn_topic_id = turn_topic_id or cls.get_resume_turn_topic_id(line)\n"
+    "                        pattern = re.compile(r\"file-service://[\\w-]+\")\n"
+)
+if "turn_topic_id = turn_topic_id or cls.get_resume_turn_topic_id(line)" not in text:
+    if needle not in text:
+        raise SystemExit("Could not find OpenaiChat SSE line loop")
+    text = text.replace(needle, replacement, 1)
+    changed = True
+
+needle = (
+    "                    if buffer:\n"
+    "                        yield buffer\n"
+    "                if sources.list:\n"
+)
+replacement = (
+    "                    if buffer:\n"
+    "                        yield buffer\n"
+    "                if turn_topic_id and conversation.finish_reason is None:\n"
+    "                    async for chunk in cls.iter_conversation_turn_ws(\n"
+    "                        session,\n"
+    "                        auth_result,\n"
+    "                        turn_topic_id,\n"
+    "                        conversation,\n"
+    "                        sources,\n"
+    "                        references,\n"
+    "                        timeout,\n"
+    "                    ):\n"
+    "                        yield chunk\n"
+    "                if sources.list:\n"
+)
+if "cls.iter_conversation_turn_ws(" not in text:
+    if needle not in text:
+        raise SystemExit("Could not find OpenaiChat post-SSE insertion point")
+    text = text.replace(needle, replacement, 1)
+    changed = True
+
+helpers = r'''
+    @classmethod
+    def get_turn_topic_id(cls, token: str) -> Optional[str]:
+        try:
+            payload = token.split(".")[1]
+            payload += "=" * (-len(payload) % 4)
+            data = json.loads(base64.urlsafe_b64decode(payload.encode()).decode())
+        except Exception as e:
+            debug.error(f"OpenaiChat: Could not decode turn topic token: {e}")
+            return None
+        return data.get("turn_topic_id")
+
+    @classmethod
+    def get_resume_turn_topic_id(cls, line: bytes) -> Optional[str]:
+        if not line.startswith(b"data: "):
+            return None
+        try:
+            data = json.loads(line[6:])
+        except Exception:
+            return None
+        if not isinstance(data, dict):
+            return None
+        if data.get("type") != "resume_conversation_token":
+            return None
+        if data.get("kind") != "topic":
+            return None
+        token = data.get("token")
+        return cls.get_turn_topic_id(token) if isinstance(token, str) else None
+
+    @classmethod
+    async def iter_conversation_turn_ws(
+        cls,
+        session,
+        auth_result: AuthResult,
+        topic_id: str,
+        conversation: Conversation,
+        sources: OpenAISources,
+        references: ContentReferences,
+        timeout: Optional[int] = 120,
+    ) -> AsyncIterator:
+        async with AsyncSession(
+            timeout=timeout,
+            impersonate="chrome",
+            headers=auth_result.headers,
+            cookies=auth_result.cookies
+        ) as ws_session:
+            response = await ws_session.get(
+                "https://chatgpt.com/backend-api/celsius/ws/user",
+                headers=auth_result.headers,
+            )
+            response.raise_for_status()
+            websocket_url = response.json().get("websocket_url")
+            if not websocket_url:
+                raise RuntimeError("OpenaiChat: No websocket_url returned for conversation-turn stream")
+            if not isinstance(websocket_url, str) or not websocket_url.startswith("wss://ws.chatgpt.com/"):
+                raise RuntimeError("OpenaiChat: Unexpected conversation-turn websocket URL")
+
+            wss = await ws_session.ws_connect(websocket_url, timeout=3)
+            command_id = 1
+            subscribed = False
+            try:
+                await wss.send_json([
+                    {"id": command_id, "command": {"type": "connect", "presence": {"type": "presence", "state": "foreground"}}},
+                    {"id": command_id + 1, "command": {"type": "subscribe", "topic_id": topic_id, "offset": "0"}},
+                ])
+                command_id += 2
+                subscribed = True
+                started = False
+                while not wss.closed:
+                    try:
+                        frames = await wss.recv_json(timeout=60 if not started else timeout)
+                    except Exception:
+                        break
+                    if not isinstance(frames, list):
+                        frames = [frames]
+                    for frame in frames:
+                        if not isinstance(frame, dict):
+                            continue
+                        messages = []
+                        reply = frame.get("reply")
+                        if isinstance(reply, dict):
+                            messages.extend(reply.get("catchups") or [])
+                        if frame.get("type") == "message":
+                            messages.append(frame)
+                        for message in messages:
+                            if not isinstance(message, dict) or message.get("topic_id") != topic_id:
+                                continue
+                            payload = message.get("payload", {})
+                            if payload.get("type") != "conversation-turn-stream":
+                                continue
+                            stream_item = payload.get("payload", {})
+                            if conversation.conversation_id is not None and stream_item.get("conversation_id") != conversation.conversation_id:
+                                continue
+                            encoded_item = stream_item.get("encoded_item")
+                            if not isinstance(encoded_item, str):
+                                continue
+                            started = True
+                            for encoded_line in encoded_item.splitlines():
+                                async for chunk in cls.iter_messages_line(
+                                    session,
+                                    auth_result,
+                                    encoded_line.encode(),
+                                    conversation,
+                                    sources,
+                                    references,
+                                ):
+                                    yield chunk
+                            if "message_stream_complete" in encoded_item or conversation.finish_reason is not None:
+                                return
+            finally:
+                if subscribed and not wss.closed:
+                    try:
+                        await wss.send_json([
+                            {"id": command_id, "command": {"type": "unsubscribe", "topic_id": topic_id}}
+                        ])
+                    except Exception:
+                        pass
+                if not wss.closed:
+                    await wss.close()
+
+'''
+if "def get_resume_turn_topic_id" not in text:
+    needle = "    @classmethod\n    async def wait_media(\n"
+    if needle not in text:
+        raise SystemExit("Could not find OpenaiChat wait_media insertion point")
+    text = text.replace(needle, helpers + needle, 1)
+    changed = True
+
 if changed:
     path.write_text(text, encoding="utf-8")
-    print("Added gpt4free ChatGPT thinking_effort request support.")
+    print("Added gpt4free ChatGPT thinking_effort and WebSocket handoff support.")
 else:
-    print("gpt4free ChatGPT thinking_effort request support already applied.")
+    print("gpt4free ChatGPT thinking_effort and WebSocket handoff support already applied.")
 PY
 
 mkdir -p "$G4F/har_and_cookies"

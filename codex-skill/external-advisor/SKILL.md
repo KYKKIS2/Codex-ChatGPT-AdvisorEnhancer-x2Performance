@@ -103,7 +103,7 @@ python $HOME\.codex\skills\external-advisor\scripts\advisor.py --prompt "Review 
 
 For ChatGPT web Intelligence/thinking choices, set the private ChatGPT field explicitly with `ADVISOR_THINKING_EFFORT` or `--thinking-effort`. Examples: `extended`, `pro-extended`, `xhigh`, `extra-high`, `high`, `medium`, or `none`. This is separate from `ADVISOR_REASONING_EFFORT`; the advisor does not infer private ChatGPT values from the OpenAI-compatible reasoning value.
 
-`extended` was observed in local HAR captures for Pro Extended, but current g4f/OpenaiChat returns an empty API response for that mode because ChatGPT streams the turn over a conversation-turn WebSocket. Treat that as unsupported until the provider implements the WebSocket handoff path.
+`extended` was observed in local HAR captures for Pro Extended. This repo's setup patch adds the required g4f/OpenaiChat conversation-turn WebSocket handoff path for that mode. If an extended call returns empty text, refresh the HAR/session first, then inspect the WebSocket handoff in `OpenaiChat`.
 
 Bounded conclave for harder tasks:
 

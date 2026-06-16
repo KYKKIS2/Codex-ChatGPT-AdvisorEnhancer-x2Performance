@@ -679,8 +679,8 @@ def call_compatible(prompt: str, model: str, timeout: int) -> str:
     if thinking_effort and not text.strip():
         raise RuntimeError(
             f"ChatGPT returned an empty response for thinking_effort={thinking_effort!r}. "
-            "This likely needs g4f/OpenaiChat support for ChatGPT's WebSocket stream handoff "
-            "used by Pro/extended thinking turns."
+            "Refresh the HAR/session first; if it still fails, inspect the g4f/OpenaiChat "
+            "conversation-turn WebSocket handoff used by Pro/extended thinking turns."
         )
     return text
 
