@@ -230,6 +230,8 @@ Pro Extended is for hard advisor questions: architecture reviews, high-risk debu
 
 The ChatGPT WebSocket can carry visible live progress such as reasoning status, summaries, recaps, and metadata, but not private hidden chain-of-thought. If the local OpenAI-compatible response returns empty content after a Pro/extended turn, the advisor attempts one fallback fetch from `backend-api/conversation/<id>` after the main stream has already ended, then recovers the latest finished assistant message after the latest user turn into the saved transcript/state. It does not poll repeatedly by default. Set `ADVISOR_FINAL_FETCH_MAX_POLLS` above `1` only when debugging a persistence race; `ADVISOR_FINAL_FETCH_POLL_SECONDS` controls the bounded delay between those explicit extra attempts.
 
+For foreground Pro Extended calls, Codex should start the command with a long timeout and wait quietly for it to finish. Do not send periodic "still running" updates or repeatedly poll the active shell session unless the user asks for status. If polling is unavoidable in the execution environment, use long waits of several minutes and report only completion, an actual error, or a meaningful timeout.
+
 For detached advisor jobs, prefer the audited launcher over ad hoc `nohup` snippets:
 
 ```bash
