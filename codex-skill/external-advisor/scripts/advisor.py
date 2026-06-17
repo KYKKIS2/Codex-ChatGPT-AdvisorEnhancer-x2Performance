@@ -641,12 +641,13 @@ def fetch_remote_final_text(
     auth = load_chatgpt_auth()
     if not auth:
         return ""
+    max_polls = int_env("ADVISOR_FINAL_FETCH_MAX_POLLS", 1, minimum=1)
     fallback_timeout = int_env("ADVISOR_FINAL_FETCH_TIMEOUT", min(max(timeout, 1), 180), minimum=1)
     poll_seconds = float_env("ADVISOR_FINAL_FETCH_POLL_SECONDS", 5.0, minimum=0.5)
     deadline = time.monotonic() + fallback_timeout
     url = f"https://chatgpt.com/backend-api/conversation/{conversation_id}"
     last_data: dict[str, Any] | None = None
-    while True:
+    for attempt in range(max_polls):
         try:
             conversation_data = get_json(url, auth["headers"], timeout)
         except RuntimeError as exc:
@@ -672,13 +673,17 @@ def fetch_remote_final_text(
             state_path.parent.mkdir(parents=True, exist_ok=True)
             state_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
             return text
-        if time.monotonic() >= deadline:
+        if attempt + 1 >= max_polls or time.monotonic() >= deadline:
             if last_data is not None:
                 transcript = transcript_from_conversation(last_data)
                 if transcript:
                     write_transcript(state_path, last_data, transcript)
             return ""
-        time.sleep(poll_seconds)
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return ""
+        time.sleep(min(poll_seconds, remaining))
+    return ""
 
 
 def build_prompt(prompt: str, context_files: list[str]) -> str:

@@ -228,7 +228,7 @@ When no explicit model is set, `pro-extended` automatically selects `gpt-5-pro` 
 
 Pro Extended is for hard advisor questions: architecture reviews, high-risk debugging, security/privacy decisions, and important strategy. It is expected to take time. Long Pro Extended prompts can run silently for several minutes before producing a clean answer. If a detached/background run exits with no response file and an empty log, verify the exact same command in the foreground before blaming Pro Extended or prompt size.
 
-The ChatGPT WebSocket can carry visible live progress such as reasoning status, summaries, recaps, and metadata, but not private hidden chain-of-thought. If the local OpenAI-compatible response returns empty content after a Pro/extended turn, the advisor attempts to fall back to `backend-api/conversation/<id>` and recover the latest finished assistant message after the latest user turn into the saved transcript/state.
+The ChatGPT WebSocket can carry visible live progress such as reasoning status, summaries, recaps, and metadata, but not private hidden chain-of-thought. If the local OpenAI-compatible response returns empty content after a Pro/extended turn, the advisor attempts one fallback fetch from `backend-api/conversation/<id>` after the main stream has already ended, then recovers the latest finished assistant message after the latest user turn into the saved transcript/state. It does not poll repeatedly by default. Set `ADVISOR_FINAL_FETCH_MAX_POLLS` above `1` only when debugging a persistence race; `ADVISOR_FINAL_FETCH_POLL_SECONDS` controls the bounded delay between those explicit extra attempts.
 
 For detached advisor jobs, prefer the audited launcher over ad hoc `nohup` snippets:
 
