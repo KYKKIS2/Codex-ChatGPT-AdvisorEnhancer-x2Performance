@@ -87,7 +87,7 @@ Return:
 }
 PRO_EXTENDED_ALIASES = {"pro extended", "pro-extended", "pro_extended"}
 DEFAULT_MODEL = "gpt-5-5-thinking"
-DEFAULT_PRO_EXTENDED_MODEL = "gpt-5-5-pro-extended"
+DEFAULT_PRO_EXTENDED_MODEL = "gpt-5-pro"
 
 
 MODE_ROLES = {

@@ -224,9 +224,11 @@ ADVISOR_THINKING_EFFORT=pro-extended \
 python3 ~/.codex/skills/external-advisor/scripts/advisor.py --prompt "Review this carefully: ..."
 ```
 
-When no explicit model is set, `pro-extended` automatically selects `gpt-5-5-pro-extended` and sends `thinking_effort=extended`. If you set `ADVISOR_MODEL` or `--model`, that explicit model wins. If ChatGPT changes the private slug, set `ADVISOR_PRO_EXTENDED_MODEL`.
+When no explicit model is set, `pro-extended` automatically selects `gpt-5-pro` and sends `thinking_effort=extended`. If you set `ADVISOR_MODEL` or `--model`, that explicit model wins. If ChatGPT changes the private slug, set `ADVISOR_PRO_EXTENDED_MODEL`.
 
-Long Pro Extended prompts can run silently for a minute or more. If a detached/background run exits with no response file and an empty log, verify the exact same command in the foreground before blaming Pro Extended or prompt size. In testing, a 14 KB architecture-review prompt that looked failed under a fragile background wrapper completed successfully in the foreground after about 80 seconds.
+Pro Extended is for hard advisor questions: architecture reviews, high-risk debugging, security/privacy decisions, and important strategy. It is expected to take time. Long Pro Extended prompts can run silently for several minutes before producing a clean answer. If a detached/background run exits with no response file and an empty log, verify the exact same command in the foreground before blaming Pro Extended or prompt size.
+
+The ChatGPT WebSocket can carry visible live progress such as reasoning status, summaries, recaps, and metadata, but not private hidden chain-of-thought. If the local OpenAI-compatible response returns empty content after a Pro/extended turn, the advisor attempts to fall back to `backend-api/conversation/<id>` and recover the latest finished assistant message after the latest user turn into the saved transcript/state.
 
 For detached advisor jobs, prefer the audited launcher over ad hoc `nohup` snippets:
 

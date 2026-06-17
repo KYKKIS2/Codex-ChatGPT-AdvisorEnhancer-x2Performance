@@ -8,6 +8,7 @@ import json
 import os
 import re
 import sys
+import time
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -49,7 +50,7 @@ THINKING_EFFORT_ALIASES = {
 }
 PRO_EXTENDED_ALIASES = {"pro extended", "pro-extended", "pro_extended"}
 DEFAULT_MODEL = "gpt-5-5-thinking"
-DEFAULT_PRO_EXTENDED_MODEL = "gpt-5-5-pro-extended"
+DEFAULT_PRO_EXTENDED_MODEL = "gpt-5-pro"
 
 
 def system_prompt() -> str:
@@ -186,6 +187,20 @@ def bool_env(name: str, default: bool = False) -> bool:
     if value is None:
         return default
     return value.lower() in ("1", "true", "yes", "on")
+
+
+def int_env(name: str, default: int, minimum: int = 1) -> int:
+    try:
+        return max(minimum, int(os.environ.get(name, str(default))))
+    except ValueError:
+        return default
+
+
+def float_env(name: str, default: float, minimum: float = 0.1) -> float:
+    try:
+        return max(minimum, float(os.environ.get(name, str(default))))
+    except ValueError:
+        return default
 
 
 def advisor_project_dir() -> Path:
@@ -534,6 +549,21 @@ def latest_message_id(conversation_data: dict[str, Any], transcript: list[dict[s
     return None
 
 
+def latest_finished_assistant_text(conversation_data: dict[str, Any]) -> str:
+    transcript = transcript_from_conversation(conversation_data)
+    last_user_index = -1
+    for index, item in enumerate(transcript):
+        if item.get("role") == "user":
+            last_user_index = index
+    candidates = transcript[last_user_index + 1:] if last_user_index >= 0 else transcript
+    for item in reversed(candidates):
+        if item.get("role") == "assistant" and item.get("status") == "finished_successfully":
+            content = str(item.get("content") or "").strip()
+            if content:
+                return content
+    return ""
+
+
 def write_transcript(state_path: Path, conversation_data: dict[str, Any], transcript: list[dict[str, Any]]) -> None:
     state_path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
@@ -595,6 +625,60 @@ def sync_remote_conversation(
         payload["chatgpt_project_id"] = project_id
     state_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
     return conversation
+
+
+def fetch_remote_final_text(
+    state_path: Path,
+    conversation: dict[str, Any] | None,
+    timeout: int,
+    project_id: str | None = None,
+) -> str:
+    if not conversation:
+        return ""
+    conversation_id = conversation.get("conversation_id")
+    if not isinstance(conversation_id, str) or not conversation_id:
+        return ""
+    auth = load_chatgpt_auth()
+    if not auth:
+        return ""
+    fallback_timeout = int_env("ADVISOR_FINAL_FETCH_TIMEOUT", min(max(timeout, 1), 180), minimum=1)
+    poll_seconds = float_env("ADVISOR_FINAL_FETCH_POLL_SECONDS", 5.0, minimum=0.5)
+    deadline = time.monotonic() + fallback_timeout
+    url = f"https://chatgpt.com/backend-api/conversation/{conversation_id}"
+    last_data: dict[str, Any] | None = None
+    while True:
+        try:
+            conversation_data = get_json(url, auth["headers"], timeout)
+        except RuntimeError as exc:
+            if os.environ.get("ADVISOR_SYNC_STRICT", "false").lower() in ("1", "true", "yes"):
+                raise
+            print(f"Advisor final fetch skipped: {redact_sensitive(str(exc))}", file=sys.stderr)
+            return ""
+        last_data = conversation_data
+        text = latest_finished_assistant_text(conversation_data)
+        if text:
+            transcript = transcript_from_conversation(conversation_data)
+            latest_id = latest_message_id(conversation_data, transcript)
+            if latest_id:
+                conversation["message_id"] = latest_id
+                conversation["parent_message_id"] = latest_id
+            if auth.get("user_id"):
+                conversation["user_id"] = auth["user_id"]
+            conversation["conversation_id"] = conversation_id
+            write_transcript(state_path, conversation_data, transcript)
+            payload: dict[str, Any] = {"conversation": conversation}
+            if project_id:
+                payload["chatgpt_project_id"] = project_id
+            state_path.parent.mkdir(parents=True, exist_ok=True)
+            state_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+            return text
+        if time.monotonic() >= deadline:
+            if last_data is not None:
+                transcript = transcript_from_conversation(last_data)
+                if transcript:
+                    write_transcript(state_path, last_data, transcript)
+            return ""
+        time.sleep(poll_seconds)
 
 
 def build_prompt(prompt: str, context_files: list[str]) -> str:
@@ -690,10 +774,13 @@ def call_compatible(prompt: str, model: str, timeout: int) -> str:
             sync_remote_conversation(state_path, load_conversation(state_path), timeout, project_id)
     text = extract_chat_text(response)
     if thinking_effort and not text.strip():
+        if persist and state_path is not None:
+            text = fetch_remote_final_text(state_path, load_conversation(state_path), timeout, project_id)
+    if thinking_effort and not text.strip():
         raise RuntimeError(
             f"ChatGPT returned an empty response for thinking_effort={thinking_effort!r}. "
-            "Refresh the HAR/session first; if it still fails, inspect the g4f/OpenaiChat "
-            "conversation-turn WebSocket handoff used by Pro/extended thinking turns."
+            "Refresh the HAR/session first; if it still fails, inspect the saved transcript "
+            "and the g4f/OpenaiChat conversation-turn WebSocket handoff used by Pro/extended thinking turns."
         )
     return text
 
