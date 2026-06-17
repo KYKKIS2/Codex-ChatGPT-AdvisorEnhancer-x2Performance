@@ -47,6 +47,9 @@ THINKING_EFFORT_ALIASES = {
     "pro_extended": "extended",
     "extended": "extended",
 }
+PRO_EXTENDED_ALIASES = {"pro extended", "pro-extended", "pro_extended"}
+DEFAULT_MODEL = "gpt-5-5-thinking"
+DEFAULT_PRO_EXTENDED_MODEL = "gpt-5-5-pro-extended"
 
 
 def system_prompt() -> str:
@@ -58,6 +61,16 @@ def normalize_thinking_effort(value: str | None) -> str | None:
         return None
     normalized = value.strip().lower()
     return THINKING_EFFORT_ALIASES.get(normalized, value.strip() or None)
+
+
+def is_pro_extended_request(value: str | None) -> bool:
+    return value is not None and value.strip().lower() in PRO_EXTENDED_ALIASES
+
+
+def default_model_for(thinking_effort: str | None) -> str:
+    if is_pro_extended_request(thinking_effort):
+        return os.environ.get("ADVISOR_PRO_EXTENDED_MODEL", DEFAULT_PRO_EXTENDED_MODEL)
+    return DEFAULT_MODEL
 
 
 def configured_thinking_effort(reasoning_effort: str | None) -> str | None:
@@ -689,7 +702,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--prompt", help="Prompt, question, draft, or plan. Reads stdin when omitted.")
     parser.add_argument("--context-file", action="append", default=[], help="Additional UTF-8 context file.")
-    parser.add_argument("--model", default=os.environ.get("ADVISOR_MODEL", "gpt-5-5-thinking"))
+    parser.add_argument("--model", default=os.environ.get("ADVISOR_MODEL"))
     parser.add_argument(
         "--thinking-effort",
         default=(
@@ -714,6 +727,8 @@ def main() -> int:
     args = parse_args()
     if args.thinking_effort is not None:
         os.environ["ADVISOR_THINKING_EFFORT"] = args.thinking_effort
+    if args.model is None:
+        args.model = default_model_for(args.thinking_effort)
     prompt = args.prompt if args.prompt is not None else sys.stdin.read()
     prompt = sanitize_text(build_prompt(prompt, args.context_file))
     if not prompt.strip():

@@ -16,6 +16,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from advisor import default_model_for
+
 
 SECURITY_TERMS = {
     "auth", "authentication", "authorization", "cookie", "token", "secret", "password",
@@ -389,7 +391,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--json", action="store_true", help="Print only JSON route decision.")
     parser.add_argument("--provider", choices=["openai", "openai-compatible"], default=os.environ.get("ADVISOR_PROVIDER", "openai-compatible"))
     parser.add_argument("--base-url", default=os.environ.get("ADVISOR_BASE_URL", "http://127.0.0.1:8080/v1"))
-    parser.add_argument("--model", default=os.environ.get("ADVISOR_MODEL", "gpt-5-5-thinking"))
+    parser.add_argument("--model", default=os.environ.get("ADVISOR_MODEL"))
     parser.add_argument("--reasoning-effort", default=os.environ.get("ADVISOR_REASONING_EFFORT", "high"))
     parser.add_argument(
         "--thinking-effort",
@@ -415,6 +417,8 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     configure_stdio()
     args = parse_args()
+    if args.model is None:
+        args.model = default_model_for(args.thinking_effort)
     args.project_dir = resolve_project_dir(args.project_dir)
     args.trace_id = args.trace_id or str(uuid.uuid4())
     args.task_id = args.task_id or str(uuid.uuid4())

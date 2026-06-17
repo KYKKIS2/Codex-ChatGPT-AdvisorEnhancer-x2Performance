@@ -9,6 +9,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+from advisor import default_model_for
+
 
 def configure_stdio() -> None:
     for stream in (sys.stdout, sys.stderr):
@@ -62,7 +64,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--context-file", action="append", default=[], help="Additional UTF-8 context file.")
     parser.add_argument("--provider", choices=["openai", "openai-compatible"], default=os.environ.get("ADVISOR_PROVIDER", "openai-compatible"))
     parser.add_argument("--base-url", default=os.environ.get("ADVISOR_BASE_URL", "http://127.0.0.1:8080/v1"))
-    parser.add_argument("--model", default=os.environ.get("ADVISOR_MODEL", "gpt-5-5-thinking"))
+    parser.add_argument("--model", default=os.environ.get("ADVISOR_MODEL"))
     parser.add_argument("--reasoning-effort", default=os.environ.get("ADVISOR_REASONING_EFFORT", "high"))
     parser.add_argument(
         "--thinking-effort",
@@ -85,6 +87,8 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     configure_stdio()
     args = parse_args()
+    if args.model is None:
+        args.model = default_model_for(args.thinking_effort)
     args.project_dir = resolve_project_dir(args.project_dir)
     if args.draft_file:
         args.draft = read_text(args.draft_file)

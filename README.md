@@ -217,6 +217,15 @@ python3 ~/.codex/skills/external-advisor/scripts/advisor.py --prompt "Review thi
 
 Aliases include `pro-extended` -> `extended`, `extra-high` -> `xhigh`, and `instant`/`none` to omit the private field. `extended` has been observed in local HAR captures for Pro Extended. The setup patch adds g4f/OpenaiChat support for ChatGPT's conversation-turn WebSocket handoff, so extended turns can continue after ChatGPT moves the response stream from the initial SSE request to a per-turn WebSocket topic.
 
+For Pro Extended, use the Pro Extended request alias, not just bare `extended`:
+
+```bash
+ADVISOR_THINKING_EFFORT=pro-extended \
+python3 ~/.codex/skills/external-advisor/scripts/advisor.py --prompt "Review this carefully: ..."
+```
+
+When no explicit model is set, `pro-extended` automatically selects `gpt-5-5-pro-extended` and sends `thinking_effort=extended`. If you set `ADVISOR_MODEL` or `--model`, that explicit model wins. If ChatGPT changes the private slug, set `ADVISOR_PRO_EXTENDED_MODEL`.
+
 Long Pro Extended prompts can run silently for a minute or more. If a detached/background run exits with no response file and an empty log, verify the exact same command in the foreground before blaming Pro Extended or prompt size. In testing, a 14 KB architecture-review prompt that looked failed under a fragile background wrapper completed successfully in the foreground after about 80 seconds.
 
 For detached advisor jobs, prefer the audited launcher over ad hoc `nohup` snippets:

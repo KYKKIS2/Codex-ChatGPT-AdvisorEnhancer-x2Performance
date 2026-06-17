@@ -15,6 +15,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from advisor import default_model_for
+
 
 STRATEGIES = ("codex-only", "single-advisor", "conclave", "critic-verifier")
 
@@ -270,7 +272,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dry-run", action="store_true", help="Validate benchmark structure without model calls.")
     parser.add_argument("--provider", choices=["openai", "openai-compatible"], default=os.environ.get("ADVISOR_PROVIDER", "openai-compatible"))
     parser.add_argument("--base-url", default=os.environ.get("ADVISOR_BASE_URL", "http://127.0.0.1:8080/v1"))
-    parser.add_argument("--model", default=os.environ.get("ADVISOR_MODEL", "gpt-5-5-thinking"))
+    parser.add_argument("--model", default=os.environ.get("ADVISOR_MODEL"))
     parser.add_argument("--reasoning-effort", default=os.environ.get("ADVISOR_REASONING_EFFORT", "high"))
     parser.add_argument(
         "--thinking-effort",
@@ -299,6 +301,8 @@ def resolve_project_dir(project_dir: Path | None) -> Path:
 def main() -> int:
     configure_stdio()
     args = parse_args()
+    if args.model is None:
+        args.model = default_model_for(args.thinking_effort)
     args.project_dir = resolve_project_dir(args.project_dir)
     strategies = list(STRATEGIES) if args.strategy == "all" else [args.strategy]
     results: list[EvalResult] = []
