@@ -217,6 +217,22 @@ python3 ~/.codex/skills/external-advisor/scripts/advisor.py --prompt "Review thi
 
 Aliases include `pro-extended` -> `extended`, `extra-high` -> `xhigh`, and `instant`/`none` to omit the private field. `extended` has been observed in local HAR captures for Pro Extended. The setup patch adds g4f/OpenaiChat support for ChatGPT's conversation-turn WebSocket handoff, so extended turns can continue after ChatGPT moves the response stream from the initial SSE request to a per-turn WebSocket topic.
 
+Long Pro Extended prompts can run silently for a minute or more. If a detached/background run exits with no response file and an empty log, verify the exact same command in the foreground before blaming Pro Extended or prompt size. In testing, a 14 KB architecture-review prompt that looked failed under a fragile background wrapper completed successfully in the foreground after about 80 seconds.
+
+For detached advisor jobs, prefer the audited launcher over ad hoc `nohup` snippets:
+
+```bash
+ADVISOR_THINKING_EFFORT=pro-extended \
+ADVISOR_MAX_OUTPUT_TOKENS=1800 \
+python3 ~/.codex/skills/external-advisor/scripts/advisor_background.py -- \
+  --context-file docs/experiment_reports/review_prompt.md \
+  --prompt "Review the attached prompt and produce the requested critique." \
+  --thinking-effort pro-extended \
+  --timeout 600
+```
+
+The launcher writes `meta.json`, `status.json`, `heartbeat.json`, `response.md`, `stderr.log`, and `monitor.log` under `.codex-advisor/background-runs/<timestamp-id>/`. Treat missing/inconsistent metadata as a wrapper failure or inconclusive run, not a model failure.
+
 ## Test The Advisor
 
 Keep the local API running, then run:

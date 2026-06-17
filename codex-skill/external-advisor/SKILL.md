@@ -105,6 +105,24 @@ For ChatGPT web Intelligence/thinking choices, set the private ChatGPT field exp
 
 `extended` was observed in local HAR captures for Pro Extended. This repo's setup patch adds the required g4f/OpenaiChat conversation-turn WebSocket handoff path for that mode. If an extended call returns empty text, refresh the HAR/session first, then inspect the WebSocket handoff in `OpenaiChat`.
 
+Pro Extended can run long prompts. A 10-20 KB prompt may be silent for a minute or more before returning. If a long Pro Extended call appears to fail but a tiny `OK` diagnostic works, do not assume the model cannot handle the prompt. First rerun the exact command in the foreground with the same environment and arguments. If foreground succeeds, classify the earlier failure as background orchestration or logging failure, not Pro Extended failure.
+
+For important Pro Extended advisor/conclave calls, prefer foreground execution unless the user explicitly wants a detached job. If detached execution is needed, use `scripts/advisor_background.py` instead of ad hoc `nohup ... & echo $!` shell snippets. The launcher creates a unique run directory with `meta.json`, `status.json`, `heartbeat.json`, `response.md`, `stderr.log`, and `monitor.log`.
+
+Background Pro Extended example:
+
+```bash
+ADVISOR_THINKING_EFFORT=pro-extended \
+ADVISOR_MAX_OUTPUT_TOKENS=1800 \
+python3 ~/.codex/skills/external-advisor/scripts/advisor_background.py -- \
+  --context-file docs/experiment_reports/review_prompt.md \
+  --prompt "Review the attached prompt and produce the requested critique." \
+  --thinking-effort pro-extended \
+  --timeout 600
+```
+
+Before reporting that Pro Extended failed in a background run, inspect `status.json`, child process existence, response byte count, `stderr.log`, `monitor.log`, prompt path validity, and the recorded command in `meta.json`. Missing or inconsistent metadata means the background wrapper is inconclusive. Empty logs plus no response file are not enough evidence that ChatGPT failed.
+
 Bounded conclave for harder tasks:
 
 ```powershell
