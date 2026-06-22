@@ -358,6 +358,26 @@ def transcript_md_path(state_path: Path) -> Path:
     return state_path.with_name("transcript.md")
 
 
+def latest_response_path() -> Path:
+    explicit = os.environ.get("ADVISOR_RESPONSE_PATH")
+    if explicit:
+        return Path(explicit)
+    explicit_state = os.environ.get("ADVISOR_STATE_PATH")
+    if explicit_state:
+        return Path(explicit_state).with_name("latest-response.md")
+    return default_state_path().with_name("latest-response.md")
+
+
+def write_latest_response(path: Path, text: str) -> None:
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        tmp.write_text(text, encoding="utf-8")
+        tmp.replace(path)
+    except OSError as exc:
+        print(f"Advisor latest-response write skipped: {redact_sensitive(str(exc))}", file=sys.stderr)
+
+
 def load_conversation(path: Path) -> dict[str, Any] | None:
     if not path.exists():
         return None
@@ -831,6 +851,7 @@ def main() -> int:
 
     if args.save:
         Path(args.save).write_text(guidance, encoding="utf-8")
+    write_latest_response(latest_response_path(), guidance)
     print(guidance)
     return 0
 
