@@ -368,14 +368,26 @@ def latest_response_path() -> Path:
     return default_state_path().with_name("latest-response.md")
 
 
-def write_latest_response(path: Path, text: str) -> None:
+def latest_response_paths() -> list[Path]:
+    primary = latest_response_path()
+    if os.environ.get("ADVISOR_RESPONSE_PATH") or os.environ.get("ADVISOR_STATE_PATH"):
+        return [primary]
+    root_latest = advisor_project_dir() / ".codex-advisor" / "latest-response.md"
+    if primary.resolve() == root_latest.resolve():
+        return [primary]
+    return [primary, root_latest]
+
+
+def write_latest_response(path: Path, text: str) -> bool:
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         tmp = path.with_suffix(path.suffix + ".tmp")
         tmp.write_text(text, encoding="utf-8")
         tmp.replace(path)
+        return True
     except OSError as exc:
         print(f"Advisor latest-response write skipped: {redact_sensitive(str(exc))}", file=sys.stderr)
+        return False
 
 
 def load_conversation(path: Path) -> dict[str, Any] | None:
@@ -851,7 +863,12 @@ def main() -> int:
 
     if args.save:
         Path(args.save).write_text(guidance, encoding="utf-8")
-    write_latest_response(latest_response_path(), guidance)
+    written_latest_paths = [path for path in latest_response_paths() if write_latest_response(path, guidance)]
+    if written_latest_paths:
+        print(
+            "Advisor latest-response saved: " + ", ".join(str(path) for path in written_latest_paths),
+            file=sys.stderr,
+        )
     print(guidance)
     return 0
 
