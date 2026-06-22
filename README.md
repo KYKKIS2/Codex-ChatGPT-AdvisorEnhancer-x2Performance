@@ -232,6 +232,8 @@ The ChatGPT WebSocket can carry visible live progress such as reasoning status, 
 
 For foreground Pro Extended calls, Codex should start the command with a long timeout and wait quietly for it to finish. Do not send periodic "still running" updates or repeatedly poll the active shell session unless the user asks for status. If polling is unavoidable in the execution environment, use long waits of several minutes and report only completion, an actual error, or a meaningful timeout.
 
+For long advisor calls, use `--save` and read the saved response or synced `transcript.md` before assuming the answer was truncated. Codex terminal output can be display-truncated to the tail of a long answer, so seeing only final punctuation in the terminal does not prove the advisor returned only punctuation.
+
 For detached advisor jobs, prefer the audited launcher over ad hoc `nohup` snippets:
 
 ```bash

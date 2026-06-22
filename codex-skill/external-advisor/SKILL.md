@@ -113,6 +113,8 @@ The WebSocket stream can carry visible live progress such as reasoning status, s
 
 When Codex runs a foreground Pro Extended advisor command, do not repeatedly poll the shell session and do not send user-facing "still running" updates every few seconds. Start the command with a long timeout, then wait quietly for the process to return. If the execution environment requires polling an active shell session, use long waits of several minutes and report only completion, an actual error, or a meaningful timeout. The open WebSocket/HTTP request is already the wait mechanism; extra Codex-side status polling wastes attention and tokens.
 
+For long or important advisor calls, pass `--save` to write the advisor answer to a file and read that file or the synced `transcript.md` before concluding the answer was truncated. Codex terminal output can be display-truncated to the tail of a long answer; seeing only final punctuation in the terminal is not enough evidence that the advisor returned only punctuation.
+
 For important Pro Extended advisor/conclave calls, prefer foreground execution unless the user explicitly wants a detached job. If detached execution is needed, use `scripts/advisor_background.py` instead of ad hoc `nohup ... & echo $!` shell snippets. The launcher creates a unique run directory with `meta.json`, `status.json`, `heartbeat.json`, `response.md`, `stderr.log`, and `monitor.log`.
 
 Background Pro Extended example:
