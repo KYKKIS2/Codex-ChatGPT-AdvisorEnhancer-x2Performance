@@ -596,6 +596,63 @@ def latest_finished_assistant_text(conversation_data: dict[str, Any]) -> str:
     return ""
 
 
+def latest_transcript_assistant_text_for_prompt(state_path: Path, prompt: str) -> str:
+    path = transcript_json_path(state_path)
+    if not path.exists():
+        return ""
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return ""
+    messages = data.get("messages")
+    if not isinstance(messages, list):
+        return ""
+    last_user_index = -1
+    normalized_prompt = prompt.strip()
+    for index, item in enumerate(messages):
+        if isinstance(item, dict) and item.get("role") == "user":
+            last_user_index = index
+    if last_user_index < 0:
+        return ""
+    latest_user = messages[last_user_index]
+    if not isinstance(latest_user, dict) or str(latest_user.get("content") or "").strip() != normalized_prompt:
+        return ""
+    for item in reversed(messages[last_user_index + 1:]):
+        if not isinstance(item, dict) or item.get("role") != "assistant":
+            continue
+        content = str(item.get("content") or "").strip()
+        if content:
+            return content
+    return ""
+
+
+def should_prefer_synced_text(local_text: str, synced_text: str) -> bool:
+    local = local_text.strip()
+    synced = synced_text.strip()
+    if not synced:
+        return False
+    if not local:
+        return True
+    if local == synced:
+        return False
+    if len(synced) < 200:
+        return False
+    if local in synced and len(local) < len(synced):
+        return True
+    return len(local) < 200 and len(synced) >= max(len(local) * 3, len(local) + 200)
+
+
+def file_snapshot(path: Path) -> bytes | None:
+    try:
+        return path.read_bytes()
+    except OSError:
+        return None
+
+
+def utf8_len(text: str) -> int:
+    return len(text.encode("utf-8", errors="replace"))
+
+
 def write_transcript(state_path: Path, conversation_data: dict[str, Any], transcript: list[dict[str, Any]]) -> None:
     state_path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
@@ -805,11 +862,23 @@ def call_compatible(prompt: str, model: str, timeout: int) -> str:
             response = post_json(f"{base_url}/chat/completions", payload, headers, timeout)
         else:
             raise
+    synced_text = ""
     if persist and state_path is not None:
         save_conversation(state_path, response, project_id)
         if sync_remote and not temporary:
+            transcript_path = transcript_json_path(state_path)
+            transcript_before = file_snapshot(transcript_path)
             sync_remote_conversation(state_path, load_conversation(state_path), timeout, project_id)
+            if file_snapshot(transcript_path) != transcript_before:
+                synced_text = latest_transcript_assistant_text_for_prompt(state_path, prompt)
     text = extract_chat_text(response)
+    if should_prefer_synced_text(text, synced_text):
+        print(
+            "Advisor response recovered from synced transcript: "
+            f"local_bytes={utf8_len(text)} synced_bytes={utf8_len(synced_text)}",
+            file=sys.stderr,
+        )
+        text = synced_text
     if thinking_effort and not text.strip():
         if persist and state_path is not None:
             text = fetch_remote_final_text(state_path, load_conversation(state_path), timeout, project_id)
