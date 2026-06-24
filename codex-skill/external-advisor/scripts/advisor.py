@@ -642,6 +642,64 @@ def should_prefer_synced_text(local_text: str, synced_text: str) -> bool:
     return len(local) < 200 and len(synced) >= max(len(local) * 3, len(local) + 200)
 
 
+def looks_like_tail_fragment(text: str, prompt: str) -> bool:
+    stripped = text.strip()
+    if not stripped:
+        return False
+    prompt_min = int_env("ADVISOR_TAIL_FRAGMENT_PROMPT_MIN_CHARS", 300, minimum=1)
+    if len(prompt.strip()) < prompt_min:
+        return False
+    max_fragment = int_env("ADVISOR_TAIL_FRAGMENT_MAX_CHARS", 240, minimum=20)
+    if len(stripped) > max_fragment:
+        return False
+    if text[:1].isspace():
+        return True
+    if stripped[:1].islower():
+        return True
+    if stripped.endswith("**") or stripped.startswith(("...", ",", ".", ";", ":", ")")):
+        return True
+    return False
+
+
+def recovery_disabled_reasons(persist: bool, temporary: bool, sync_remote: bool) -> list[str]:
+    reasons: list[str] = []
+    if not persist:
+        reasons.append("ADVISOR_PERSIST_CONVERSATION=false")
+    if temporary:
+        reasons.append("ADVISOR_TEMPORARY=true")
+    if not sync_remote:
+        reasons.append("ADVISOR_SYNC_REMOTE=false")
+    return reasons
+
+
+def bool_env_default_true(name: str) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return True
+    return value.lower() in ("1", "true", "yes", "on")
+
+
+def call_compatible_with_recovery(prompt: str, model: str, timeout: int) -> str:
+    old_values = {
+        "ADVISOR_PERSIST_CONVERSATION": os.environ.get("ADVISOR_PERSIST_CONVERSATION"),
+        "ADVISOR_TEMPORARY": os.environ.get("ADVISOR_TEMPORARY"),
+        "ADVISOR_SYNC_REMOTE": os.environ.get("ADVISOR_SYNC_REMOTE"),
+        "ADVISOR_AUTO_RETRY_TAIL_FRAGMENT": os.environ.get("ADVISOR_AUTO_RETRY_TAIL_FRAGMENT"),
+    }
+    os.environ["ADVISOR_PERSIST_CONVERSATION"] = "true"
+    os.environ["ADVISOR_TEMPORARY"] = "false"
+    os.environ["ADVISOR_SYNC_REMOTE"] = "true"
+    os.environ["ADVISOR_AUTO_RETRY_TAIL_FRAGMENT"] = "false"
+    try:
+        return call_compatible(prompt, model, timeout)
+    finally:
+        for name, value in old_values.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+
+
 def file_snapshot(path: Path) -> bytes | None:
     try:
         return path.read_bytes()
@@ -821,11 +879,20 @@ def call_compatible(prompt: str, model: str, timeout: int) -> str:
     persist = os.environ.get("ADVISOR_PERSIST_CONVERSATION", "true").lower() in ("1", "true", "yes")
     temporary = os.environ.get("ADVISOR_TEMPORARY", "false").lower() in ("1", "true", "yes")
     sync_remote = os.environ.get("ADVISOR_SYNC_REMOTE", "true").lower() in ("1", "true", "yes")
-    project_id = chatgpt_project_id(timeout, allow_create=(persist and not temporary))
+    use_state = persist and not temporary
+    disabled = recovery_disabled_reasons(persist, temporary, sync_remote)
+    if disabled:
+        print(
+            "Advisor transcript recovery disabled by "
+            + ", ".join(disabled)
+            + "; avoid these flags for normal advisor calls.",
+            file=sys.stderr,
+        )
+    project_id = chatgpt_project_id(timeout, allow_create=use_state)
     if project_id:
         payload["gizmo_id"] = project_id
     conversation = None
-    if persist:
+    if use_state:
         state_path = default_state_path()
         conversation = load_conversation(state_path)
         previous_project_id = saved_project_id(state_path)
@@ -879,6 +946,13 @@ def call_compatible(prompt: str, model: str, timeout: int) -> str:
             file=sys.stderr,
         )
         text = synced_text
+    if disabled and looks_like_tail_fragment(text, prompt) and bool_env_default_true("ADVISOR_AUTO_RETRY_TAIL_FRAGMENT"):
+        print(
+            "Advisor response looks like a tail fragment while transcript recovery is disabled "
+            f"({', '.join(disabled)}); retrying once with persistent remote sync.",
+            file=sys.stderr,
+        )
+        return call_compatible_with_recovery(prompt, model, timeout)
     if thinking_effort and not text.strip():
         if persist and state_path is not None:
             text = fetch_remote_final_text(state_path, load_conversation(state_path), timeout, project_id)
