@@ -13,6 +13,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+import advisor_safety as safety
+
 
 MEMORY_FILES = (
     "project-profile.md",
@@ -55,32 +57,19 @@ def configure_stdio() -> None:
 
 
 def sanitize_text(text: str) -> str:
-    return text.encode("utf-8", errors="replace").decode("utf-8")
+    return safety.sanitize_text(text)
 
 
 def truncate(text: str, limit: int) -> str:
-    text = sanitize_text(text or "")
-    if len(text) <= limit:
-        return text
-    return text[:limit] + f"\n...[truncated {len(text) - limit} chars]"
+    return safety.truncate(text, limit)
 
 
 def read_text(path: Path, limit: int) -> str:
-    return truncate(path.read_text(encoding="utf-8", errors="replace"), limit)
+    return safety.read_limited_text(path, limit)
 
 
 def resolve_input_file(project_dir: Path, raw: str, allow_outside_project: bool) -> Path:
-    path = (project_dir / raw).resolve() if not Path(raw).is_absolute() else Path(raw).resolve()
-    try:
-        path.relative_to(project_dir)
-        in_project = True
-    except ValueError:
-        in_project = False
-    if not in_project and not allow_outside_project:
-        raise RuntimeError(f"Refusing to include file outside the project: {path}")
-    if is_sensitive_path(project_dir, path):
-        raise RuntimeError(f"Refusing to include sensitive advisor/auth/env/key file: {path}")
-    return path
+    return safety.resolve_input_file(project_dir, raw, allow_outside_project)
 
 
 def advisor_dir(project_dir: Path) -> Path:
@@ -114,45 +103,100 @@ def run_capture(project_dir: Path, command: list[str], limit: int) -> CommandCap
     except FileNotFoundError:
         return CommandCapture(" ".join(command), False, None, "Command not available.")
     except subprocess.TimeoutExpired as exc:
-        output = (exc.stdout or "") + "\n" + (exc.stderr or "")
+        output = safety.sanitize_text(exc.stdout) + "\n" + safety.sanitize_text(exc.stderr)
         return CommandCapture(" ".join(command), False, None, truncate(output, limit))
     output = (completed.stdout + "\n" + completed.stderr).strip()
-    return CommandCapture(" ".join(command), completed.returncode == 0, completed.returncode, truncate(output, limit))
+    return CommandCapture(
+        " ".join(command),
+        completed.returncode == 0,
+        completed.returncode,
+        truncate(safety.redact_sensitive_text(output), limit),
+    )
+
+
+def diff_path_lists(project_dir: Path, *, cached: bool = False) -> tuple[list[str], list[str], str]:
+    command = ["git", "diff"]
+    if cached:
+        command.append("--cached")
+    command.extend(["--name-only", "--"])
+    try:
+        completed = subprocess.run(
+            command,
+            cwd=project_dir,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            capture_output=True,
+            timeout=20,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
+        return [], [], f"Could not inspect changed diff paths: {exc}"
+    if completed.returncode != 0:
+        return [], [], completed.stderr.strip() or "git diff --name-only failed."
+    safe_paths: list[str] = []
+    skipped: list[str] = []
+    for raw in completed.stdout.splitlines():
+        relative = raw.strip()
+        if not relative:
+            continue
+        path = (project_dir / relative).resolve()
+        if is_sensitive_path(project_dir, path):
+            skipped.append(relative)
+        else:
+            safe_paths.append(relative)
+    return safe_paths, skipped, ""
+
+
+def git_status_capture(project_dir: Path, limit: int) -> CommandCapture:
+    capture = run_capture(project_dir, ["git", "status", "--short"], limit)
+    if not capture.output:
+        return capture
+    lines: list[str] = []
+    for line in capture.output.splitlines():
+        prefix = line[:3]
+        raw_paths = line[3:] if len(line) > 3 else line
+        rendered_paths: list[str] = []
+        for raw in raw_paths.split(" -> "):
+            candidate = raw.strip().strip('"')
+            if candidate and is_sensitive_path(project_dir, (project_dir / candidate).resolve()):
+                rendered_paths.append("[SENSITIVE-PATH]")
+            else:
+                rendered_paths.append(raw)
+        lines.append(prefix + " -> ".join(rendered_paths))
+    capture.output = "\n".join(lines)
+    return capture
 
 
 def git_context(project_dir: Path, diff_chars: int) -> dict[str, Any]:
     if not (project_dir / ".git").exists():
         return {"available": False, "reason": "No .git directory found."}
+    diff_paths, skipped_sensitive, path_error = diff_path_lists(project_dir)
+    cached_diff_paths, cached_skipped_sensitive, cached_path_error = diff_path_lists(project_dir, cached=True)
     captures = [
-        run_capture(project_dir, ["git", "status", "--short"], diff_chars),
-        run_capture(project_dir, ["git", "diff", "--stat"], diff_chars),
-        run_capture(project_dir, ["git", "diff", "--check"], diff_chars),
-        run_capture(project_dir, ["git", "diff", "--"], diff_chars),
+        git_status_capture(project_dir, diff_chars),
     ]
+    if diff_paths:
+        captures.append(run_capture(project_dir, ["git", "diff", "--stat", "--", *diff_paths[:80]], diff_chars))
+        captures.append(run_capture(project_dir, ["git", "diff", "--check", "--", *diff_paths[:80]], diff_chars))
+        captures.append(run_capture(project_dir, ["git", "diff", "--", *diff_paths[:80]], diff_chars))
+    else:
+        reason = path_error or "No non-sensitive changed files available for full diff."
+        captures.append(CommandCapture("git diff -- <non-sensitive files>", True, 0, reason))
+    if cached_diff_paths:
+        captures.append(run_capture(project_dir, ["git", "diff", "--cached", "--stat", "--", *cached_diff_paths[:80]], diff_chars))
+        captures.append(run_capture(project_dir, ["git", "diff", "--cached", "--check", "--", *cached_diff_paths[:80]], diff_chars))
+        captures.append(run_capture(project_dir, ["git", "diff", "--cached", "--", *cached_diff_paths[:80]], diff_chars))
+    elif cached_path_error:
+        captures.append(CommandCapture("git diff --cached -- <non-sensitive files>", True, 0, cached_path_error))
     return {
         "available": True,
         "captures": [capture.__dict__ for capture in captures],
+        "skipped_sensitive_diff_files": sorted(set(skipped_sensitive + cached_skipped_sensitive)),
     }
 
 
 def is_sensitive_path(project_dir: Path, path: Path) -> bool:
-    lower_parts = [part.lower() for part in path.parts]
-    name = path.name.lower()
-    try:
-        relative_parts = [part.lower() for part in path.relative_to(project_dir).parts]
-    except ValueError:
-        relative_parts = lower_parts
-    if ".codex-advisor" in relative_parts:
-        return True
-    if "har_and_cookies" in relative_parts:
-        return True
-    if name in SENSITIVE_FILE_NAMES:
-        return True
-    if name.startswith(".env."):
-        return True
-    if name.startswith("auth_") and name.endswith(".json"):
-        return True
-    return any(name.endswith(suffix) for suffix in SENSITIVE_SUFFIXES)
+    return safety.is_sensitive_path(project_dir, path)
 
 
 def file_context(project_dir: Path, paths: list[str], max_chars: int, allow_outside_project: bool) -> list[dict[str, Any]]:
@@ -223,11 +267,12 @@ def build_pack(args: argparse.Namespace, prompt: str) -> dict[str, Any]:
 
 def write_pack(project_dir: Path, pack: dict[str, Any]) -> tuple[Path, Path]:
     out_dir = packs_dir(project_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
+    safety.ensure_private_dir(out_dir)
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    json_path = out_dir / f"{stamp}-context-pack.json"
-    md_path = out_dir / f"{stamp}-context-pack.md"
-    json_path.write_text(json.dumps(pack, indent=2), encoding="utf-8")
+    unique = uuid.uuid4().hex[:8]
+    json_path = out_dir / f"{stamp}-{unique}-context-pack.json"
+    md_path = out_dir / f"{stamp}-{unique}-context-pack.md"
+    safety.atomic_write_json(json_path, pack)
 
     lines = [
         "# Advisor Context Pack",
@@ -288,11 +333,12 @@ def write_pack(project_dir: Path, pack: dict[str, Any]) -> tuple[Path, Path]:
                 "```",
                 "",
             ])
-    md_path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
+    md_text = "\n".join(lines).rstrip() + "\n"
+    safety.atomic_write_text(md_path, md_text)
     latest_json = advisor_dir(project_dir) / "latest-context-pack.json"
     latest_md = advisor_dir(project_dir) / "latest-context-pack.md"
-    latest_json.write_text(json_path.read_text(encoding="utf-8"), encoding="utf-8")
-    latest_md.write_text(md_path.read_text(encoding="utf-8"), encoding="utf-8")
+    safety.atomic_write_json(latest_json, pack)
+    safety.atomic_write_text(latest_md, md_text)
     return json_path, md_path
 
 

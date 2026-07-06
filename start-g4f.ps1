@@ -37,18 +37,40 @@ if (-not (Test-Path $Py)) {
     $Py = "python"
 }
 
-$listener = $null
-try {
-    $listener = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Parse("127.0.0.1"), $Port)
-    $listener.Start()
+$RuntimePatch = Join-Path $Root "patches\apply_gpt4free_runtime_patch.py"
+if (Test-Path $RuntimePatch) {
+    & python $RuntimePatch $G4f | Out-Null
 }
-catch {
-    throw "Port $Port is already in use. Stop the existing g4f server or start this one with -Port <other-port>."
-}
-finally {
-    if ($listener) {
-        $listener.Stop()
+
+function Test-PortBindable {
+    param([int]$PortToCheck)
+    $listener = $null
+    try {
+        $listener = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Parse("127.0.0.1"), $PortToCheck)
+        $listener.Start()
+        return $true
     }
+    catch {
+        return $false
+    }
+    finally {
+        if ($listener) {
+            $listener.Stop()
+        }
+    }
+}
+
+$portReady = $false
+$waitSeconds = if ($env:G4F_PORT_WAIT_SECONDS) { [int]$env:G4F_PORT_WAIT_SECONDS } else { 15 }
+for ($i = 0; $i -lt $waitSeconds; $i++) {
+    if (Test-PortBindable -PortToCheck $Port) {
+        $portReady = $true
+        break
+    }
+    Start-Sleep -Seconds 1
+}
+if (-not $portReady) {
+    throw "Port $Port is already in use. Stop the existing g4f server or start this one with -Port <other-port>."
 }
 
 Write-Host "Starting g4f API on http://127.0.0.1:$Port/v1"

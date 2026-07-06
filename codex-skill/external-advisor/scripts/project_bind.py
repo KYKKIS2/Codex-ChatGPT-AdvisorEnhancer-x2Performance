@@ -9,6 +9,8 @@ import re
 import sys
 from pathlib import Path
 
+import advisor_safety as safety
+
 
 PROJECT_ID_RE = re.compile(r"(g-p-[A-Za-z0-9]+)")
 
@@ -34,7 +36,10 @@ def resolve_project_dir(project_dir: Path | None) -> Path:
 
 
 def bind_project(project_dir: Path, value: str, name: str | None) -> Path:
-    project_id = normalize_project_id(value)
+    try:
+        project_id = normalize_project_id(value)
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
     path = project_path(project_dir)
     payload = {
         "chatgpt_project_id": project_id,
@@ -42,8 +47,7 @@ def bind_project(project_dir: Path, value: str, name: str | None) -> Path:
     }
     if name:
         payload["name"] = name
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    safety.atomic_write_json(path, payload)
     return path
 
 

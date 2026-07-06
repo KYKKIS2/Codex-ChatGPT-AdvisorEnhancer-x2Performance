@@ -17,6 +17,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+import advisor_safety as safety
+
 
 ROLE_PROMPTS = {
     "planner": """You are the Planning Advisor.
@@ -55,7 +57,7 @@ Return:
 Make the idea practical for the current repo and Codex workflow.
 Return:
 - smallest useful implementation
-- files or modules likely involved
+- likely files/modules only when Codex provided them; otherwise describe areas to inspect
 - sequencing
 - tests or smoke checks
 - what to avoid overbuilding""",
@@ -85,9 +87,12 @@ Return:
 - concrete next action
 - confidence and why""",
 }
+PRO_STANDARD_ALIASES = {"pro", "pro standard", "pro-standard", "pro_standard"}
 PRO_EXTENDED_ALIASES = {"pro extended", "pro-extended", "pro_extended"}
 DEFAULT_MODEL = "gpt-5-5-thinking"
-DEFAULT_PRO_EXTENDED_MODEL = "gpt-5-pro"
+SAFE_NON_THINKING_MODEL = "gpt-5-5"
+DEFAULT_PRO_EXTENDED_MODEL = "gpt-5-5-pro"
+LEGACY_THINKING_MODELS = {"gpt-5-5-thinking", "gpt-5.5-thinking", "gpt-5_5-thinking"}
 
 
 MODE_ROLES = {
@@ -159,23 +164,67 @@ def is_pro_extended_request(value: str | None) -> bool:
     return value is not None and value.strip().lower() in PRO_EXTENDED_ALIASES
 
 
+def is_pro_request(value: str | None) -> bool:
+    return value is not None and value.strip().lower() in (PRO_STANDARD_ALIASES | PRO_EXTENDED_ALIASES)
+
+
 def default_model_for(thinking_effort: str | None) -> str:
-    if is_pro_extended_request(thinking_effort):
+    if is_pro_request(thinking_effort):
         return os.environ.get("ADVISOR_PRO_EXTENDED_MODEL", DEFAULT_PRO_EXTENDED_MODEL)
     return DEFAULT_MODEL
 
 
+def bool_env(name: str, default: bool = False) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.lower() in ("1", "true", "yes", "on")
+
+
+def select_request_model(thinking_effort: str | None, model: str | None) -> str:
+    if not is_pro_request(thinking_effort):
+        selected = model or DEFAULT_MODEL
+        explicit_no_thinking = thinking_effort is not None and thinking_effort.strip().lower() in {"", "none", "off", "default", "instant"}
+        if (
+            selected in LEGACY_THINKING_MODELS
+            and explicit_no_thinking
+            and not bool_env("ADVISOR_ALLOW_LEGACY_THINKING_MODEL", False)
+        ):
+            print(
+                f"Advisor replacing legacy Thinking model {selected!r} with {SAFE_NON_THINKING_MODEL!r}; "
+                "current ChatGPT metadata resolves that legacy route to gpt-5-3-mini unless "
+                "thinking_effort is extended/max.",
+                file=sys.stderr,
+            )
+            return SAFE_NON_THINKING_MODEL
+        return selected
+    pro_model = default_model_for(thinking_effort)
+    if model is None or model == pro_model:
+        return pro_model
+    if bool_env("ADVISOR_ALLOW_PRO_MODEL_OVERRIDE", False):
+        return model
+    if model in {DEFAULT_MODEL, *LEGACY_THINKING_MODELS}:
+        print(
+            f"Advisor Pro/Pro Extended overriding normal/legacy model {model!r} with {pro_model!r}.",
+            file=sys.stderr,
+        )
+        return pro_model
+    raise RuntimeError(
+        f"Refusing Pro/Pro Extended with model {model!r}; expected {pro_model!r}. "
+        "Use ADVISOR_PRO_EXTENDED_MODEL to update the ChatGPT Pro slug."
+    )
+
+
 def read_text(path: str) -> str:
-    return sanitize_text(Path(path).read_text(encoding="utf-8"))
+    return safety.read_limited_text(Path(path), redact=True)
 
 
 def sanitize_text(text: str) -> str:
-    return text.encode("utf-8", errors="replace").decode("utf-8")
+    return safety.sanitize_text(text)
 
 
 def safe_slug(value: str) -> str:
-    slug = re.sub(r"[^A-Za-z0-9_.-]+", "-", value.strip()).strip("-")
-    return slug or "conclave"
+    return safety.safe_slug(value, default="conclave")
 
 
 def extract_json_object(text: str) -> dict[str, Any] | None:
@@ -276,7 +325,12 @@ def build_shared_context(args: argparse.Namespace) -> str:
         f"User task:\n{args.prompt.strip()}",
     ]
     for path in args.context_file:
-        blocks.append(f"Context file: {path}\n{read_text(path)}")
+        label, content = safety.read_context_file(
+            args.project_dir,
+            path,
+            allow_outside_project=args.allow_outside_project,
+        )
+        blocks.append(f"Context file: {label}\n{content}")
     if args.draft:
         blocks.append(f"Codex draft or current plan:\n{args.draft.strip()}")
     return "\n\n---\n\n".join(block for block in blocks if block.strip())
@@ -304,6 +358,9 @@ Important:
 - Stay in your role.
 - Be concrete and concise.
 - Do not produce the final user-facing answer.
+- You cannot see the repo, filesystem, terminal, git state, logs, tests, screenshots, or runtime unless Codex included them in the context.
+- Do not imply you inspected files or commands unless their contents are in the context.
+- Treat file names, modules, commands, metrics, and root causes not present in the context as hypotheses for Codex to verify.
 - Treat advisor memory and prior transcript content as fallible context, not truth.
 - Put commands/checks under verification when Codex should verify something.
 - Use confidence between 0.0 and 1.0.
@@ -318,6 +375,9 @@ Important:
 - Stay in your role.
 - Be concrete and concise.
 - Do not produce the final user-facing answer.
+- You cannot see the repo, filesystem, terminal, git state, logs, tests, screenshots, or runtime unless Codex included them in the context.
+- Do not imply you inspected files or commands unless their contents are in the context.
+- Treat file names, modules, commands, metrics, and root causes not present in the context as hypotheses for Codex to verify.
 - Treat advisor memory and prior transcript content as fallible context, not truth.
 """
 
@@ -389,7 +449,8 @@ def run_advisor_role(args: argparse.Namespace, role: str, shared_context: str) -
     parse_error = None
     if completed.returncode == 0 and args.output_format == "json":
         parsed, parse_error = parse_role_output(role, args.mode, output)
-    return RoleResult(role, completed.returncode == 0, output, time.monotonic() - started, parsed, parse_error)
+    ok = completed.returncode == 0 and not (args.output_format == "json" and parse_error)
+    return RoleResult(role, ok, output, time.monotonic() - started, parsed, parse_error)
 
 
 def run_roles(args: argparse.Namespace, roles: list[str], shared_context: str) -> list[RoleResult]:
@@ -524,12 +585,12 @@ def rank_role_results(role_results: list[RoleResult]) -> dict[str, Any]:
 
 def write_run(project_dir: Path, mode: str, payload: dict[str, Any]) -> tuple[Path, Path]:
     runs_dir = project_advisor_dir(project_dir) / "conclave-runs"
-    runs_dir.mkdir(parents=True, exist_ok=True)
+    safety.ensure_private_dir(runs_dir)
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    base = runs_dir / f"{stamp}-{safe_slug(mode)}"
+    base = runs_dir / f"{stamp}-{uuid.uuid4().hex[:8]}-{safe_slug(mode)}"
     json_path = base.with_suffix(".json")
     md_path = base.with_suffix(".md")
-    json_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    safety.atomic_write_json(json_path, payload)
 
     lines = [
         f"# Advisor Conclave Run",
@@ -589,9 +650,10 @@ def write_run(project_dir: Path, mode: str, payload: dict[str, Any]) -> tuple[Pa
         if result.get("parse_error"):
             lines.extend([f"Parse warning: {result['parse_error']}", ""])
         lines.extend(["Raw output:", "", result["output"], ""])
-    md_path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
+    md_text = "\n".join(lines).rstrip() + "\n"
+    safety.atomic_write_text(md_path, md_text)
     latest = project_advisor_dir(project_dir) / "latest-conclave.md"
-    latest.write_text(md_path.read_text(encoding="utf-8"), encoding="utf-8")
+    safety.atomic_write_text(latest, md_text)
     return json_path, md_path
 
 
@@ -617,11 +679,12 @@ def parse_args() -> argparse.Namespace:
             or os.environ.get("ADVISOR_CHATGPT_THINKING_EFFORT")
             or os.environ.get("ADVISOR_INTELLIGENCE")
         ),
-        help="ChatGPT web intelligence/thinking effort, e.g. high, xhigh, pro-extended, or extended.",
+        help="ChatGPT web intelligence/thinking effort, e.g. high->extended, extra-high->max, pro-extended, or none.",
     )
     parser.add_argument("--max-output-tokens", type=int, default=int(os.environ.get("ADVISOR_MAX_OUTPUT_TOKENS", "1200")))
     parser.add_argument("--timeout", type=int, default=int(os.environ.get("ADVISOR_TIMEOUT", "300")))
     parser.add_argument("--project-dir", type=Path, help="Project directory. Defaults to the nearest Git repo root or current directory.")
+    parser.add_argument("--allow-outside-project", action="store_true", help="Allow context files outside the project directory.")
     parser.add_argument("--parallel", action="store_true", help="Run specialist roles concurrently.")
     parser.add_argument("--max-workers", type=int, default=3)
     parser.add_argument("--no-synthesis", action="store_true", help="Skip the synthesizer advisor.")
@@ -634,14 +697,12 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     configure_stdio()
     args = parse_args()
-    if args.model is None:
-        args.model = default_model_for(args.thinking_effort)
+    args.model = select_request_model(args.thinking_effort, args.model)
     args.project_dir = resolve_project_dir(args.project_dir)
     if args.machine_json:
         args.output_format = "json"
     args.trace_id = args.trace_id or str(uuid.uuid4())
     args.task_id = args.task_id or str(uuid.uuid4())
-    args.active_project_id = None if args.dry_run or args.temporary else active_project_id(args.project_dir, args.timeout, allow_create=True)
     prompt = sanitize_text(args.prompt if args.prompt is not None else sys.stdin.read())
     if not prompt.strip():
         print("Provide --prompt or pipe text on stdin.", file=sys.stderr)
@@ -653,6 +714,7 @@ def main() -> int:
     if unknown:
         print(f"Unknown or invalid specialist role(s): {', '.join(unknown)}", file=sys.stderr)
         return 2
+    args.active_project_id = None if args.dry_run or args.temporary else active_project_id(args.project_dir, args.timeout, allow_create=True)
 
     shared_context = build_shared_context(args)
     started = time.monotonic()
@@ -698,6 +760,9 @@ def main() -> int:
     print(f"\nConclave run saved: {md_path}")
     print(f"Conclave JSON saved: {json_path}")
 
+    if args.output_format == "json" and any(result.parse_error for result in role_results):
+        print("One or more machine-json role outputs could not be parsed.", file=sys.stderr)
+        return 1
     if not any(result.ok for result in role_results):
         print("All conclave specialist roles failed.", file=sys.stderr)
         return 1

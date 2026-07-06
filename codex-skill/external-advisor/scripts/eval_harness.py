@@ -15,7 +15,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from advisor import default_model_for
+import advisor_safety as safety
+from advisor import select_request_model
 
 
 STRATEGIES = ("codex-only", "single-advisor", "conclave", "critic-verifier")
@@ -58,7 +59,7 @@ BENCHMARKS = {
         "The local g4f server fails because port 8080 is already in use.",
     ],
     "model-choice": [
-        "Choose default model slug between gpt-5-5-thinking and gpt-5-5-pro.",
+        "Choose default model slug between gpt-5-5 and gpt-5-5-pro.",
         "Decide whether model-choice questions need planner, alternative, critic, and verifier roles.",
         "Choose when to use machine JSON instead of readable advisor text.",
         "Decide whether Pro should be used for every advisor call.",
@@ -149,7 +150,7 @@ def run_command(args: argparse.Namespace, command: list[str], prompt: str) -> tu
         output = (completed.stdout + "\n" + completed.stderr).strip()
         return "completed", completed.returncode, time.monotonic() - started, output
     except subprocess.TimeoutExpired as exc:
-        output = ((exc.stdout or "") + "\n" + (exc.stderr or "")).strip()
+        output = (safety.sanitize_text(exc.stdout) + "\n" + safety.sanitize_text(exc.stderr)).strip()
         return "timeout", None, time.monotonic() - started, output
     except Exception as exc:
         return "error", None, time.monotonic() - started, str(exc)
@@ -211,11 +212,12 @@ def evaluate_strategy(args: argparse.Namespace, category: str, index: int, task:
 
 def write_report(project_dir: Path, payload: dict[str, Any]) -> tuple[Path, Path]:
     out_dir = evaluations_dir(project_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
+    safety.ensure_private_dir(out_dir)
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    json_path = out_dir / f"{stamp}-evaluation.json"
-    md_path = out_dir / f"{stamp}-evaluation.md"
-    json_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    unique = uuid.uuid4().hex[:8]
+    json_path = out_dir / f"{stamp}-{unique}-evaluation.json"
+    md_path = out_dir / f"{stamp}-{unique}-evaluation.md"
+    safety.atomic_write_json(json_path, payload)
     lines = [
         "# Advisor Evaluation Run",
         "",
@@ -239,11 +241,12 @@ def write_report(project_dir: Path, payload: dict[str, Any]) -> tuple[Path, Path
             f"{result['status']} exit={result['exit_code']} latency={result['elapsed_seconds']:.1f}s "
             f"output_chars={result['output_chars']}"
         )
-    md_path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
+    md_text = "\n".join(lines).rstrip() + "\n"
+    safety.atomic_write_text(md_path, md_text)
     latest_json = advisor_dir(project_dir) / "latest-evaluation.json"
     latest_md = advisor_dir(project_dir) / "latest-evaluation.md"
-    latest_json.write_text(json_path.read_text(encoding="utf-8"), encoding="utf-8")
-    latest_md.write_text(md_path.read_text(encoding="utf-8"), encoding="utf-8")
+    safety.atomic_write_json(latest_json, payload)
+    safety.atomic_write_text(latest_md, md_text)
     return json_path, md_path
 
 
@@ -281,7 +284,7 @@ def parse_args() -> argparse.Namespace:
             or os.environ.get("ADVISOR_CHATGPT_THINKING_EFFORT")
             or os.environ.get("ADVISOR_INTELLIGENCE")
         ),
-        help="ChatGPT web intelligence/thinking effort, e.g. high, xhigh, pro-extended, or extended.",
+        help="ChatGPT web intelligence/thinking effort, e.g. high->extended, extra-high->max, pro-extended, or none.",
     )
     parser.add_argument("--max-output-tokens", type=int, default=int(os.environ.get("ADVISOR_MAX_OUTPUT_TOKENS", "1000")))
     parser.add_argument("--timeout", type=int, default=int(os.environ.get("ADVISOR_TIMEOUT", "300")))
@@ -301,8 +304,7 @@ def resolve_project_dir(project_dir: Path | None) -> Path:
 def main() -> int:
     configure_stdio()
     args = parse_args()
-    if args.model is None:
-        args.model = default_model_for(args.thinking_effort)
+    args.model = select_request_model(args.thinking_effort, args.model)
     args.project_dir = resolve_project_dir(args.project_dir)
     strategies = list(STRATEGIES) if args.strategy == "all" else [args.strategy]
     results: list[EvalResult] = []

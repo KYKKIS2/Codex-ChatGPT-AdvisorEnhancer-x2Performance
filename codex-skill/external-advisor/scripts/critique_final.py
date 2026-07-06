@@ -9,7 +9,8 @@ import subprocess
 import sys
 from pathlib import Path
 
-from advisor import default_model_for
+import advisor_safety as safety
+from advisor import select_request_model
 
 
 def configure_stdio() -> None:
@@ -19,11 +20,11 @@ def configure_stdio() -> None:
 
 
 def sanitize_text(text: str) -> str:
-    return text.encode("utf-8", errors="replace").decode("utf-8")
+    return safety.sanitize_text(text)
 
 
 def read_text(path: str) -> str:
-    return sanitize_text(Path(path).read_text(encoding="utf-8"))
+    return safety.read_limited_text(Path(path), redact=True)
 
 
 def conclave_script_path() -> Path:
@@ -47,7 +48,12 @@ def build_prompt(args: argparse.Namespace) -> str:
     if args.prompt:
         blocks.append(f"Original user request:\n{args.prompt.strip()}")
     for path in args.context_file:
-        blocks.append(f"Context file: {path}\n{read_text(path)}")
+        label, content = safety.read_context_file(
+            args.project_dir,
+            path,
+            allow_outside_project=args.allow_outside_project,
+        )
+        blocks.append(f"Context file: {label}\n{content}")
     blocks.append(f"Codex draft:\n{args.draft.strip()}")
     blocks.append(
         "Return concise critique only. Do not write the final answer. "
@@ -73,11 +79,12 @@ def parse_args() -> argparse.Namespace:
             or os.environ.get("ADVISOR_CHATGPT_THINKING_EFFORT")
             or os.environ.get("ADVISOR_INTELLIGENCE")
         ),
-        help="ChatGPT web intelligence/thinking effort, e.g. high, xhigh, pro-extended, or extended.",
+        help="ChatGPT web intelligence/thinking effort, e.g. high->extended, extra-high->max, pro-extended, or none.",
     )
     parser.add_argument("--max-output-tokens", type=int, default=int(os.environ.get("ADVISOR_MAX_OUTPUT_TOKENS", "1200")))
     parser.add_argument("--timeout", type=int, default=int(os.environ.get("ADVISOR_TIMEOUT", "300")))
     parser.add_argument("--project-dir", type=Path, help="Project directory. Defaults to the nearest Git repo root or current directory.")
+    parser.add_argument("--allow-outside-project", action="store_true", help="Allow context/draft files outside the project directory.")
     parser.add_argument("--machine-json", action="store_true", help="Request machine-readable JSON critique.")
     parser.add_argument("--no-sync", action="store_true", help="Skip remote transcript sync.")
     parser.add_argument("--dry-run", action="store_true", help="Print the generated prompt without calling the model.")
@@ -87,11 +94,14 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     configure_stdio()
     args = parse_args()
-    if args.model is None:
-        args.model = default_model_for(args.thinking_effort)
+    args.model = select_request_model(args.thinking_effort, args.model)
     args.project_dir = resolve_project_dir(args.project_dir)
     if args.draft_file:
-        args.draft = read_text(args.draft_file)
+        _, args.draft = safety.read_context_file(
+            args.project_dir,
+            args.draft_file,
+            allow_outside_project=args.allow_outside_project,
+        )
     elif args.draft is None:
         args.draft = sanitize_text(sys.stdin.read())
     else:

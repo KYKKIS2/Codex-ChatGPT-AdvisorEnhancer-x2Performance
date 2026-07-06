@@ -19,6 +19,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+import advisor_safety as safety
+
 
 SAFE_ENV_KEYS = (
     "ADVISOR_PROVIDER",
@@ -43,9 +45,7 @@ def utc_now() -> str:
 
 
 def write_json(path: Path, data: dict[str, Any]) -> None:
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(json.dumps(data, indent=2, sort_keys=True), encoding="utf-8")
-    tmp.replace(path)
+    safety.atomic_write_json(path, data, sort_keys=True)
 
 
 def byte_count(path: Path) -> int:
@@ -84,15 +84,16 @@ def safe_env_snapshot() -> dict[str, str]:
 
 def launch(args: argparse.Namespace, remainder: list[str]) -> int:
     run_dir = Path(args.run_dir).resolve() if args.run_dir else default_run_dir().resolve()
-    run_dir.mkdir(parents=True, exist_ok=True)
+    safety.ensure_private_dir(run_dir)
     command = command_from_args(remainder)
+    redacted_command = safety.redact_argv(command)
 
     meta = {
         "run_id": run_dir.name,
         "created_at_utc": utc_now(),
         "launcher_pid": os.getpid(),
         "cwd": str(Path.cwd().resolve()),
-        "command": command,
+        "command": redacted_command,
         "env_fingerprint": safe_env_snapshot(),
         "monitor_file": str(run_dir / "monitor.log"),
         "response_file": str(run_dir / "response.md"),
@@ -111,7 +112,12 @@ def launch(args: argparse.Namespace, remainder: list[str]) -> int:
         "--",
         *command,
     ]
-    monitor_log = (run_dir / "monitor.log").open("ab")
+    monitor_path = run_dir / "monitor.log"
+    monitor_log = monitor_path.open("ab")
+    try:
+        os.chmod(monitor_path, 0o600)
+    except OSError:
+        pass
     monitor = subprocess.Popen(
         monitor_cmd,
         cwd=Path.cwd(),
@@ -144,6 +150,11 @@ def monitor(run_dir: Path, command: list[str]) -> int:
 
     try:
         with response_tmp.open("wb") as stdout_file, stderr_path.open("ab") as stderr_file:
+            try:
+                os.chmod(response_tmp, 0o600)
+                os.chmod(stderr_path, 0o600)
+            except OSError:
+                pass
             child = subprocess.Popen(
                 command,
                 stdin=subprocess.DEVNULL,
@@ -158,7 +169,7 @@ def monitor(run_dir: Path, command: list[str]) -> int:
                 "started_at_utc": started_iso,
                 "monitor_pid": os.getpid(),
                 "child_pid": child.pid,
-                "command": command,
+                "command": safety.redact_argv(command),
             }
             write_json(status_path, running_status)
 
@@ -181,6 +192,11 @@ def monitor(run_dir: Path, command: list[str]) -> int:
                 time.sleep(5)
 
         response_tmp.replace(response_path)
+        try:
+            os.chmod(response_path, 0o600)
+            os.chmod(stderr_path, 0o600)
+        except OSError:
+            pass
         duration = round(time.time() - started_at, 3)
         stderr_tail = tail_text(stderr_path)
         response_bytes = byte_count(response_path)

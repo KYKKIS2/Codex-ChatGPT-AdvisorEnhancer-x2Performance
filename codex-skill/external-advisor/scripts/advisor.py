@@ -10,9 +10,12 @@ import re
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
 from typing import Any
+
+import advisor_safety as safety
 
 
 SYSTEM_PROMPT = """You are an expert advisor helping Codex improve its answer before it is sent.
@@ -21,6 +24,13 @@ Answer naturally and directly. Give concise, actionable second-pass guidance
 that helps Codex serve the user's real goal. Point out missing assumptions,
 risks, tradeoffs, structural improvements, and concrete details to include when
 they matter.
+
+You do not have implicit access to Codex's repository, filesystem, terminal,
+git state, logs, tests, screenshots, or local observations. You only know what
+Codex includes in this prompt or attached context. Do not imply that you have
+inspected files, commands, errors, or runtime state unless their contents were
+provided. Treat file names, modules, metrics, commands, and root causes not
+present in the prompt as hypotheses for Codex to verify locally.
 
 Do not expose private chain-of-thought. Do not invent facts. Do not force fixed
 section headings; use headings or bullets only when they make the guidance
@@ -35,22 +45,57 @@ THINKING_EFFORT_ALIASES = {
     "off": None,
     "default": None,
     "instant": None,
-    "low": "low",
-    "medium": "medium",
-    "high": "high",
-    "extra high": "xhigh",
-    "extra-high": "xhigh",
-    "extra_high": "xhigh",
-    "xhigh": "xhigh",
-    "pro": "pro",
+    "light": "min",
+    "min": "min",
+    "minimum": "min",
+    "low": "min",
+    "medium": "standard",
+    "standard": "standard",
+    "thinking": "standard",
+    "high": "extended",
+    "extended thinking": "extended",
+    "extra high": "max",
+    "extra-high": "max",
+    "extra_high": "max",
+    "xhigh": "max",
+    "reasoning high": "extended",
+    "reasoning-high": "extended",
+    "reasoning_high": "extended",
+    "reasoning xhigh": "max",
+    "reasoning-xhigh": "max",
+    "reasoning_xhigh": "max",
+    "reasoning extra high": "max",
+    "reasoning-extra-high": "max",
+    "reasoning_extra_high": "max",
+    "heavy": "max",
+    "max": "max",
+    "maximum": "max",
+    "pro": "standard",
+    "pro standard": "standard",
+    "pro-standard": "standard",
+    "pro_standard": "standard",
     "pro extended": "extended",
     "pro-extended": "extended",
     "pro_extended": "extended",
     "extended": "extended",
 }
+PRO_STANDARD_ALIASES = {"pro", "pro standard", "pro-standard", "pro_standard"}
 PRO_EXTENDED_ALIASES = {"pro extended", "pro-extended", "pro_extended"}
 DEFAULT_MODEL = "gpt-5-5-thinking"
-DEFAULT_PRO_EXTENDED_MODEL = "gpt-5-pro"
+SAFE_NON_THINKING_MODEL = "gpt-5-5"
+DEFAULT_CHATGPT_THINKING_EFFORT = "extended"
+DEFAULT_PRO_EXTENDED_MODEL = "gpt-5-5-pro"
+LEGACY_THINKING_MODELS = {"gpt-5-5-thinking", "gpt-5.5-thinking", "gpt-5_5-thinking"}
+COMPATIBLE_MODEL_ALIASES = {
+    "gpt-5-5-thinking": ("gpt-5.5-thinking", "gpt-5_5-thinking"),
+    "gpt-5-5-pro": ("gpt-5.5-pro", "gpt-5_5-pro"),
+    "gpt-5-5": ("gpt-5.5", "gpt-5_5"),
+}
+COMPATIBLE_MODEL_FALLBACKS = (
+    "gpt-5-5-thinking",
+    "gpt-5.5-thinking",
+    "gpt-5_5-thinking",
+)
 
 
 def system_prompt() -> str:
@@ -61,15 +106,28 @@ def normalize_thinking_effort(value: str | None) -> str | None:
     if value is None:
         return None
     normalized = value.strip().lower()
-    return THINKING_EFFORT_ALIASES.get(normalized, value.strip() or None)
+    if normalized in THINKING_EFFORT_ALIASES:
+        return THINKING_EFFORT_ALIASES[normalized]
+    if bool_env("ADVISOR_ALLOW_UNKNOWN_THINKING_EFFORT", False):
+        return value.strip() or None
+    allowed = ", ".join(sorted(key for key in THINKING_EFFORT_ALIASES if key))
+    raise RuntimeError(
+        f"Unknown ADVISOR_THINKING_EFFORT value {value!r}. "
+        f"Known values/aliases: {allowed}. Set ADVISOR_ALLOW_UNKNOWN_THINKING_EFFORT=true "
+        "only for deliberate diagnostics against a changed ChatGPT web schema."
+    )
 
 
 def is_pro_extended_request(value: str | None) -> bool:
     return value is not None and value.strip().lower() in PRO_EXTENDED_ALIASES
 
 
+def is_pro_request(value: str | None) -> bool:
+    return value is not None and value.strip().lower() in (PRO_STANDARD_ALIASES | PRO_EXTENDED_ALIASES)
+
+
 def default_model_for(thinking_effort: str | None) -> str:
-    if is_pro_extended_request(thinking_effort):
+    if is_pro_request(thinking_effort):
         return os.environ.get("ADVISOR_PRO_EXTENDED_MODEL", DEFAULT_PRO_EXTENDED_MODEL)
     return DEFAULT_MODEL
 
@@ -83,7 +141,8 @@ def configured_thinking_effort(reasoning_effort: str | None) -> str | None:
     )
     if explicit is not None:
         return normalize_thinking_effort(explicit)
-    return None
+    default = os.environ.get("ADVISOR_DEFAULT_THINKING_EFFORT", DEFAULT_CHATGPT_THINKING_EFFORT)
+    return normalize_thinking_effort(default) if default is not None else None
 
 
 def configure_stdio() -> None:
@@ -93,27 +152,15 @@ def configure_stdio() -> None:
 
 
 def read_text(path: str) -> str:
-    return sanitize_text(Path(path).read_text(encoding="utf-8"))
+    return safety.read_limited_text(Path(path), redact=True)
 
 
 def sanitize_text(text: str) -> str:
-    return text.encode("utf-8", errors="replace").decode("utf-8")
+    return safety.sanitize_text(text)
 
 
 def redact_sensitive(text: str) -> str:
-    patterns = [
-        (r"eyJ[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{20,}", "[REDACTED_JWT]"),
-        (r"(?i)bearer\s+[A-Za-z0-9._~+/=-]{20,}", "Bearer [REDACTED]"),
-        (r"(?i)(authorization['\"]?\s*[:=]\s*['\"]?)[^'\"\s,}]+", r"\1[REDACTED]"),
-        (r"(?i)(access[_-]?token['\"]?\s*[:=]\s*['\"]?)[^'\"\s,}]+", r"\1[REDACTED]"),
-        (r"(?i)(refresh[_-]?token['\"]?\s*[:=]\s*['\"]?)[^'\"\s,}]+", r"\1[REDACTED]"),
-        (r"(?i)(session[_-]?id['\"]?\s*[:=]\s*['\"]?)[^'\"\s,}]+", r"\1[REDACTED]"),
-        (r"(?i)(cookie['\"]?\s*[:=]\s*['\"]?)[^'\"}]+", r"\1[REDACTED]"),
-        (r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}", "[REDACTED_EMAIL]"),
-    ]
-    for pattern, replacement in patterns:
-        text = re.sub(pattern, replacement, text)
-    return text
+    return safety.redact_sensitive_text(text)
 
 
 def post_json(url: str, payload: dict[str, Any], headers: dict[str, str], timeout: int) -> dict[str, Any]:
@@ -132,7 +179,8 @@ def post_json(url: str, payload: dict[str, Any], headers: dict[str, str], timeou
     try:
         return json.loads(body)
     except json.JSONDecodeError as exc:
-        raise RuntimeError(f"Non-JSON response from {url}: {body[:500]}") from exc
+        preview = safety.truncate(redact_sensitive(body), 500)
+        raise RuntimeError(f"Non-JSON response from {url}: {preview}") from exc
 
 
 def get_json(url: str, headers: dict[str, str], timeout: int) -> dict[str, Any]:
@@ -150,7 +198,97 @@ def get_json(url: str, headers: dict[str, str], timeout: int) -> dict[str, Any]:
     try:
         return json.loads(body)
     except json.JSONDecodeError as exc:
-        raise RuntimeError(f"Non-JSON response from {url}: {body[:500]}") from exc
+        preview = safety.truncate(redact_sensitive(body), 500)
+        raise RuntimeError(f"Non-JSON response from {url}: {preview}") from exc
+
+
+def compatible_model_ids(base_url: str, headers: dict[str, str], timeout: int) -> set[str]:
+    payload = get_json(f"{base_url}/models", headers, min(timeout, 5))
+    models = payload.get("data")
+    if not isinstance(models, list):
+        return set()
+    ids: set[str] = set()
+    for model in models:
+        if not isinstance(model, dict):
+            continue
+        model_id = model.get("id")
+        if isinstance(model_id, str) and model_id.strip():
+            ids.add(model_id.strip())
+    return ids
+
+
+def g4f_provider_base_url(base_url: str) -> str | None:
+    parsed = urllib.parse.urlparse(base_url)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        return None
+    if parsed.hostname not in {"127.0.0.1", "localhost"}:
+        return None
+    path = parsed.path.rstrip("/")
+    if path.endswith("/v1"):
+        path = path[:-3].rstrip("/")
+    return urllib.parse.urlunparse((parsed.scheme, parsed.netloc, path, "", "", "")).rstrip("/")
+
+
+def g4f_provider_model_ids(base_url: str, headers: dict[str, str], timeout: int) -> tuple[set[str], str] | None:
+    provider_root = g4f_provider_base_url(base_url)
+    if provider_root is None:
+        return None
+    provider = (
+        os.environ.get("ADVISOR_G4F_PROVIDER")
+        or os.environ.get("G4F_PROVIDER")
+        or "OpenaiAccount"
+    ).strip()
+    if not provider:
+        return None
+    quoted_provider = urllib.parse.quote(provider, safe="")
+    url = f"{provider_root}/api/{quoted_provider}/models"
+    try:
+        return compatible_model_ids(url.rsplit("/models", 1)[0], headers, timeout), url
+    except RuntimeError:
+        return None
+
+
+def resolve_compatible_model(model: str, base_url: str, headers: dict[str, str], timeout: int) -> str:
+    if not bool_env("ADVISOR_VALIDATE_MODEL", True):
+        return model
+    try:
+        provider_models = g4f_provider_model_ids(base_url, headers, timeout)
+        if provider_models is not None:
+            models, model_source = provider_models
+        else:
+            models = compatible_model_ids(base_url, headers, timeout)
+            model_source = f"{base_url}/models"
+    except RuntimeError as exc:
+        print(f"Advisor model validation skipped: {exc}", file=sys.stderr)
+        return model
+    if not models or model in models:
+        return model
+    for alias in COMPATIBLE_MODEL_ALIASES.get(model, ()):
+        if alias in models:
+            print(
+                f"Advisor requested model {model!r}; {model_source} exposes alias {alias!r}.",
+                file=sys.stderr,
+            )
+            return alias
+    if not bool_env("ADVISOR_ALLOW_MODEL_FALLBACK", False):
+        raise RuntimeError(
+            f"Advisor requested model {model!r}, but {model_source} does not expose it. "
+            "Refusing to fall back automatically because that can create a weaker ChatGPT model chat. "
+            "Refresh/update the local g4f/HAR model list, pass the exact ChatGPT web model slug with ADVISOR_MODEL, "
+            "or set ADVISOR_VALIDATE_MODEL=false only for a deliberate diagnostic."
+        )
+    for fallback in COMPATIBLE_MODEL_FALLBACKS:
+        if fallback in models:
+            print(
+                f"Advisor requested model {model!r} is not exposed by {model_source}; using {fallback!r}.",
+                file=sys.stderr,
+            )
+            return fallback
+    available = ", ".join(sorted(models)[:12])
+    raise RuntimeError(
+        f"Advisor requested model {model!r} is not exposed by {model_source}, "
+        f"and no preferred fallback is available. First available models: {available}"
+    )
 
 
 def extract_responses_text(response: dict[str, Any]) -> str:
@@ -187,6 +325,62 @@ def bool_env(name: str, default: bool = False) -> bool:
     if value is None:
         return default
     return value.lower() in ("1", "true", "yes", "on")
+
+
+def is_pro_model_slug(value: Any) -> bool:
+    if not isinstance(value, str):
+        return False
+    normalized = value.strip().lower()
+    return normalized in {
+        "gpt-5-5-pro",
+        "gpt-5.5-pro",
+        "gpt-5_5-pro",
+    } or normalized.endswith("-pro")
+
+
+def select_request_model(thinking_effort: str | None, model: str | None) -> str:
+    normalized_effort = normalize_thinking_effort(thinking_effort)
+    if not is_pro_request(thinking_effort):
+        selected = model or DEFAULT_MODEL
+        explicit_no_thinking = thinking_effort is not None and normalized_effort is None
+        if (
+            selected in LEGACY_THINKING_MODELS
+            and (explicit_no_thinking or normalized_effort in {"min", "standard"})
+            and not bool_env("ADVISOR_ALLOW_LEGACY_THINKING_MODEL", False)
+        ):
+            print(
+                f"Advisor replacing legacy Thinking model {selected!r} with {SAFE_NON_THINKING_MODEL!r}; "
+                "current ChatGPT metadata resolves that legacy route to gpt-5-3-mini unless "
+                "thinking_effort is extended/max. Set ADVISOR_ALLOW_LEGACY_THINKING_MODEL=true "
+                "only for deliberate diagnostics.",
+                file=sys.stderr,
+            )
+            return SAFE_NON_THINKING_MODEL
+        return selected
+
+    pro_model = default_model_for(thinking_effort)
+    if model is None or model == pro_model:
+        return pro_model
+    if bool_env("ADVISOR_ALLOW_PRO_MODEL_OVERRIDE", False):
+        print(
+            f"Advisor Pro/Pro Extended using explicit model override {model!r}; expected {pro_model!r}.",
+            file=sys.stderr,
+        )
+        return model
+
+    if model in {DEFAULT_MODEL, *LEGACY_THINKING_MODELS}:
+        print(
+            f"Advisor Pro/Pro Extended overriding normal/legacy model {model!r} with {pro_model!r}. "
+            "Set ADVISOR_ALLOW_PRO_MODEL_OVERRIDE=true only for deliberate diagnostics.",
+            file=sys.stderr,
+        )
+        return pro_model
+
+    raise RuntimeError(
+        f"Refusing Pro/Pro Extended with model {model!r}; expected {pro_model!r}. "
+        "Use ADVISOR_PRO_EXTENDED_MODEL to update the ChatGPT Pro slug, or set "
+        "ADVISOR_ALLOW_PRO_MODEL_OVERRIDE=true only for a deliberate diagnostic."
+    )
 
 
 def int_env(name: str, default: int, minimum: int = 1) -> int:
@@ -245,8 +439,7 @@ def write_project_binding(project_id: str, source: str | None = None, name: str 
         data.setdefault("chatgpt_project_source", source)
     if name:
         data.setdefault("name", name)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    safety.atomic_write_json(path, data)
 
 
 def find_gizmo(payload: Any) -> dict[str, Any] | None:
@@ -261,6 +454,41 @@ def find_gizmo(payload: Any) -> dict[str, Any] | None:
     elif isinstance(payload, list):
         for value in payload:
             found = find_gizmo(value)
+            if found:
+                return found
+    return None
+
+
+def find_conversation_payload(payload: Any) -> dict[str, Any] | None:
+    if isinstance(payload, dict):
+        conversation = payload.get("conversation")
+        if isinstance(conversation, dict) and isinstance(conversation.get("conversation_id"), str):
+            return conversation
+        if isinstance(payload.get("conversation_id"), str):
+            return payload
+        for value in payload.values():
+            found = find_conversation_payload(value)
+            if found:
+                return found
+    elif isinstance(payload, list):
+        for value in payload:
+            found = find_conversation_payload(value)
+            if found:
+                return found
+    return None
+
+
+def find_conversation_data_payload(payload: Any) -> dict[str, Any] | None:
+    if isinstance(payload, dict):
+        if isinstance(payload.get("mapping"), dict):
+            return payload
+        for value in payload.values():
+            found = find_conversation_data_payload(value)
+            if found:
+                return found
+    elif isinstance(payload, list):
+        for value in payload:
+            found = find_conversation_data_payload(value)
             if found:
                 return found
     return None
@@ -313,7 +541,8 @@ def chatgpt_project_id(timeout: int | None = None, allow_create: bool = True) ->
     )
     project_id = normalize_chatgpt_project_id(explicit)
     if project_id:
-        write_project_binding(project_id, explicit, default_project_name())
+        if allow_create:
+            write_project_binding(project_id, explicit, default_project_name())
         return project_id
 
     binding = read_project_binding()
@@ -334,6 +563,7 @@ def default_state_path() -> Path:
         return Path(explicit)
     key = os.environ.get("ADVISOR_CONVERSATION_KEY")
     if key:
+        key = safety.safe_key_slug(key, default="conversation")
         explicit_root = os.environ.get("ADVISOR_STATE_DIR")
         if explicit_root:
             root = Path(explicit_root)
@@ -351,10 +581,16 @@ def default_state_path() -> Path:
 
 
 def transcript_json_path(state_path: Path) -> Path:
+    name = state_path.name
+    if name.endswith(".conversation.json") and name != "conversation.json":
+        return state_path.with_name(name[: -len(".conversation.json")] + ".transcript.json")
     return state_path.with_name("transcript.json")
 
 
 def transcript_md_path(state_path: Path) -> Path:
+    name = state_path.name
+    if name.endswith(".conversation.json") and name != "conversation.json":
+        return state_path.with_name(name[: -len(".conversation.json")] + ".transcript.md")
     return state_path.with_name("transcript.md")
 
 
@@ -380,10 +616,7 @@ def latest_response_paths() -> list[Path]:
 
 def write_latest_response(path: Path, text: str) -> bool:
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_suffix(path.suffix + ".tmp")
-        tmp.write_text(text, encoding="utf-8")
-        tmp.replace(path)
+        safety.atomic_write_text(path, text)
         return True
     except OSError as exc:
         print(f"Advisor latest-response write skipped: {redact_sensitive(str(exc))}", file=sys.stderr)
@@ -413,19 +646,41 @@ def saved_project_id(path: Path) -> str | None:
 
 
 def remove_state_files(state_path: Path) -> None:
-    for path in (state_path, transcript_json_path(state_path), transcript_md_path(state_path)):
+    for path in (
+        state_path,
+        transcript_json_path(state_path),
+        transcript_md_path(state_path),
+        state_path.with_name("latest-response.md"),
+    ):
         path.unlink(missing_ok=True)
 
 
+def stale_conversation_error(exc: RuntimeError) -> bool:
+    text = str(exc)
+    markers = (
+        "HTTP 401",
+        "HTTP 403",
+        "HTTP 404",
+        "conversation_deleted",
+        "conversation_not_found",
+        "conversation_inaccessible",
+        "Invalid conversation body",
+        "invalid conversation body",
+        "invalid_conversation",
+        "Response 422",
+        "HTTP 422",
+    )
+    return any(marker in text for marker in markers)
+
+
 def save_conversation(path: Path, response: dict[str, Any], project_id: str | None = None) -> None:
-    conversation = response.get("conversation")
-    if not isinstance(conversation, dict):
+    conversation = find_conversation_payload(response)
+    if conversation is None:
         return
     payload: dict[str, Any] = {"conversation": conversation}
     if project_id:
         payload["chatgpt_project_id"] = project_id
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    safety.atomic_write_json(path, payload)
 
 
 def read_skill_config() -> dict[str, Any]:
@@ -562,6 +817,21 @@ def transcript_from_conversation(conversation_data: dict[str, Any]) -> list[dict
             "status": message.get("status"),
             "content": text,
         })
+        metadata = message.get("metadata")
+        if isinstance(metadata, dict):
+            model_metadata = {
+                key: metadata.get(key)
+                for key in (
+                    "model_slug",
+                    "requested_model_slug",
+                    "resolved_model_slug",
+                    "default_model_slug",
+                    "thinking_effort",
+                )
+                if isinstance(metadata.get(key), (str, int, float, bool))
+            }
+            if model_metadata:
+                transcript[-1]["metadata"] = model_metadata
     return transcript
 
 
@@ -589,11 +859,55 @@ def latest_finished_assistant_text(conversation_data: dict[str, Any]) -> str:
             last_user_index = index
     candidates = transcript[last_user_index + 1:] if last_user_index >= 0 else transcript
     for item in reversed(candidates):
-        if item.get("role") == "assistant" and item.get("status") == "finished_successfully":
+        if item.get("role") == "assistant" and assistant_status_has_final_content(item.get("status")):
             content = str(item.get("content") or "").strip()
             if content:
                 return content
     return ""
+
+
+def latest_finished_assistant_text_for_prompt_data(conversation_data: dict[str, Any], prompt: str) -> str:
+    transcript = transcript_from_conversation(conversation_data)
+    return latest_assistant_text_after_prompt_messages(transcript, prompt)
+
+
+def latest_assistant_text_after_prompt_messages(messages: list[Any], prompt: str) -> str:
+    normalized_prompt = prompt.strip()
+    last_user_index = -1
+    for index, item in enumerate(messages):
+        if not isinstance(item, dict) or item.get("role") != "user":
+            continue
+        if str(item.get("content") or "").strip() == normalized_prompt:
+            last_user_index = index
+    if last_user_index < 0:
+        return ""
+    candidates: list[dict[str, Any]] = []
+    for item in messages[last_user_index + 1:]:
+        if not isinstance(item, dict):
+            continue
+        if item.get("role") == "user":
+            break
+        if item.get("role") == "assistant":
+            candidates.append(item)
+    for item in reversed(candidates):
+        if not isinstance(item, dict) or item.get("role") != "assistant":
+            continue
+        if not assistant_status_has_final_content(item.get("status")):
+            continue
+        content = str(item.get("content") or "").strip()
+        if content:
+            return content
+    return ""
+
+
+def transcript_contains_prompt(messages: list[Any], prompt: str) -> bool:
+    normalized_prompt = prompt.strip()
+    return any(
+        isinstance(item, dict)
+        and item.get("role") == "user"
+        and str(item.get("content") or "").strip() == normalized_prompt
+        for item in messages
+    )
 
 
 def latest_transcript_assistant_text_for_prompt(state_path: Path, prompt: str) -> str:
@@ -607,23 +921,187 @@ def latest_transcript_assistant_text_for_prompt(state_path: Path, prompt: str) -
     messages = data.get("messages")
     if not isinstance(messages, list):
         return ""
-    last_user_index = -1
+    return latest_assistant_text_after_prompt_messages(messages, prompt)
+
+
+def latest_assistant_metadata_after_prompt_messages(messages: list[Any], prompt: str) -> dict[str, Any]:
     normalized_prompt = prompt.strip()
+    last_user_index = -1
     for index, item in enumerate(messages):
-        if isinstance(item, dict) and item.get("role") == "user":
+        if not isinstance(item, dict) or item.get("role") != "user":
+            continue
+        if str(item.get("content") or "").strip() == normalized_prompt:
             last_user_index = index
     if last_user_index < 0:
-        return ""
-    latest_user = messages[last_user_index]
-    if not isinstance(latest_user, dict) or str(latest_user.get("content") or "").strip() != normalized_prompt:
-        return ""
-    for item in reversed(messages[last_user_index + 1:]):
-        if not isinstance(item, dict) or item.get("role") != "assistant":
+        return {}
+    candidates: list[dict[str, Any]] = []
+    for item in messages[last_user_index + 1:]:
+        if not isinstance(item, dict):
             continue
-        content = str(item.get("content") or "").strip()
-        if content:
-            return content
+        if item.get("role") == "user":
+            break
+        if item.get("role") == "assistant":
+            candidates.append(item)
+    for item in reversed(candidates):
+        if not assistant_status_has_final_content(item.get("status")):
+            continue
+        metadata = item.get("metadata")
+        if isinstance(metadata, dict):
+            return metadata
+    return {}
+
+
+def latest_transcript_assistant_metadata_for_prompt(state_path: Path, prompt: str) -> dict[str, Any]:
+    path = transcript_json_path(state_path)
+    if not path.exists():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return {}
+    messages = data.get("messages")
+    if not isinstance(messages, list):
+        return {}
+    return latest_assistant_metadata_after_prompt_messages(messages, prompt)
+
+
+def rejected_resolved_model_slugs() -> set[str]:
+    raw = os.environ.get("ADVISOR_REJECT_RESOLVED_MODEL_SLUGS", "gpt-5-3-mini")
+    return {item.strip().lower() for item in raw.split(",") if item.strip()}
+
+
+def metadata_pro_request_model(metadata: dict[str, Any]) -> str | None:
+    for key in ("requested_model_slug", "model_slug", "default_model_slug"):
+        value = metadata.get(key)
+        if is_pro_model_slug(value):
+            return str(value)
+    return None
+
+
+def metadata_matches_current_pro_effort(metadata: dict[str, Any]) -> bool:
+    requested = os.environ.get("ADVISOR_THINKING_EFFORT")
+    if not is_pro_request(requested):
+        return False
+    expected = normalize_thinking_effort(requested)
+    actual = metadata.get("thinking_effort")
+    if actual is None:
+        return True
+    return str(actual).strip().lower() == expected
+
+
+def metadata_is_current_pro_request(metadata: dict[str, Any]) -> bool:
+    return bool(metadata_pro_request_model(metadata)) and metadata_matches_current_pro_effort(metadata)
+
+
+def assert_resolved_model_route(state_path: Path | None, prompt: str) -> None:
+    if bool_env("ADVISOR_ALLOW_RESOLVED_MODEL_DOWNGRADE", False):
+        return
+    if state_path is None:
+        return
+    metadata = latest_transcript_assistant_metadata_for_prompt(state_path, prompt)
+    if not metadata:
+        return
+    resolved = metadata.get("resolved_model_slug")
+    if isinstance(resolved, str) and resolved.strip().lower() in rejected_resolved_model_slugs():
+        if metadata_is_current_pro_request(metadata):
+            # Browser-captured Pro Extended turns can still report gpt-5-3-mini
+            # here; the Pro request slug plus extended effort are the stable
+            # signal for this route.
+            print(
+                "Advisor Pro/Pro Extended metadata contains a rejected-looking resolved_model_slug, "
+                "but the latest browser Pro Extended HAR uses the same resolved slug while keeping "
+                "model_slug/default_model_slug on the Pro model. Accepting the Pro-shaped route: "
+                f"metadata={metadata!r}",
+                file=sys.stderr,
+            )
+            return
+        raise RuntimeError(
+            "Advisor request resolved to a rejected/weaker ChatGPT model. "
+            f"metadata={metadata!r}. Refresh the HAR/session or choose a route that does not "
+            "downgrade. Set ADVISOR_ALLOW_RESOLVED_MODEL_DOWNGRADE=true only for deliberate diagnostics."
+        )
+
+
+def assert_pro_model_route(state_path: Path | None, prompt: str) -> None:
+    if not is_pro_request(os.environ.get("ADVISOR_THINKING_EFFORT")):
+        return
+    if state_path is None:
+        return
+    metadata = latest_transcript_assistant_metadata_for_prompt(state_path, prompt)
+    if not metadata:
+        return
+    resolved = (
+        metadata.get("resolved_model_slug")
+        or metadata.get("requested_model_slug")
+        or metadata.get("model_slug")
+    )
+    if is_pro_model_slug(resolved):
+        return
+    pro_request_model = metadata_pro_request_model(metadata)
+    if pro_request_model and metadata_matches_current_pro_effort(metadata):
+        print(
+            "Advisor Pro/Pro Extended route accepted from Pro-shaped assistant metadata. "
+            "ChatGPT may report a non-Pro resolved_model_slug even for browser-captured Pro Extended turns: "
+            f"metadata={metadata!r}",
+            file=sys.stderr,
+        )
+        return
+    raise RuntimeError(
+        "Advisor Pro/Pro Extended request did not resolve to a Pro model. "
+        f"metadata={metadata!r}. This usually means a normal ADVISOR_MODEL override, "
+        "a stale g4f runtime patch, a ChatGPT web model slug change, or a HAR/session "
+        "that does not contain/allow the real Pro browser route."
+    )
+
+
+def assistant_status_has_final_content(status: Any) -> bool:
+    if status is None:
+        return True
+    normalized = str(status).strip().lower()
+    if not normalized:
+        return True
+    if normalized in {
+        "finished_successfully",
+        "finished",
+        "complete",
+        "completed",
+        "success",
+        "succeeded",
+    }:
+        return True
+    if normalized in {
+        "in_progress",
+        "running",
+        "pending",
+        "queued",
+        "failed",
+        "error",
+        "errored",
+        "cancelled",
+        "canceled",
+        "interrupted",
+    }:
+        return False
+    return not any(marker in normalized for marker in ("progress", "running", "pending", "fail", "error", "cancel"))
+
+
+def exact_repeated_half(text: str) -> str:
+    stripped = text.strip()
+    if len(stripped) < 8 or len(stripped) % 2 != 0:
+        return ""
+    midpoint = len(stripped) // 2
+    first = stripped[:midpoint]
+    second = stripped[midpoint:]
+    if first and first == second:
+        return first
     return ""
+
+
+def synced_text_matches_repeated_local(local_text: str, synced_text: str) -> bool:
+    repeated = exact_repeated_half(local_text)
+    if not repeated:
+        return False
+    return repeated.strip() == synced_text.strip()
 
 
 def should_prefer_synced_text(local_text: str, synced_text: str) -> bool:
@@ -635,6 +1113,8 @@ def should_prefer_synced_text(local_text: str, synced_text: str) -> bool:
         return True
     if local == synced:
         return False
+    if synced_text_matches_repeated_local(local, synced):
+        return True
     if len(synced) < 200:
         return False
     if local in synced and len(local) < len(synced):
@@ -659,6 +1139,44 @@ def looks_like_tail_fragment(text: str, prompt: str) -> bool:
     if stripped.endswith("**") or stripped.startswith(("...", ",", ".", ";", ":", ")")):
         return True
     return False
+
+
+def looks_suspiciously_short(text: str, prompt: str, *, had_transport_corruption: bool = False) -> bool:
+    stripped = text.strip()
+    if not stripped:
+        return True
+    prompt_min = int_env("ADVISOR_SUSPICIOUS_SHORT_PROMPT_MIN_CHARS", 300, minimum=1)
+    if len(prompt.strip()) < prompt_min:
+        return False
+    max_chars = int_env("ADVISOR_SUSPICIOUS_SHORT_MAX_CHARS", 120, minimum=20)
+    if len(stripped) > max_chars:
+        return False
+    if bool_env("ADVISOR_ALLOW_SUSPICIOUS_SHORT_RESPONSE", False):
+        return False
+    return had_transport_corruption or looks_like_tail_fragment(stripped, prompt)
+
+
+def response_needs_remote_recovery(text: str, prompt: str, *, had_transport_corruption: bool = False) -> bool:
+    return not text.strip() or looks_like_tail_fragment(text, prompt) or looks_suspiciously_short(
+        text,
+        prompt,
+        had_transport_corruption=had_transport_corruption,
+    )
+
+
+def recovery_debug_context(state_path: Path | None = None) -> str:
+    parts = [
+        f"auth_file={auth_file_path() or 'not-found'}",
+        f"setup_dir={setup_dir_from_config() or 'not-configured'}",
+    ]
+    if state_path is not None:
+        parts.extend([
+            f"state_path={state_path}",
+            f"transcript_json={transcript_json_path(state_path)}",
+            f"transcript_md={transcript_md_path(state_path)}",
+        ])
+    parts.append("latest_response_paths=" + ", ".join(str(path) for path in latest_response_paths()))
+    return "; ".join(parts)
 
 
 def recovery_disabled_reasons(persist: bool, temporary: bool, sync_remote: bool) -> list[str]:
@@ -700,15 +1218,13 @@ def call_compatible_with_recovery(prompt: str, model: str, timeout: int) -> str:
                 os.environ[name] = value
 
 
-def file_snapshot(path: Path) -> bytes | None:
-    try:
-        return path.read_bytes()
-    except OSError:
-        return None
-
-
 def utf8_len(text: str) -> int:
     return len(text.encode("utf-8", errors="replace"))
+
+
+def deduplicate_repeated_transport_text(text: str) -> str:
+    repeated = exact_repeated_half(text)
+    return repeated if repeated else text
 
 
 def write_transcript(state_path: Path, conversation_data: dict[str, Any], transcript: list[dict[str, Any]]) -> None:
@@ -719,7 +1235,7 @@ def write_transcript(state_path: Path, conversation_data: dict[str, Any], transc
         "current_node": conversation_data.get("current_node") or conversation_data.get("current_node_id"),
         "messages": transcript,
     }
-    transcript_json_path(state_path).write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    safety.atomic_write_json(transcript_json_path(state_path), payload)
 
     lines = [
         f"# Advisor Transcript",
@@ -731,7 +1247,7 @@ def write_transcript(state_path: Path, conversation_data: dict[str, Any], transc
     for item in transcript:
         role = str(item["role"]).title()
         lines.extend([f"## {role}", "", str(item["content"]).strip(), ""])
-    transcript_md_path(state_path).write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
+    safety.atomic_write_text(transcript_md_path(state_path), "\n".join(lines).rstrip() + "\n")
 
 
 def sync_remote_conversation(
@@ -739,6 +1255,7 @@ def sync_remote_conversation(
     conversation: dict[str, Any] | None,
     timeout: int,
     project_id: str | None = None,
+    expected_prompt: str | None = None,
 ) -> dict[str, Any] | None:
     if not conversation:
         return conversation
@@ -754,10 +1271,24 @@ def sync_remote_conversation(
     except RuntimeError as exc:
         if os.environ.get("ADVISOR_SYNC_STRICT", "false").lower() in ("1", "true", "yes"):
             raise
+        if bool_env("ADVISOR_RESET_INACCESSIBLE_CONVERSATION", True) and stale_conversation_error(exc):
+            remove_state_files(state_path)
+            print(
+                "Advisor remote sync found an inaccessible saved conversation; "
+                "cleared local advisor state so the next call starts a fresh ChatGPT chat.",
+                file=sys.stderr,
+            )
+            return None
         print(f"Advisor remote sync skipped: {redact_sensitive(str(exc))}", file=sys.stderr)
         return conversation
 
     transcript = transcript_from_conversation(conversation_data)
+    if expected_prompt is not None and not transcript_contains_prompt(transcript, expected_prompt):
+        print(
+            "Advisor remote sync did not yet contain the current prompt; keeping local adapter state.",
+            file=sys.stderr,
+        )
+        return conversation
     latest_id = latest_message_id(conversation_data, transcript)
     if latest_id:
         conversation["message_id"] = latest_id
@@ -766,44 +1297,49 @@ def sync_remote_conversation(
         conversation["user_id"] = auth["user_id"]
     conversation["conversation_id"] = conversation_id
     write_transcript(state_path, conversation_data, transcript)
-    state_path.parent.mkdir(parents=True, exist_ok=True)
     payload: dict[str, Any] = {"conversation": conversation}
     if project_id:
         payload["chatgpt_project_id"] = project_id
-    state_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    safety.atomic_write_json(state_path, payload)
     return conversation
 
 
 def fetch_remote_final_text(
     state_path: Path,
     conversation: dict[str, Any] | None,
+    prompt: str,
     timeout: int,
     project_id: str | None = None,
 ) -> str:
     if not conversation:
+        print("Advisor final fetch skipped: no conversation id was returned by the local adapter.", file=sys.stderr)
         return ""
     conversation_id = conversation.get("conversation_id")
     if not isinstance(conversation_id, str) or not conversation_id:
+        print("Advisor final fetch skipped: saved conversation state has no conversation_id.", file=sys.stderr)
         return ""
     auth = load_chatgpt_auth()
     if not auth:
+        print("Advisor final fetch skipped: ChatGPT HAR/auth is unavailable.", file=sys.stderr)
         return ""
-    max_polls = int_env("ADVISOR_FINAL_FETCH_MAX_POLLS", 1, minimum=1)
+    max_polls = int_env("ADVISOR_FINAL_FETCH_MAX_POLLS", 6, minimum=1)
     fallback_timeout = int_env("ADVISOR_FINAL_FETCH_TIMEOUT", min(max(timeout, 1), 180), minimum=1)
     poll_seconds = float_env("ADVISOR_FINAL_FETCH_POLL_SECONDS", 5.0, minimum=0.5)
     deadline = time.monotonic() + fallback_timeout
     url = f"https://chatgpt.com/backend-api/conversation/{conversation_id}"
     last_data: dict[str, Any] | None = None
     for attempt in range(max_polls):
+        remaining_before = max(1, int(deadline - time.monotonic()))
+        request_timeout = max(1, min(timeout, remaining_before))
         try:
-            conversation_data = get_json(url, auth["headers"], timeout)
+            conversation_data = get_json(url, auth["headers"], request_timeout)
         except RuntimeError as exc:
             if os.environ.get("ADVISOR_SYNC_STRICT", "false").lower() in ("1", "true", "yes"):
                 raise
             print(f"Advisor final fetch skipped: {redact_sensitive(str(exc))}", file=sys.stderr)
             return ""
         last_data = conversation_data
-        text = latest_finished_assistant_text(conversation_data)
+        text = latest_finished_assistant_text_for_prompt_data(conversation_data, prompt)
         if text:
             transcript = transcript_from_conversation(conversation_data)
             latest_id = latest_message_id(conversation_data, transcript)
@@ -817,14 +1353,18 @@ def fetch_remote_final_text(
             payload: dict[str, Any] = {"conversation": conversation}
             if project_id:
                 payload["chatgpt_project_id"] = project_id
-            state_path.parent.mkdir(parents=True, exist_ok=True)
-            state_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+            safety.atomic_write_json(state_path, payload)
             return text
         if attempt + 1 >= max_polls or time.monotonic() >= deadline:
             if last_data is not None:
                 transcript = transcript_from_conversation(last_data)
-                if transcript:
+                if transcript and transcript_contains_prompt(transcript, prompt):
                     write_transcript(state_path, last_data, transcript)
+                elif transcript:
+                    print(
+                        "Advisor final fetch did not expose the current prompt; leaving transcript unchanged.",
+                        file=sys.stderr,
+                    )
             return ""
         remaining = deadline - time.monotonic()
         if remaining <= 0:
@@ -833,10 +1373,30 @@ def fetch_remote_final_text(
     return ""
 
 
+def allow_outside_project_context() -> bool:
+    return bool_env("ADVISOR_ALLOW_OUTSIDE_PROJECT_CONTEXT", False)
+
+
+def compatible_api_key(base_url: str) -> str:
+    explicit = os.environ.get("ADVISOR_API_KEY")
+    if explicit is not None:
+        return explicit
+    host = urllib.parse.urlparse(base_url).hostname or ""
+    if host in {"api.openai.com"} and bool_env("ADVISOR_COMPATIBLE_USE_OPENAI_KEY", False):
+        return os.environ.get("OPENAI_API_KEY", "local")
+    return "local"
+
+
 def build_prompt(prompt: str, context_files: list[str]) -> str:
     blocks = [prompt.strip()]
+    project_dir = advisor_project_dir()
     for path in context_files:
-        blocks.append(f"\n\n--- Context file: {path} ---\n{read_text(path)}")
+        label, content = safety.read_context_file(
+            project_dir,
+            path,
+            allow_outside_project=allow_outside_project_context(),
+        )
+        blocks.append(f"\n\n--- Context file: {label} ---\n{content}")
     return "\n".join(block for block in blocks if block.strip())
 
 
@@ -864,7 +1424,7 @@ def call_openai(prompt: str, model: str, timeout: int) -> str:
 
 def call_compatible(prompt: str, model: str, timeout: int) -> str:
     base_url = os.environ.get("ADVISOR_BASE_URL", "http://127.0.0.1:8080/v1").rstrip("/")
-    api_key = os.environ.get("ADVISOR_API_KEY", os.environ.get("OPENAI_API_KEY", "local"))
+    api_key = compatible_api_key(base_url)
     reasoning_effort = os.environ.get("ADVISOR_REASONING_EFFORT")
     thinking_effort = configured_thinking_effort(reasoning_effort)
     payload = {
@@ -918,11 +1478,19 @@ def call_compatible(prompt: str, model: str, timeout: int) -> str:
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
     }
+    model = resolve_compatible_model(model, base_url, headers, timeout)
+    payload["model"] = model
+    if is_pro_request(os.environ.get("ADVISOR_THINKING_EFFORT")) or bool_env("ADVISOR_DEBUG_ROUTE", False):
+        print(
+            "Advisor route: "
+            f"model={model!r} thinking_effort={thinking_effort!r} "
+            f"project_id={project_id or 'none'} state_path={state_path or 'none'}",
+            file=sys.stderr,
+        )
     try:
         response = post_json(f"{base_url}/chat/completions", payload, headers, timeout)
     except RuntimeError as exc:
-        stale_markers = ("conversation_deleted", "conversation_not_found", "conversation_inaccessible")
-        if persist and conversation and any(marker in str(exc) for marker in stale_markers):
+        if persist and conversation and stale_conversation_error(exc):
             if state_path is not None:
                 remove_state_files(state_path)
             payload.pop("conversation", None)
@@ -933,12 +1501,10 @@ def call_compatible(prompt: str, model: str, timeout: int) -> str:
     if persist and state_path is not None:
         save_conversation(state_path, response, project_id)
         if sync_remote and not temporary:
-            transcript_path = transcript_json_path(state_path)
-            transcript_before = file_snapshot(transcript_path)
-            sync_remote_conversation(state_path, load_conversation(state_path), timeout, project_id)
-            if file_snapshot(transcript_path) != transcript_before:
-                synced_text = latest_transcript_assistant_text_for_prompt(state_path, prompt)
+            sync_remote_conversation(state_path, load_conversation(state_path), timeout, project_id, expected_prompt=prompt)
+            synced_text = latest_transcript_assistant_text_for_prompt(state_path, prompt)
     text = extract_chat_text(response)
+    had_transport_corruption = False
     if should_prefer_synced_text(text, synced_text):
         print(
             "Advisor response recovered from synced transcript: "
@@ -946,6 +1512,27 @@ def call_compatible(prompt: str, model: str, timeout: int) -> str:
             file=sys.stderr,
         )
         text = synced_text
+    else:
+        embedded_text = ""
+        embedded_conversation_data = find_conversation_data_payload(response)
+        if embedded_conversation_data is not None:
+            embedded_text = latest_finished_assistant_text_for_prompt_data(embedded_conversation_data, prompt)
+        if should_prefer_synced_text(text, embedded_text):
+            print(
+                "Advisor response recovered from embedded conversation payload: "
+                f"local_bytes={utf8_len(text)} embedded_bytes={utf8_len(embedded_text)}",
+                file=sys.stderr,
+            )
+            text = embedded_text
+        deduped_text = deduplicate_repeated_transport_text(text)
+        if deduped_text != text:
+            had_transport_corruption = True
+            print(
+                "Advisor response deduplicated repeated OpenAI-compatible transport text: "
+                f"local_bytes={utf8_len(text)} deduped_bytes={utf8_len(deduped_text)}",
+                file=sys.stderr,
+            )
+            text = deduped_text
     if disabled and looks_like_tail_fragment(text, prompt) and bool_env_default_true("ADVISOR_AUTO_RETRY_TAIL_FRAGMENT"):
         print(
             "Advisor response looks like a tail fragment while transcript recovery is disabled "
@@ -953,15 +1540,32 @@ def call_compatible(prompt: str, model: str, timeout: int) -> str:
             file=sys.stderr,
         )
         return call_compatible_with_recovery(prompt, model, timeout)
-    if thinking_effort and not text.strip():
+    if response_needs_remote_recovery(text, prompt, had_transport_corruption=had_transport_corruption):
         if persist and state_path is not None:
-            text = fetch_remote_final_text(state_path, load_conversation(state_path), timeout, project_id)
-    if thinking_effort and not text.strip():
+            recovered_text = fetch_remote_final_text(state_path, load_conversation(state_path), prompt, timeout, project_id)
+            if recovered_text:
+                print(
+                    "Advisor response recovered from bounded final transcript fetch: "
+                    f"local_bytes={utf8_len(text)} recovered_bytes={utf8_len(recovered_text)}",
+                    file=sys.stderr,
+                )
+                text = recovered_text
+    if response_needs_remote_recovery(text, prompt, had_transport_corruption=had_transport_corruption):
+        if thinking_effort and not text.strip():
+            raise RuntimeError(
+                f"ChatGPT returned an empty response for thinking_effort={thinking_effort!r}. "
+                "Refresh the HAR/session first; if it still fails, inspect the saved transcript "
+                "and the g4f/OpenaiChat conversation-turn WebSocket handoff used by Pro/extended thinking turns. "
+                + recovery_debug_context(state_path)
+            )
         raise RuntimeError(
-            f"ChatGPT returned an empty response for thinking_effort={thinking_effort!r}. "
-            "Refresh the HAR/session first; if it still fails, inspect the saved transcript "
-            "and the g4f/OpenaiChat conversation-turn WebSocket handoff used by Pro/extended thinking turns."
+            "Advisor response still looks like a corrupted OpenAI-compatible transport fragment "
+            f"after transcript recovery attempts (bytes={utf8_len(text)}). "
+            "Retry with normal transcript sync enabled, or refresh the HAR/session if this repeats. "
+            + recovery_debug_context(state_path)
         )
+    assert_resolved_model_route(state_path, prompt)
+    assert_pro_model_route(state_path, prompt)
     return text
 
 
@@ -977,7 +1581,7 @@ def parse_args() -> argparse.Namespace:
             or os.environ.get("ADVISOR_CHATGPT_THINKING_EFFORT")
             or os.environ.get("ADVISOR_INTELLIGENCE")
         ),
-        help="ChatGPT web intelligence/thinking effort, e.g. high, xhigh, pro-extended, or extended.",
+        help="ChatGPT web intelligence/thinking effort, e.g. high->extended, extra-high->max, pro-extended, or none.",
     )
     parser.add_argument(
         "--provider",
@@ -986,6 +1590,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--timeout", type=int, default=int(os.environ.get("ADVISOR_TIMEOUT", "300")))
     parser.add_argument("--save", help="Optional file path to write the guidance.")
+    parser.add_argument("--allow-outside-project", action="store_true", help="Allow context files outside the project directory.")
     return parser.parse_args()
 
 
@@ -994,8 +1599,9 @@ def main() -> int:
     args = parse_args()
     if args.thinking_effort is not None:
         os.environ["ADVISOR_THINKING_EFFORT"] = args.thinking_effort
-    if args.model is None:
-        args.model = default_model_for(args.thinking_effort)
+    if args.allow_outside_project:
+        os.environ["ADVISOR_ALLOW_OUTSIDE_PROJECT_CONTEXT"] = "true"
+    args.model = select_request_model(args.thinking_effort, args.model)
     prompt = args.prompt if args.prompt is not None else sys.stdin.read()
     prompt = sanitize_text(build_prompt(prompt, args.context_file))
     if not prompt.strip():
@@ -1005,7 +1611,7 @@ def main() -> int:
     guidance = call_openai(prompt, args.model, args.timeout) if args.provider == "openai" else call_compatible(prompt, args.model, args.timeout)
 
     if args.save:
-        Path(args.save).write_text(guidance, encoding="utf-8")
+        safety.atomic_write_text(Path(args.save), guidance)
     written_latest_paths = [path for path in latest_response_paths() if write_latest_response(path, guidance)]
     if written_latest_paths:
         print(

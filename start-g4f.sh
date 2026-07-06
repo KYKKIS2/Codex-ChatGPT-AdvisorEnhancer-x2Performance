@@ -29,7 +29,13 @@ if [[ ! -x "$PY" ]]; then
   PY="python3"
 fi
 
-if ! "$PY" - "$PORT" <<'PY'
+RUNTIME_PATCH="$ROOT/patches/apply_gpt4free_runtime_patch.py"
+if [[ -f "$RUNTIME_PATCH" ]]; then
+  python3 "$RUNTIME_PATCH" "$G4F" >/dev/null
+fi
+
+can_bind_port() {
+  "$PY" - "$PORT" <<'PY'
 import socket
 import sys
 
@@ -42,6 +48,18 @@ except OSError:
 finally:
     sock.close()
 PY
+}
+
+port_ready=false
+for _ in $(seq 1 "${G4F_PORT_WAIT_SECONDS:-15}"); do
+  if can_bind_port; then
+    port_ready=true
+    break
+  fi
+  sleep 1
+done
+
+if [[ "$port_ready" != true ]]
 then
   echo "Port $PORT is already in use. Stop the existing g4f server or set G4F_PORT to another port." >&2
   exit 1

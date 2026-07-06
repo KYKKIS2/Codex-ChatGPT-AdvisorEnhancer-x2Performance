@@ -7,6 +7,7 @@ import json
 import os
 import shutil
 import sys
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -14,6 +15,7 @@ from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import advisor  # noqa: E402
+import advisor_safety as safety  # noqa: E402
 
 
 ROOT_STATE_FILES = ("conversation.json", "transcript.json", "transcript.md")
@@ -34,8 +36,7 @@ def load_json(path: Path) -> dict[str, Any]:
 
 
 def write_json(path: Path, payload: dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    safety.atomic_write_json(path, payload)
 
 
 def project_binding_path(project_dir: Path) -> Path:
@@ -109,7 +110,7 @@ def write_binding(project_dir: Path, project_id: str, name: str | None, source: 
     path = project_binding_path(project_dir)
     payload = load_json(path)
     payload["chatgpt_project_id"] = project_id
-    payload.setdefault("chatgpt_project_source", source)
+    payload["chatgpt_project_source"] = source
     if name:
         payload.setdefault("name", name)
     write_json(path, payload)
@@ -140,6 +141,8 @@ def archive_root_state(project_dir: Path) -> list[Path]:
         return []
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     archive_dir = root / "legacy-root" / stamp
+    if archive_dir.exists():
+        archive_dir = root / "legacy-root" / f"{stamp}-{uuid.uuid4().hex[:8]}"
     archive_dir.mkdir(parents=True, exist_ok=True)
     moved: list[Path] = []
     for source in existing:
@@ -178,9 +181,10 @@ def main() -> int:
         if not project_id:
             print("Invalid ChatGPT Project URL/ID. Expected a value containing g-p-...", file=sys.stderr)
             return 2
+        source = args.project
     else:
         project_id = existing_project_id(project_dir)
-    source = "existing-binding" if project_id else ""
+        source = "existing-binding" if project_id else ""
 
     if not project_id:
         project_id = infer_project_id_from_root_state(project_dir, args.timeout)

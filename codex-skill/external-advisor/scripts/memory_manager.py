@@ -11,6 +11,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+import advisor_safety as safety
+
 
 DEFAULT_PROFILE = """# Project Profile
 
@@ -75,19 +77,17 @@ def load_json(path: Path, default: Any) -> Any:
         return json.loads(path.read_text(encoding="utf-8"))
     except json.JSONDecodeError:
         backup = path.with_suffix(path.suffix + ".invalid")
-        backup.write_text(path.read_text(encoding="utf-8", errors="replace"), encoding="utf-8")
+        safety.atomic_write_text(backup, path.read_text(encoding="utf-8", errors="replace"))
         return default
 
 
 def write_json(path: Path, data: Any) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    safety.atomic_write_json(path, data)
 
 
 def append_markdown(path: Path, title: str, body: str, source: str) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    if not path.exists():
-        path.write_text("", encoding="utf-8")
+    safety.ensure_private_dir(path.parent)
+    existing = path.read_text(encoding="utf-8", errors="replace") if path.exists() else ""
     entry = "\n\n".join([
         f"## {title}",
         f"Created UTC: {now_iso()}",
@@ -96,8 +96,7 @@ def append_markdown(path: Path, title: str, body: str, source: str) -> None:
         body.strip(),
         "",
     ])
-    with path.open("a", encoding="utf-8") as handle:
-        handle.write("\n\n" + entry.strip() + "\n")
+    safety.atomic_write_text(path, existing.rstrip() + "\n\n" + entry.strip() + "\n")
 
 
 def init_memory(project_dir: Path) -> None:
@@ -111,7 +110,7 @@ def init_memory(project_dir: Path) -> None:
     for name, content in defaults.items():
         path = root / name
         if not path.exists():
-            path.write_text(content.rstrip() + "\n", encoding="utf-8")
+            safety.atomic_write_text(path, content.rstrip() + "\n")
     for name in ("decisions.json", "outcomes.json"):
         path = root / name
         if not path.exists():
@@ -130,7 +129,7 @@ def record_outcome(args: argparse.Namespace) -> dict[str, Any]:
         "accepted_advice": args.accepted_advice,
         "rejected_advice": args.rejected_advice,
         "outcome": args.outcome,
-        "useful": parse_bool(args.useful) if args.useful is not None else None,
+        "useful": args.useful if args.useful is not None else None,
         "source": args.source,
         "confidence": clamp_confidence(args.confidence),
         "status": args.status,
@@ -254,7 +253,7 @@ def write_summary(project_dir: Path, data: dict[str, Any]) -> Path:
     lines.extend(["", "## Recent Outcomes", ""])
     for item in data["recent_outcomes"]:
         lines.append(f"- `{item.get('id')}` useful={item.get('useful')} mode={item.get('advisor_mode')}: {item.get('outcome')}")
-    path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
+    safety.atomic_write_text(path, "\n".join(lines).rstrip() + "\n")
     return path
 
 
@@ -272,7 +271,7 @@ def parse_args() -> argparse.Namespace:
     outcome.add_argument("--accepted-advice", action="append", default=[])
     outcome.add_argument("--rejected-advice", action="append", default=[])
     outcome.add_argument("--outcome", required=True)
-    outcome.add_argument("--useful")
+    outcome.add_argument("--useful", type=parse_bool)
     outcome.add_argument("--source", default="codex")
     outcome.add_argument("--confidence", type=float)
     outcome.add_argument("--status", choices=["accepted", "rejected", "mixed", "unknown"], default="unknown")

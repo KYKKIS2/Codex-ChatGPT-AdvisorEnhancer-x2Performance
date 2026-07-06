@@ -23,6 +23,8 @@ Most coding-agent failures do not happen because the agent cannot type code. The
 
 The `external-advisor` skill helps with that layer.
 
+The advisor is not a repo-reading agent. It has no implicit access to Codex's local filesystem, terminal, git state, tests, logs, screenshots, or prior observations. It only sees the prompt, explicit context files, context packs, and synced advisor-chat transcript content that Codex sends. File names, modules, commands, metrics, or root causes suggested by the advisor are hypotheses until Codex verifies them locally.
+
 It is designed for questions like:
 
 - Which architecture should I choose?
@@ -38,7 +40,7 @@ It is intentionally not meant for every small bug fix. Codex should still handle
 
 - Installs bundled Codex skills, including `external-advisor` and `prepare-goal`.
 - Starts a local OpenAI-compatible `g4f` API.
-- Uses `gpt-5-5-thinking` by default with high reasoning effort.
+- Uses `gpt-5-5-thinking` by default with ChatGPT `thinking_effort=extended`.
 - Persists one advisor conversation per working directory.
 - Syncs the online ChatGPT advisor chat before and after each persistent advisor call.
 - Writes local transcript files Codex can inspect later.
@@ -142,18 +144,25 @@ sudo apt install -y git python3 python3-pip python3-venv
 Run setup:
 
 ```bash
-chmod +x setup.sh start-g4f.sh test-advisor.sh test-conclave.sh test-router.sh test-context-pack.sh test-verifier-loop.sh test-memory.sh test-ranking.sh test-eval-harness.sh
+chmod +x setup.sh start-g4f.sh test-advisor.sh test-conclave.sh test-router.sh test-context-pack.sh test-verifier-loop.sh test-memory.sh test-ranking.sh test-eval-harness.sh test-advisor-transport-recovery.sh test-security-regressions.sh
 ./setup.sh
 ```
 
 Setup will:
 
-- clone `https://github.com/xtekky/gpt4free` into `vendor/gpt4free`
+- clone `https://github.com/xtekky/gpt4free` into `vendor/gpt4free` at the pinned default ref used by this repo
 - create `vendor/gpt4free/.venv` and install Python dependencies there
 - apply `patches/gpt4free-advisor.patch`
+- apply and verify the shared runtime patch for Project binding, `thinking_effort`, and Pro Extended WebSocket handoff
 - install the bundled Codex skills from `codex-skill/` into your Codex skills folder
 - write `advisor-config.json` so Codex knows the exact local start script path
 - create `vendor/gpt4free/har_and_cookies`
+
+Override the pinned g4f ref only when you are deliberately testing a new upstream version:
+
+```bash
+GPT4FREE_REF=<commit-or-tag> ./setup.sh
+```
 
 ## Add Your HAR
 
@@ -207,7 +216,7 @@ Optional Pro test:
 ./start-g4f.sh gpt-5-5-pro
 ```
 
-`gpt-5-5-thinking` has been the most reliable default in testing. `gpt-5-5-pro` can work, but may sometimes return blank or thinking-only API output.
+`gpt-5-5-thinking` is the normal advisor default, and the wrapper sends `thinking_effort=extended` by default. The unsafe route is `gpt-5-5-thinking` with no private effort, `min`, or `standard`, which current ChatGPT metadata can resolve to `gpt-5-3-mini`; if no thinking is explicitly requested, the wrapper uses plain `gpt-5-5` to avoid that downgrade. Pro Extended requests `gpt-5-5-pro` plus `thinking_effort=extended`.
 
 ChatGPT web also sends a separate private `thinking_effort` field for some Intelligence choices. The advisor supports passing that field explicitly:
 
@@ -221,7 +230,7 @@ ADVISOR_THINKING_EFFORT=extended \
 python3 ~/.codex/skills/external-advisor/scripts/advisor.py --prompt "Review this carefully: ..."
 ```
 
-Aliases include `pro-extended` -> `extended`, `extra-high` -> `xhigh`, and `instant`/`none` to omit the private field. `extended` has been observed in local HAR captures for Pro Extended. The setup patch adds g4f/OpenaiChat support for ChatGPT's conversation-turn WebSocket handoff, so extended turns can continue after ChatGPT moves the response stream from the initial SSE request to a per-turn WebSocket topic.
+Aliases use the current ChatGPT private values: `low`/`light` -> `min`, `medium` -> `standard`, `high` -> `extended`, and `extra-high`/`xhigh`/`heavy` -> `max`. Older raw values such as `high` or `xhigh` are not sent directly because ChatGPT can reject them with `Invalid conversation body`; unknown values fail locally unless `ADVISOR_ALLOW_UNKNOWN_THINKING_EFFORT=true` is set for diagnostics. The default when no private effort is set is `extended`, because that is the currently safe Thinking-lane advisor route. The setup patch adds g4f/OpenaiChat support for ChatGPT's conversation-turn WebSocket handoff, so extended turns can continue after ChatGPT moves the response stream from the initial SSE request to a per-turn WebSocket topic.
 
 For Pro Extended, use the Pro Extended request alias, not just bare `extended`:
 
@@ -230,15 +239,19 @@ ADVISOR_THINKING_EFFORT=pro-extended \
 python3 ~/.codex/skills/external-advisor/scripts/advisor.py --prompt "Review this carefully: ..."
 ```
 
-When no explicit model is set, `pro-extended` automatically selects `gpt-5-pro` and sends `thinking_effort=extended`. If you set `ADVISOR_MODEL` or `--model`, that explicit model wins. If ChatGPT changes the private slug, set `ADVISOR_PRO_EXTENDED_MODEL`.
+`pro-extended` automatically selects `gpt-5-5-pro` and sends `thinking_effort=extended`. If a normal default model such as `gpt-5-5-thinking` is also set, the scripts override it to `gpt-5-5-pro` to avoid silent downgrades. If ChatGPT changes the private request slug, set `ADVISOR_PRO_EXTENDED_MODEL`. Use `ADVISOR_ALLOW_PRO_MODEL_OVERRIDE=true` only for deliberate diagnostics.
 
 Pro Extended is for hard advisor questions: architecture reviews, high-risk debugging, security/privacy decisions, and important strategy. It is expected to take time. Long Pro Extended prompts can run silently for several minutes before producing a clean answer. If a detached/background run exits with no response file and an empty log, verify the exact same command in the foreground before blaming Pro Extended or prompt size.
 
 The ChatGPT WebSocket can carry visible live progress such as reasoning status, summaries, recaps, and metadata, but not private hidden chain-of-thought. If the local OpenAI-compatible response returns empty content after a Pro/extended turn, the advisor attempts one fallback fetch from `backend-api/conversation/<id>` after the main stream has already ended, then recovers the latest finished assistant message after the latest user turn into the saved transcript/state. It does not poll repeatedly by default. Set `ADVISOR_FINAL_FETCH_MAX_POLLS` above `1` only when debugging a persistence race; `ADVISOR_FINAL_FETCH_POLL_SECONDS` controls the bounded delay between those explicit extra attempts.
 
+`advisor.py` verifies Pro Extended by reading synced ChatGPT metadata. Current browser Pro Extended captures can show `model_slug`/`default_model_slug: gpt-5-5-pro` with `thinking_effort: extended` while also reporting `resolved_model_slug: gpt-5-3-mini`; do not treat that resolved field alone as a downgrade for Pro. A HAR containing only `model: gpt-5-5-thinking` with `thinking_effort: extended` is a Thinking-lane capture, not a Pro Extended capture; capture a browser HAR while selecting Pro Extended and sending a real prompt if the Pro request fields are missing.
+
+For non-Pro persistent ChatGPT-backed advisor calls, `advisor.py` also rejects known downgraded resolved models by default. Currently `ADVISOR_REJECT_RESOLVED_MODEL_SLUGS` defaults to `gpt-5-3-mini`. Set `ADVISOR_ALLOW_RESOLVED_MODEL_DOWNGRADE=true` only for deliberate transport diagnostics.
+
 For foreground Pro Extended calls, Codex should start the command with a long timeout and wait quietly for it to finish. Do not send periodic "still running" updates or repeatedly poll the active shell session unless the user asks for status. If polling is unavoidable in the execution environment, use long waits of several minutes and report only completion, an actual error, or a meaningful timeout.
 
-For long advisor calls, use `--save` and read the saved response, the automatic latest-response file, or synced `transcript.md` before assuming the answer was truncated. By default `advisor.py` writes `.codex-advisor/latest-response.md`; when a ChatGPT Project binding moves state under `.codex-advisor/projects/<g-p-id>/`, it also writes the project-scoped `latest-response.md` there. If `ADVISOR_STATE_PATH` is set it writes `latest-response.md` beside that state file; if `ADVISOR_RESPONSE_PATH` is set it writes exactly there. The CLI reports saved latest-response path(s) on stderr. If the OpenAI-compatible response body is only a tail fragment but the synced ChatGPT transcript contains the full latest answer for the same prompt, `advisor.py` recovers the full text from the transcript and reports that on stderr. Do not use `ADVISOR_TEMPORARY=true`, `ADVISOR_PERSIST_CONVERSATION=false`, or `ADVISOR_SYNC_REMOTE=false` for normal advisor calls; those flags disable transcript recovery. If a substantial prompt returns a suspicious tail fragment while recovery is disabled, `advisor.py` retries once with persistent remote sync unless `ADVISOR_AUTO_RETRY_TAIL_FRAGMENT=false` is set. This latest-response file is a convenience artifact and can be overwritten by concurrent advisor runs, so use `--save` for task-specific evidence. Codex terminal output can be display-truncated to the tail of a long answer, so seeing only final punctuation in the terminal does not prove the advisor returned only punctuation.
+For long advisor calls, use `--save` and read the saved response, the automatic latest-response file, or synced `transcript.md` before assuming the answer was truncated. By default `advisor.py` writes `.codex-advisor/latest-response.md`; when a ChatGPT Project binding moves state under `.codex-advisor/projects/<g-p-id>/`, it also writes the project-scoped `latest-response.md` there. If `ADVISOR_STATE_PATH` is set it writes `latest-response.md` beside that state file; if `ADVISOR_RESPONSE_PATH` is set it writes exactly there. The CLI reports saved latest-response path(s) on stderr. If the OpenAI-compatible response body is duplicated, empty, or only a tail fragment but the synced ChatGPT transcript contains the latest finished answer for the same prompt, `advisor.py` recovers the clean text from the transcript and reports that on stderr. Empty or suspiciously corrupted turns also perform a bounded final transcript fetch; `ADVISOR_FINAL_FETCH_MAX_POLLS` defaults to `6`. If recovery still leaves a corrupted fragment for a substantial prompt, the script fails closed instead of saving that fragment as advice. Do not use `ADVISOR_TEMPORARY=true`, `ADVISOR_PERSIST_CONVERSATION=false`, or `ADVISOR_SYNC_REMOTE=false` for normal advisor calls; those flags disable transcript recovery. If a substantial prompt returns a suspicious tail fragment while recovery is disabled, `advisor.py` retries once with persistent remote sync unless `ADVISOR_AUTO_RETRY_TAIL_FRAGMENT=false` is set. This latest-response file is a convenience artifact and can be overwritten by concurrent advisor runs, so use `--save` for task-specific evidence. Codex terminal output can be display-truncated to the tail of a long answer, so seeing only final punctuation in the terminal does not prove the advisor returned only punctuation.
 
 For detached advisor jobs, prefer the audited launcher over ad hoc `nohup` snippets:
 
@@ -253,6 +266,18 @@ python3 ~/.codex/skills/external-advisor/scripts/advisor_background.py -- \
 ```
 
 The launcher writes `meta.json`, `status.json`, `heartbeat.json`, `response.md`, `stderr.log`, and `monitor.log` under `.codex-advisor/background-runs/<timestamp-id>/`. Treat missing/inconsistent metadata as a wrapper failure or inconclusive run, not a model failure.
+
+## Context And Safety Boundaries
+
+Advisor prompts, selected files, generated context packs, diffs, command output, transcripts, and saved advisor artifacts may be sent to or synced with ChatGPT. Keep prompts focused and do not include secrets, credentials, private keys, wallet keys, tokens, HAR contents, `.env` values, customer data, or unrelated private files.
+
+The advisor only knows the context Codex sends. Do not write final answers as if the advisor independently inspected the repository. Use advisor output as critique and deeper reasoning, then verify repo facts locally with file reads, commands, tests, or artifacts.
+
+The context pack blocks obvious sensitive paths such as `.env`, `.codex-advisor`, HAR/cookie/auth files, and key material. Full git diffs are now built only from non-sensitive changed paths and are redacted before being written. Explicit `--context-file`, `--draft-file`, and `--error-file` reads use the same sensitive-file guard. If you truly need to include a file outside the project, pass `--allow-outside-project`; do not use that flag for secrets.
+
+For `ADVISOR_PROVIDER=openai-compatible`, `OPENAI_API_KEY` is not forwarded to arbitrary compatible endpoints. Use `ADVISOR_API_KEY` for a compatible server that requires a token. To intentionally reuse `OPENAI_API_KEY` with an OpenAI host through compatible mode, set `ADVISOR_COMPATIBLE_USE_OPENAI_KEY=true`.
+
+The verifier loop runs commands with `shell=False` and a constrained argv allowlist. It is intended for fast local evidence such as `python3 --version`, `python3 -m py_compile ...`, `git diff --check`, and common test commands. `--run-suggested` still means Codex should review advisor-suggested commands before running them; `--allow-unsafe-commands` is an explicit escape hatch.
 
 ## Test The Advisor
 
@@ -307,12 +332,13 @@ These tests do not require a live advisor endpoint:
 ./test-router.sh
 ./test-context-pack.sh
 ./test-verifier-loop.sh
+./test-advisor-transport-recovery.sh
 ./test-memory.sh
 ./test-ranking.sh
 ./test-eval-harness.sh
 ```
 
-The router test confirms task types map to the intended advisor path. The context-pack test creates `.codex-advisor/latest-context-pack.json`. The verifier-loop dry run creates `.codex-advisor/latest-verifier-loop.json` and runs a harmless local command as evidence. The memory test initializes searchable memory and records a sample decision/outcome. The ranking test confirms conclave JSON includes role rankings. The eval harness test confirms the benchmark structure.
+The router test confirms task types map to the intended advisor path. The context-pack test creates `.codex-advisor/latest-context-pack.json`. The verifier-loop dry run creates `.codex-advisor/latest-verifier-loop.json` and runs a harmless local command as evidence. The advisor transport recovery test covers empty Pro/extended bodies, stale transcript refusal, and embedded conversation recovery. The memory test initializes searchable memory and records a sample decision/outcome. The ranking test confirms conclave JSON includes role rankings. The eval harness test confirms the benchmark structure.
 
 ## Use From Codex
 
@@ -792,6 +818,7 @@ For complex projects, that separation is powerful. You get fast local execution 
 - This setup depends on your own local HAR/session and `g4f`.
 - Do not commit `vendor/gpt4free/har_and_cookies`.
 - Do not commit `.codex-advisor`.
+- Do not send secrets, `.env` values, HAR contents, keys, tokens, cookies, or unrelated private files to advisor calls.
 - Do not use this to bypass access controls or share private session material.
 - Treat advisor output as critique, not ground truth.
 - Verify important claims before using them.

@@ -16,7 +16,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from advisor import default_model_for
+import advisor_safety as safety
+from advisor import select_request_model
 
 
 SECURITY_TERMS = {
@@ -67,7 +68,7 @@ def configure_stdio() -> None:
 
 
 def sanitize_text(text: str) -> str:
-    return text.encode("utf-8", errors="replace").decode("utf-8")
+    return safety.sanitize_text(text)
 
 
 def contains_any(text: str, terms: set[str]) -> list[str]:
@@ -245,12 +246,14 @@ def forced_decision(route: str, reasons: list[str]) -> RouteDecision:
 
 
 def build_payload(args: argparse.Namespace, prompt: str, decision: RouteDecision) -> dict[str, Any]:
+    preview = safety.truncate(safety.redact_sensitive_text(prompt.strip()), 1200)
+    command = command_preview(decision, args)
     return {
         "schema_version": "1.0",
         "created_utc": datetime.now(timezone.utc).isoformat(),
         "trace_id": args.trace_id,
         "task_id": args.task_id,
-        "prompt": prompt.strip(),
+        "prompt_excerpt": preview,
         "draft_present": bool(args.draft),
         "changed_files": args.changed_file,
         "tags": args.tag,
@@ -268,18 +271,18 @@ def build_payload(args: argparse.Namespace, prompt: str, decision: RouteDecision
         "confidence": decision.confidence,
         "reasons": decision.reasons,
         "skip_reason": decision.skip_reason,
-        "command_preview": command_preview(decision, args),
+        "command_preview": safety.redact_argv(command),
     }
 
 
 def write_route(project_dir: Path, payload: dict[str, Any]) -> Path:
     out_dir = route_log_dir(project_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
+    safety.ensure_private_dir(out_dir)
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    path = out_dir / f"{stamp}-{payload['route']}.json"
-    path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    path = out_dir / f"{stamp}-{uuid.uuid4().hex[:8]}-{payload['route']}.json"
+    safety.atomic_write_json(path, payload)
     latest = advisor_dir(project_dir) / "latest-route.json"
-    latest.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    safety.atomic_write_json(latest, payload)
     return path
 
 
@@ -301,6 +304,8 @@ def build_context_pack(args: argparse.Namespace, prompt: str) -> Path | None:
         command.extend(["--file", path])
     for path in args.context_file:
         command.extend(["--context-file", path])
+    if args.allow_outside_project_context:
+        command.append("--allow-outside-project")
     for tag in args.tag:
         command.extend(["--constraint", f"Task tag: {tag}"])
     completed = subprocess.run(
@@ -328,14 +333,18 @@ def execute_route(args: argparse.Namespace, prompt: str, decision: RouteDecision
         print(decision.skip_reason)
         return 0
     command = command_preview(decision, args)
-    context_files = list(args.context_file)
+    context_files: list[str] = []
     if not args.no_context_pack:
         pack_path = build_context_pack(args, prompt)
         if pack_path:
             context_files.append(str(pack_path))
+    if not context_files:
+        context_files.extend(args.context_file)
     if decision.command_kind in {"conclave", "verifier-loop"}:
         for path in context_files:
             command.extend(["--context-file", path])
+        if args.allow_outside_project_context:
+            command.append("--allow-outside-project")
     env = os.environ.copy()
     env["ADVISOR_PROVIDER"] = args.provider
     env["ADVISOR_BASE_URL"] = args.base_url
@@ -350,8 +359,13 @@ def execute_route(args: argparse.Namespace, prompt: str, decision: RouteDecision
         blocks = []
         for path in context_files:
             try:
-                blocks.append(f"Context file: {path}\n{Path(path).read_text(encoding='utf-8')}")
-            except OSError as exc:
+                label, content = safety.read_context_file(
+                    args.project_dir,
+                    path,
+                    allow_outside_project=args.allow_outside_project_context,
+                )
+                blocks.append(f"Context file: {label}\n{content}")
+            except (OSError, RuntimeError) as exc:
                 blocks.append(f"Context file unavailable: {path}\n{exc}")
         prompt = f"{prompt.strip()}\n\n--- Advisor context pack ---\n" + "\n\n---\n\n".join(blocks)
     if args.error_output:
@@ -400,12 +414,13 @@ def parse_args() -> argparse.Namespace:
             or os.environ.get("ADVISOR_CHATGPT_THINKING_EFFORT")
             or os.environ.get("ADVISOR_INTELLIGENCE")
         ),
-        help="ChatGPT web intelligence/thinking effort, e.g. high, xhigh, pro-extended, or extended.",
+        help="ChatGPT web intelligence/thinking effort, e.g. high->extended, extra-high->max, pro-extended, or none.",
     )
     parser.add_argument("--max-output-tokens", type=int, default=int(os.environ.get("ADVISOR_MAX_OUTPUT_TOKENS", "1200")))
     parser.add_argument("--timeout", type=int, default=int(os.environ.get("ADVISOR_TIMEOUT", "300")))
     parser.add_argument("--project-dir", type=Path, help="Project directory. Defaults to the nearest Git repo root or current directory.")
     parser.add_argument("--allow-sensitive-advisor", action="store_true", help="Allow advisor routing for security/privacy/auth/token tasks after caller redaction.")
+    parser.add_argument("--allow-outside-project-context", action="store_true", help="Allow context/draft/error files outside the project directory.")
     parser.add_argument("--trace-id", default=os.environ.get("ADVISOR_TRACE_ID"))
     parser.add_argument("--task-id", default=os.environ.get("ADVISOR_TASK_ID"))
     parser.add_argument("--no-sync", action="store_true")
@@ -417,16 +432,23 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     configure_stdio()
     args = parse_args()
-    if args.model is None:
-        args.model = default_model_for(args.thinking_effort)
+    args.model = select_request_model(args.thinking_effort, args.model)
     args.project_dir = resolve_project_dir(args.project_dir)
     args.trace_id = args.trace_id or str(uuid.uuid4())
     args.task_id = args.task_id or str(uuid.uuid4())
     prompt = sanitize_text(args.prompt if args.prompt is not None else sys.stdin.read())
     if args.draft_file:
-        args.draft = sanitize_text(Path(args.draft_file).read_text(encoding="utf-8"))
+        _, args.draft = safety.read_context_file(
+            args.project_dir,
+            args.draft_file,
+            allow_outside_project=args.allow_outside_project_context,
+        )
     if args.error_file:
-        args.error_output = sanitize_text(Path(args.error_file).read_text(encoding="utf-8"))
+        _, args.error_output = safety.read_context_file(
+            args.project_dir,
+            args.error_file,
+            allow_outside_project=args.allow_outside_project_context,
+        )
     if not prompt.strip():
         print("Provide --prompt or pipe text on stdin.", file=sys.stderr)
         return 2
