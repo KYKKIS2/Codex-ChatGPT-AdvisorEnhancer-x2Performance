@@ -340,6 +340,15 @@ def is_pro_model_slug(value: Any) -> bool:
 
 def select_request_model(thinking_effort: str | None, model: str | None) -> str:
     normalized_effort = normalize_thinking_effort(thinking_effort)
+    if isinstance(model, str):
+        model = model.strip() or None
+    if isinstance(model, str) and model.lower() == "default":
+        print(
+            "Advisor ignoring ADVISOR_MODEL='default' and selecting the configured safe model "
+            "for the requested thinking mode.",
+            file=sys.stderr,
+        )
+        model = None
     if not is_pro_request(thinking_effort):
         selected = model or DEFAULT_MODEL
         explicit_no_thinking = thinking_effort is not None and normalized_effort is None

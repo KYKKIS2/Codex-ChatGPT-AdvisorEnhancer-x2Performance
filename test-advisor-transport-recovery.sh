@@ -119,15 +119,24 @@ with patched_env(ADVISOR_PRO_EXTENDED_MODEL=None, ADVISOR_ALLOW_PRO_MODEL_OVERRI
     selected = advisor.select_request_model(None, "gpt-5-5-thinking")
     if selected != "gpt-5-5-thinking":
         raise SystemExit(f"Default Thinking model should be preserved: {selected!r}")
+    selected = advisor.select_request_model(None, "default")
+    if selected != "gpt-5-5-thinking":
+        raise SystemExit(f"ADVISOR_MODEL=default should use the safe default model: {selected!r}")
     selected = advisor.select_request_model("none", "gpt-5-5-thinking")
     if selected != "gpt-5-5":
         raise SystemExit(f"Explicit no-thinking route should use safe non-thinking model: {selected!r}")
+    selected = advisor.select_request_model("none", "default")
+    if selected != "gpt-5-5":
+        raise SystemExit(f"ADVISOR_MODEL=default with no thinking should use safe non-thinking model: {selected!r}")
     selected = advisor.select_request_model("high", "gpt-5-5-thinking")
     if selected != "gpt-5-5-thinking":
         raise SystemExit(f"Legacy Thinking model with extended effort should be allowed: {selected!r}")
     selected = advisor.select_request_model("pro-extended", "gpt-5-5-thinking")
     if selected != "gpt-5-5-pro":
         raise SystemExit(f"Pro Extended did not override normal thinking model: {selected!r}")
+    selected = advisor.select_request_model("pro-extended", "default")
+    if selected != "gpt-5-5-pro":
+        raise SystemExit(f"ADVISOR_MODEL=default with Pro Extended should use Pro model: {selected!r}")
     selected = advisor.select_request_model("pro-extended", "gpt-5-5-pro")
     if selected != "gpt-5-5-pro":
         raise SystemExit(f"Pro Extended changed the Pro request model unexpectedly: {selected!r}")

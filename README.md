@@ -218,6 +218,8 @@ Optional Pro test:
 
 `gpt-5-5-thinking` is the normal advisor default, and the wrapper sends `thinking_effort=extended` by default. The unsafe route is `gpt-5-5-thinking` with no private effort, `min`, or `standard`, which current ChatGPT metadata can resolve to `gpt-5-3-mini`; if no thinking is explicitly requested, the wrapper uses plain `gpt-5-5` to avoid that downgrade. Pro Extended requests `gpt-5-5-pro` plus `thinking_effort=extended`.
 
+Do not intentionally set `ADVISOR_MODEL=default`. If an older Codex session or inherited shell environment does pass `default`, the wrapper ignores that alias and selects the safe configured model for the requested thinking mode.
+
 ChatGPT web also sends a separate private `thinking_effort` field for some Intelligence choices. The advisor supports passing that field explicitly:
 
 ```powershell
