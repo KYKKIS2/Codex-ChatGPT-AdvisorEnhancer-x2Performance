@@ -9,10 +9,11 @@ $G4f = Join-Path $Vendor "gpt4free"
 $Venv = Join-Path $G4f ".venv"
 $Py = Join-Path $Venv "Scripts\python.exe"
 $Patch = Join-Path $Root "patches\gpt4free-advisor.patch"
-$SkillSource = Join-Path $Root "codex-skill\external-advisor"
+$SkillsSource = Join-Path $Root "codex-skill"
 $CodexHome = if ([string]::IsNullOrWhiteSpace($env:CODEX_HOME)) { Join-Path $HOME ".codex" } else { $env:CODEX_HOME }
-$SkillDest = Join-Path $CodexHome "skills\external-advisor"
-$SkillConfig = Join-Path $SkillDest "advisor-config.json"
+$SkillsDest = Join-Path $CodexHome "skills"
+$ExternalAdvisorSkillDest = Join-Path $SkillsDest "external-advisor"
+$SkillConfig = Join-Path $ExternalAdvisorSkillDest "advisor-config.json"
 
 New-Item -ItemType Directory -Force -Path $Vendor | Out-Null
 
@@ -346,8 +347,13 @@ finally {
     Pop-Location
 }
 
-New-Item -ItemType Directory -Force -Path $SkillDest | Out-Null
-Copy-Item -Recurse -Force -Path (Join-Path $SkillSource "*") -Destination $SkillDest
+New-Item -ItemType Directory -Force -Path $SkillsDest | Out-Null
+Get-ChildItem -Directory -Path $SkillsSource | ForEach-Object {
+    $dest = Join-Path $SkillsDest $_.Name
+    New-Item -ItemType Directory -Force -Path $dest | Out-Null
+    Copy-Item -Recurse -Force -Path (Join-Path $_.FullName "*") -Destination $dest
+    Write-Host "Installed Codex skill: $($_.Name)"
+}
 @{
     setup_dir = $Root
     start_g4f = (Join-Path $Root "start-g4f.ps1")

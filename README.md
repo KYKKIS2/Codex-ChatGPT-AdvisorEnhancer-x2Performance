@@ -36,7 +36,7 @@ It is intentionally not meant for every small bug fix. Codex should still handle
 
 ## What It Does
 
-- Installs a Codex skill named `external-advisor`.
+- Installs bundled Codex skills, including `external-advisor` and `prepare-goal`.
 - Starts a local OpenAI-compatible `g4f` API.
 - Uses `gpt-5-5-thinking` by default with high reasoning effort.
 - Persists one advisor conversation per working directory.
@@ -88,7 +88,7 @@ An official Codex version could replace the local `g4f`/HAR layer with OpenAI-ma
 
 This repo currently uses:
 
-- Codex skill: `external-advisor`
+- Codex skills: `external-advisor`, `prepare-goal`
 - Local API: `http://127.0.0.1:8080/v1`
 - Provider: `OpenaiAccount`
 - Default model: `gpt-5-5-thinking`
@@ -103,6 +103,7 @@ This repo currently uses:
 - Searchable memory manager: `codex-skill/external-advisor/scripts/memory_manager.py`
 - Deterministic advisor ranking inside `conclave.py`
 - Local evaluation harness: `codex-skill/external-advisor/scripts/eval_harness.py`
+- Goal-prep helper: `codex-skill/prepare-goal`
 
 `gpt4free` is not committed into this repository. The setup scripts download it into:
 
@@ -111,6 +112,11 @@ vendor/gpt4free
 ```
 
 The HAR file is never included. It is sensitive authentication material and must stay local.
+
+## Bundled Codex Skills
+
+- `external-advisor`: asks the local ChatGPT advisor for planning, architecture, strategy, critique, verification, and other judgment-heavy work.
+- `prepare-goal`: prepares repository planning files before starting a long Codex Goal Mode run, then produces a ready-to-use `/goal` prompt.
 
 ## Quick Start
 
@@ -145,7 +151,7 @@ Setup will:
 - clone `https://github.com/xtekky/gpt4free` into `vendor/gpt4free`
 - create `vendor/gpt4free/.venv` and install Python dependencies there
 - apply `patches/gpt4free-advisor.patch`
-- install the Codex skill into your Codex skills folder
+- install the bundled Codex skills from `codex-skill/` into your Codex skills folder
 - write `advisor-config.json` so Codex knows the exact local start script path
 - create `vendor/gpt4free/har_and_cookies`
 

@@ -1,0 +1,4 @@
+interface:
+  display_name: "Prepare Goal"
+  short_description: "Create PRDs, plans, and goal prompts"
+  default_prompt: "Use $prepare-goal to turn this task into the necessary planning files and a ready-to-run /goal."

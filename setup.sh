@@ -8,9 +8,10 @@ G4F="$VENDOR/gpt4free"
 VENV="$G4F/.venv"
 PY="$VENV/bin/python"
 PATCH="$ROOT/patches/gpt4free-advisor.patch"
-SKILL_SOURCE="$ROOT/codex-skill/external-advisor"
-SKILL_DEST="${CODEX_HOME:-$HOME/.codex}/skills/external-advisor"
-SKILL_CONFIG="$SKILL_DEST/advisor-config.json"
+SKILLS_SOURCE="$ROOT/codex-skill"
+SKILLS_DEST="${CODEX_HOME:-$HOME/.codex}/skills"
+EXTERNAL_ADVISOR_SKILL_DEST="$SKILLS_DEST/external-advisor"
+SKILL_CONFIG="$EXTERNAL_ADVISOR_SKILL_DEST/advisor-config.json"
 
 mkdir -p "$VENDOR"
 
@@ -349,8 +350,15 @@ mkdir -p "$G4F/har_and_cookies"
 
 chmod +x "$ROOT/start-g4f.sh" "$ROOT/test-advisor.sh" "$ROOT/test-conclave.sh" "$ROOT/test-router.sh" "$ROOT/test-context-pack.sh" "$ROOT/test-verifier-loop.sh" "$ROOT/test-memory.sh" "$ROOT/test-ranking.sh" "$ROOT/test-eval-harness.sh" 2>/dev/null || true
 
-mkdir -p "$SKILL_DEST"
-cp -R "$SKILL_SOURCE"/. "$SKILL_DEST"/
+mkdir -p "$SKILLS_DEST"
+for skill_dir in "$SKILLS_SOURCE"/*; do
+  [[ -d "$skill_dir" ]] || continue
+  skill_name="$(basename "$skill_dir")"
+  dest="$SKILLS_DEST/$skill_name"
+  mkdir -p "$dest"
+  cp -R "$skill_dir"/. "$dest"/
+  echo "Installed Codex skill: $skill_name"
+done
 cat > "$SKILL_CONFIG" <<EOF
 {
   "setup_dir": "$ROOT",
