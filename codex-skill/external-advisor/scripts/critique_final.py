@@ -10,7 +10,7 @@ import sys
 from pathlib import Path
 
 import advisor_safety as safety
-from advisor import select_request_model
+from advisor import select_request_model, select_request_thinking_effort
 
 
 def configure_stdio() -> None:
@@ -94,6 +94,7 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     configure_stdio()
     args = parse_args()
+    args.thinking_effort = select_request_thinking_effort(args.thinking_effort)
     args.model = select_request_model(args.thinking_effort, args.model)
     args.project_dir = resolve_project_dir(args.project_dir)
     if args.draft_file:

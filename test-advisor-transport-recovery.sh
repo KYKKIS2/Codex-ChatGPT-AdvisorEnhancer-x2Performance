@@ -116,18 +116,34 @@ with patched_env(ADVISOR_PRO_EXTENDED_MODEL=None, ADVISOR_ALLOW_PRO_MODEL_OVERRI
             raise SystemExit(f"Unknown effort failed with unclear error: {exc}") from exc
     else:
         raise SystemExit("Unknown thinking effort was not rejected locally.")
+    selected_effort = advisor.select_request_thinking_effort(None)
+    if selected_effort != "extended":
+        raise SystemExit(f"Unset advisor thinking effort should clamp to extended: {selected_effort!r}")
+    selected_effort = advisor.select_request_thinking_effort("none")
+    if selected_effort != "extended":
+        raise SystemExit(f"Explicit no-thinking route should clamp to extended: {selected_effort!r}")
+    selected_effort = advisor.select_request_thinking_effort("medium")
+    if selected_effort != "extended":
+        raise SystemExit(f"Weak non-Pro effort should clamp to extended: {selected_effort!r}")
     selected = advisor.select_request_model(None, "gpt-5-5-thinking")
     if selected != "gpt-5-5-thinking":
         raise SystemExit(f"Default Thinking model should be preserved: {selected!r}")
     selected = advisor.select_request_model(None, "default")
     if selected != "gpt-5-5-thinking":
         raise SystemExit(f"ADVISOR_MODEL=default should use the safe default model: {selected!r}")
-    selected = advisor.select_request_model("none", "gpt-5-5-thinking")
-    if selected != "gpt-5-5":
-        raise SystemExit(f"Explicit no-thinking route should use safe non-thinking model: {selected!r}")
-    selected = advisor.select_request_model("none", "default")
-    if selected != "gpt-5-5":
-        raise SystemExit(f"ADVISOR_MODEL=default with no thinking should use safe non-thinking model: {selected!r}")
+    selected = advisor.select_request_model("extended", "gpt-5-5")
+    if selected != "gpt-5-5-thinking":
+        raise SystemExit(f"Explicit non-thinking model should clamp to default Thinking model: {selected!r}")
+    selected = advisor.select_request_model("extended", "gpt-4o")
+    if selected != "gpt-5-5-thinking":
+        raise SystemExit(f"Arbitrary non-Pro model should clamp to default Thinking model: {selected!r}")
+    with patched_env(ADVISOR_ALLOW_NON_DEFAULT_ROUTE="true"):
+        selected_effort = advisor.select_request_thinking_effort("none")
+        if selected_effort != "none":
+            raise SystemExit(f"Diagnostic route override did not preserve explicit effort: {selected_effort!r}")
+        selected = advisor.select_request_model("none", "gpt-4o")
+        if selected != "gpt-4o":
+            raise SystemExit(f"Diagnostic route override did not preserve explicit model: {selected!r}")
     selected = advisor.select_request_model("high", "gpt-5-5-thinking")
     if selected != "gpt-5-5-thinking":
         raise SystemExit(f"Legacy Thinking model with extended effort should be allowed: {selected!r}")

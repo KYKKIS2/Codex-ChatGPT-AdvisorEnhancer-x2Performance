@@ -85,6 +85,7 @@ DEFAULT_MODEL = "gpt-5-5-thinking"
 SAFE_NON_THINKING_MODEL = "gpt-5-5"
 DEFAULT_CHATGPT_THINKING_EFFORT = "extended"
 DEFAULT_PRO_EXTENDED_MODEL = "gpt-5-5-pro"
+ALLOW_NON_DEFAULT_ROUTE_ENV = "ADVISOR_ALLOW_NON_DEFAULT_ROUTE"
 LEGACY_THINKING_MODELS = {"gpt-5-5-thinking", "gpt-5.5-thinking", "gpt-5_5-thinking"}
 COMPATIBLE_MODEL_ALIASES = {
     "gpt-5-5-thinking": ("gpt-5.5-thinking", "gpt-5_5-thinking"),
@@ -126,10 +127,30 @@ def is_pro_request(value: str | None) -> bool:
     return value is not None and value.strip().lower() in (PRO_STANDARD_ALIASES | PRO_EXTENDED_ALIASES)
 
 
+def allow_non_default_route() -> bool:
+    return bool_env(ALLOW_NON_DEFAULT_ROUTE_ENV, False)
+
+
 def default_model_for(thinking_effort: str | None) -> str:
     if is_pro_request(thinking_effort):
         return os.environ.get("ADVISOR_PRO_EXTENDED_MODEL", DEFAULT_PRO_EXTENDED_MODEL)
     return DEFAULT_MODEL
+
+
+def select_request_thinking_effort(thinking_effort: str | None) -> str | None:
+    if is_pro_request(thinking_effort) or allow_non_default_route():
+        return thinking_effort
+
+    normalized_effort = normalize_thinking_effort(thinking_effort)
+    if thinking_effort is not None and normalized_effort != DEFAULT_CHATGPT_THINKING_EFFORT:
+        print(
+            "Advisor forcing non-Pro ADVISOR_THINKING_EFFORT to "
+            f"{DEFAULT_CHATGPT_THINKING_EFFORT!r} instead of {thinking_effort!r}. "
+            "Use ADVISOR_THINKING_EFFORT=pro-extended for Pro, or set "
+            f"{ALLOW_NON_DEFAULT_ROUTE_ENV}=true only for deliberate diagnostics.",
+            file=sys.stderr,
+        )
+    return DEFAULT_CHATGPT_THINKING_EFFORT
 
 
 def configured_thinking_effort(reasoning_effort: str | None) -> str | None:
@@ -140,8 +161,12 @@ def configured_thinking_effort(reasoning_effort: str | None) -> str | None:
         or os.environ.get("ADVISOR_INTELLIGENCE")
     )
     if explicit is not None:
+        if not is_pro_request(explicit) and not allow_non_default_route():
+            return DEFAULT_CHATGPT_THINKING_EFFORT
         return normalize_thinking_effort(explicit)
     default = os.environ.get("ADVISOR_DEFAULT_THINKING_EFFORT", DEFAULT_CHATGPT_THINKING_EFFORT)
+    if default is not None and not allow_non_default_route():
+        return DEFAULT_CHATGPT_THINKING_EFFORT
     return normalize_thinking_effort(default) if default is not None else None
 
 
@@ -350,6 +375,16 @@ def select_request_model(thinking_effort: str | None, model: str | None) -> str:
         )
         model = None
     if not is_pro_request(thinking_effort):
+        if not allow_non_default_route():
+            if model is not None and model != DEFAULT_MODEL:
+                print(
+                    "Advisor ignoring non-Pro ADVISOR_MODEL="
+                    f"{model!r} and using {DEFAULT_MODEL!r} with "
+                    f"thinking_effort={DEFAULT_CHATGPT_THINKING_EFFORT!r}. "
+                    f"Set {ALLOW_NON_DEFAULT_ROUTE_ENV}=true only for deliberate diagnostics.",
+                    file=sys.stderr,
+                )
+            return DEFAULT_MODEL
         selected = model or DEFAULT_MODEL
         explicit_no_thinking = thinking_effort is not None and normalized_effort is None
         if (
@@ -1610,6 +1645,11 @@ def main() -> int:
         os.environ["ADVISOR_THINKING_EFFORT"] = args.thinking_effort
     if args.allow_outside_project:
         os.environ["ADVISOR_ALLOW_OUTSIDE_PROJECT_CONTEXT"] = "true"
+    args.thinking_effort = select_request_thinking_effort(args.thinking_effort)
+    if args.thinking_effort is None:
+        os.environ.pop("ADVISOR_THINKING_EFFORT", None)
+    else:
+        os.environ["ADVISOR_THINKING_EFFORT"] = args.thinking_effort
     args.model = select_request_model(args.thinking_effort, args.model)
     prompt = args.prompt if args.prompt is not None else sys.stdin.read()
     prompt = sanitize_text(build_prompt(prompt, args.context_file))

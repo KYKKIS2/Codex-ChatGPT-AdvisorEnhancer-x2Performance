@@ -227,7 +227,7 @@ Optional Pro test:
 ./start-g4f.sh gpt-5-5-pro
 ```
 
-`gpt-5-5-thinking` is the normal advisor default, and the wrapper sends `thinking_effort=extended` by default. The unsafe route is `gpt-5-5-thinking` with no private effort, `min`, or `standard`, which current ChatGPT metadata can resolve to `gpt-5-3-mini`; if no thinking is explicitly requested, the wrapper uses plain `gpt-5-5` to avoid that downgrade. Pro Extended requests `gpt-5-5-pro` plus `thinking_effort=extended`.
+`gpt-5-5-thinking` is the normal advisor default, and the wrapper sends `thinking_effort=extended` by default. Weak/no-thinking routes such as `gpt-5-5` with no private effort, `min`, or `standard` can resolve to weaker ChatGPT models, so normal non-Pro advisor calls are policy-clamped to `gpt-5-5-thinking` plus `thinking_effort=extended`. Explicit non-Pro model overrides such as `gpt-4o`, `gpt-5-5`, or `ADVISOR_THINKING_EFFORT=none` are ignored unless `ADVISOR_ALLOW_NON_DEFAULT_ROUTE=true` is set for deliberate diagnostics. Pro Extended requests `gpt-5-5-pro` plus `thinking_effort=extended`.
 
 Do not intentionally set `ADVISOR_MODEL=default`. If an older Codex session or inherited shell environment does pass `default`, the wrapper ignores that alias and selects the safe configured model for the requested thinking mode.
 
@@ -243,7 +243,7 @@ ADVISOR_THINKING_EFFORT=extended \
 python3 ~/.codex/skills/external-advisor/scripts/advisor.py --prompt "Review this carefully: ..."
 ```
 
-Aliases use the current ChatGPT private values: `low`/`light` -> `min`, `medium` -> `standard`, `high` -> `extended`, and `extra-high`/`xhigh`/`heavy` -> `max`. Older raw values such as `high` or `xhigh` are not sent directly because ChatGPT can reject them with `Invalid conversation body`; unknown values fail locally unless `ADVISOR_ALLOW_UNKNOWN_THINKING_EFFORT=true` is set for diagnostics. The default when no private effort is set is `extended`, because that is the currently safe Thinking-lane advisor route. The setup patch adds g4f/OpenaiChat support for ChatGPT's conversation-turn WebSocket handoff, so extended turns can continue after ChatGPT moves the response stream from the initial SSE request to a per-turn WebSocket topic.
+Aliases use the current ChatGPT private values: `low`/`light` -> `min`, `medium` -> `standard`, `high` -> `extended`, and `extra-high`/`xhigh`/`heavy` -> `max`. Older raw values such as `high` or `xhigh` are not sent directly because ChatGPT can reject them with `Invalid conversation body`; unknown values fail locally unless `ADVISOR_ALLOW_UNKNOWN_THINKING_EFFORT=true` is set for diagnostics. Normal non-Pro advisor calls are clamped to `extended`, because that is the currently safe Thinking-lane advisor route. The setup patch adds g4f/OpenaiChat support for ChatGPT's conversation-turn WebSocket handoff, so extended turns can continue after ChatGPT moves the response stream from the initial SSE request to a per-turn WebSocket topic.
 
 For Pro Extended, use the Pro Extended request alias, not just bare `extended`:
 
