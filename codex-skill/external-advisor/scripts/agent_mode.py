@@ -492,29 +492,12 @@ def project_relative_parts(project: Path, path: Path) -> list[str]:
         return relative_parts(path)
 
 
-def allowed_advisor_route_state(project: Path, path: Path) -> bool:
-    try:
-        rel = path.resolve().relative_to(project.resolve())
-    except (OSError, ValueError):
-        return False
-    parts = rel.parts
-    if not parts or parts[0] != ".codex-advisor":
-        return False
-    if len(parts) == 1:
-        return True
-    if parts == (".codex-advisor", "routes"):
-        return True
-    if parts == (".codex-advisor", "latest-route.json"):
-        return True
-    return len(parts) == 3 and parts[1] == "routes" and parts[2].endswith(".json")
-
-
 def contains_sensitive_project_marker(project: Path, path: Path) -> bool:
-    if allowed_advisor_route_state(project, path):
-        return False
     parts = project_relative_parts(project, path)
     joined = "/".join(parts)
     name = path.name.lower()
+    if ".codex-advisor" in parts:
+        return True
     if any(marker.lower() in joined for marker in BROWSER_DIR_MARKERS):
         return True
     if any(part in SENSITIVE_AGENT_DIR_NAMES for part in parts):

@@ -11,6 +11,12 @@ SANITIZED_CONFIG="$PROJECT_ROOT/agent-config-sanitized.json"
 WORKSPACES="$PROJECT_ROOT/workspaces"
 trap 'rm -rf "$PROJECT_ROOT" "$FAKE_BIN" "$OUTSIDE"' EXIT
 
+unset ADVISOR_AGENT_ALLOWED_ROOTS
+unset ADVISOR_AGENT_BRIDGE_EXECUTABLE
+unset ADVISOR_AGENT_SANITIZED_WORKSPACE
+unset ADVISOR_AGENT_WORKSPACE_ROOT
+unset DEVSPACE_ALLOWED_ROOTS
+
 PROJECT="$PROJECT_ROOT/project with spaces"
 mkdir -p "$PROJECT"
 git -C "$PROJECT" init -q -b main
@@ -88,13 +94,10 @@ route_dir = project / ".codex-advisor" / "routes"
 route_dir.mkdir(parents=True)
 (project / ".codex-advisor" / "latest-route.json").write_text("{}", encoding="utf-8")
 (route_dir / "safe-route.json").write_text("{}", encoding="utf-8")
-scan = agent_mode.scan_project_secrets(project)
-if not scan.ok:
-    raise SystemExit(f"route-only advisor state failed secret scan: {scan.to_dict()}")
 (project / ".codex-advisor" / "latest-response.md").write_text("advisor response", encoding="utf-8")
 scan = agent_mode.scan_project_secrets(project)
-if scan.ok or not any(".codex-advisor/latest-response.md" in finding.path for finding in scan.findings):
-    raise SystemExit("advisor transcript/state was not blocked")
+if scan.ok or not any(".codex-advisor" in finding.path for finding in scan.findings):
+    raise SystemExit("advisor state was not blocked")
 (project / ".codex-advisor" / "latest-response.md").unlink()
 
 secret_file = project / ".env.local"
