@@ -4,7 +4,11 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROUTER="$ROOT/codex-skill/external-advisor/scripts/router.py"
 PROJECT="$(mktemp -d)"
-trap 'rm -rf "$PROJECT"' EXIT
+FAKE_BIN="$(mktemp -d)"
+trap 'rm -rf "$PROJECT" "$FAKE_BIN"' EXIT
+
+printf '#!/usr/bin/env bash\necho fake devspace\n' > "$FAKE_BIN/devspace"
+chmod +x "$FAKE_BIN/devspace"
 
 assert_route() {
   local expected="$1"
@@ -38,3 +42,6 @@ assert_route "verifier" "verifier-loop" --failed-tests --prompt "pytest failed a
 assert_route "conclave" "" --prompt "Which model or framework should I use for training?"
 assert_route "single-advisor" "" --before-final --draft "Draft answer" --prompt "Review before final"
 assert_route "machine-json-verifier" "verifier-loop" --machine-verify --prompt "Verify this patch"
+assert_route "agent-mode" "agent-mode" --agent-allowed-root "$PROJECT" --agent-bridge-executable "$FAKE_BIN/devspace" --prompt "Decide the architecture for advisor memory"
+assert_route "single-advisor" "" --prompt-only --agent-allowed-root "$PROJECT" --agent-bridge-executable "$FAKE_BIN/devspace" --prompt "Decide the architecture for advisor memory"
+assert_route "single-advisor" "" --agent-allowed-root "$PROJECT" --agent-bridge-executable "$FAKE_BIN/missing-devspace" --prompt "Decide the architecture for advisor memory"

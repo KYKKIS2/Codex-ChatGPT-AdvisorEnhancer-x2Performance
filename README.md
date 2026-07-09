@@ -23,7 +23,9 @@ Most coding-agent failures do not happen because the agent cannot type code. The
 
 The `external-advisor` skill helps with that layer.
 
-The advisor is not a repo-reading agent. It has no implicit access to Codex's local filesystem, terminal, git state, tests, logs, screenshots, or prior observations. It only sees the prompt, explicit context files, context packs, and synced advisor-chat transcript content that Codex sends. File names, modules, commands, metrics, or root causes suggested by the advisor are hypotheses until Codex verifies them locally.
+Prompt-only advisor calls are not repo-reading agents. They have no implicit access to Codex's local filesystem, terminal, git state, tests, logs, screenshots, or prior observations. They only see the prompt, explicit context files, context packs, and synced advisor-chat transcript content that Codex sends. File names, modules, commands, metrics, or root causes suggested by prompt-only advisor calls are hypotheses until Codex verifies them locally.
+
+For broad repo-analysis and architecture critique, this repo also supports a repo-aware advisor agent mode. When a narrow allowed root and a DevSpace-compatible MCP bridge are configured safely, the router prefers agent mode and generates a review-first ChatGPT handoff. Prompt-only critique remains the fallback when agent mode is unavailable, unsafe, or explicitly disabled.
 
 It is designed for questions like:
 
@@ -45,7 +47,8 @@ It is intentionally not meant for every small bug fix. Codex should still handle
 - Syncs the online ChatGPT advisor chat before and after each persistent advisor call.
 - Writes local transcript files Codex can inspect later.
 - Adds optional conclave mode with role-specific planner, critic, security, verifier, and synthesis advisors.
-- Adds an advisor router for no-advisor, single-advisor, conclave, verifier, and machine-json verifier paths.
+- Adds a repo-aware advisor agent-mode handoff for DevSpace-compatible MCP bridges.
+- Adds an advisor router for no-advisor, agent-mode, single-advisor, conclave, verifier, and machine-json verifier paths.
 - Adds critique-before-final mode for important answers.
 - Adds a verifier loop that asks what evidence to gather, runs safe local commands, then asks the verifier to interpret the actual output.
 - Lets you explicitly say `Use the external advisor` when you want a second opinion.
@@ -100,6 +103,8 @@ This repo currently uses:
 - Conclave runner: `codex-skill/external-advisor/scripts/conclave.py`
 - Router: `codex-skill/external-advisor/scripts/router.py`
 - Context pack builder: `codex-skill/external-advisor/scripts/context_pack.py`
+- Agent-mode doctor and handoff: `codex-skill/external-advisor/scripts/agent_mode.py`
+- Agent-mode setup helper: `codex-skill/external-advisor/scripts/advisor_agent_setup.py`
 - Critique-before-final: `codex-skill/external-advisor/scripts/critique_final.py`
 - Evidence-backed verifier loop: `codex-skill/external-advisor/scripts/verifier_loop.py`
 - Searchable memory manager: `codex-skill/external-advisor/scripts/memory_manager.py`
@@ -155,7 +160,7 @@ sudo apt install -y git python3 python3-pip python3-venv
 Run setup:
 
 ```bash
-chmod +x setup.sh start-g4f.sh test-advisor.sh test-conclave.sh test-router.sh test-context-pack.sh test-verifier-loop.sh test-memory.sh test-ranking.sh test-eval-harness.sh test-advisor-transport-recovery.sh test-security-regressions.sh
+chmod +x setup.sh start-g4f.sh test-advisor.sh test-conclave.sh test-router.sh test-context-pack.sh test-verifier-loop.sh test-memory.sh test-ranking.sh test-eval-harness.sh test-advisor-transport-recovery.sh test-security-regressions.sh test-agent-mode.sh
 ./setup.sh
 ```
 
@@ -210,6 +215,87 @@ Ubuntu/Linux:
 If `vendor/gpt4free` is missing, the start script will run setup automatically before starting the API.
 If port `8080` is already in use, stop the existing server or start on another port with `.\start-g4f.ps1 -Port 8081` or `G4F_PORT=8081 ./start-g4f.sh`.
 Debug logging is off by default. Use `.\start-g4f.ps1 -DebugLog` or `G4F_DEBUG=true ./start-g4f.sh` only when troubleshooting.
+
+## Default Repo-Aware Agent Mode
+
+Agent mode is the preferred advisor route for non-trivial critique, planning, architecture, and broad repo-analysis requests when it is safely configured. It uses a DevSpace-compatible MCP bridge so ChatGPT can inspect an approved local project instead of relying only on snippets Codex sends.
+
+This repo does not install DevSpace, start DevSpace, open tunnels, run `npx @waishnav/devspace`, or contact ChatGPT from setup, doctor, setup-helper, or router dry runs. Configure the MCP bridge yourself, keep allowed roots narrow, and keep the Owner password private.
+
+DevSpace-style bridges protect by allowed root and tool authorization, not by a built-in `.env`/HAR/key denylist. The advisor therefore runs its own secret preflight before agent mode is considered available. By default, if the real project contains obvious sensitive paths such as `.env*`, HAR/cookie/auth files, key material, wallet/seed files, browser profiles, symlink escapes, or advisor transcript/conversation state under `.codex-advisor`, agent mode automatically creates a sanitized review workspace under `~/.codex/advisor-agent/workspaces/` and gives ChatGPT that copy instead of the real checkout. If sanitization is disabled or cannot produce a clean copy, prompt-only advisor mode remains the fallback.
+
+Recommended setup shape:
+
+```bash
+npm install -g @waishnav/devspace
+devspace init
+devspace serve
+```
+
+During DevSpace setup, choose a narrow project root, not `~`, `/`, a drive root, browser profile, `.ssh`, wallet folder, HAR/cookie directory, or other secret store. DevSpace uses a public HTTPS `/mcp` endpoint through a tunnel you control; the tunnel URL is not a secret, but the Owner password is.
+
+Tell the advisor router which local roots are allowed:
+
+```bash
+export ADVISOR_AGENT_ALLOWED_ROOTS="/absolute/path/to/one/project-or-parent"
+```
+
+Or write a durable user-level config for the current project:
+
+```bash
+python3 ./codex-skill/external-advisor/scripts/advisor_agent_setup.py \
+  --auto \
+  --project-dir .
+```
+
+That writes the exact validated root to `~/.codex/advisor-agent/config.json` by default. The config file must live outside the project, so a repository cannot self-authorize its own root. If the secret preflight finds sensitive files, the helper generates a sanitized workspace and records that generated root too. `--allow-sensitive-project` exists only for deliberate diagnostics and should not be used as a normal setup path.
+
+Sanitized workspaces are rebuilt when selected. They skip `.git`, dependency/cache/build directories, `.env*`, HAR/cookie/auth files, key material, wallet/seed files, browser profiles, advisor transcript state, symlinks, secret-looking file contents, archives, databases, and large model/data artifacts. Each sanitized copy includes `ADVISOR_SANITIZED_WORKSPACE.md` and `SANITIZED_WORKSPACE_MANIFEST.json`. It is intentionally incomplete; Codex must verify final facts and apply edits in the original checkout.
+
+Then validate without starting network exposure:
+
+```bash
+python3 ./codex-skill/external-advisor/scripts/agent_mode.py \
+  --doctor \
+  --project-dir .
+```
+
+Generate the review-first handoff:
+
+```bash
+python3 ./codex-skill/external-advisor/scripts/agent_mode.py \
+  --print-handoff \
+  --project-dir . \
+  --allowed-root "$PWD" \
+  --task "Review this architecture decision."
+```
+
+Force a sanitized copy even when the project currently looks clean:
+
+```bash
+python3 ./codex-skill/external-advisor/scripts/router.py \
+  --execute \
+  --agent-sanitized-workspace always \
+  --prompt "Review this architecture decision."
+```
+
+Or let the router choose agent mode when configured:
+
+```bash
+python3 ./codex-skill/external-advisor/scripts/router.py \
+  --execute \
+  --prompt "Decide the architecture for advisor memory."
+```
+
+Agent mode v1 is review-first. The generated handoff tells ChatGPT to inspect, plan, and review only. Codex remains the default implementer unless the user explicitly grants ChatGPT edit or shell authority in that ChatGPT session. DevSpace tool surfaces can expose edit and shell tools, so treat connected ChatGPT as a trusted coding partner with local-machine access.
+
+Force prompt-only critique when needed:
+
+```bash
+python3 ./codex-skill/external-advisor/scripts/router.py \
+  --prompt-only \
+  --prompt "Review this plan without repo-aware agent mode."
+```
 
 Default model:
 
@@ -346,12 +432,13 @@ These tests do not require a live advisor endpoint:
 ./test-context-pack.sh
 ./test-verifier-loop.sh
 ./test-advisor-transport-recovery.sh
+./test-agent-mode.sh
 ./test-memory.sh
 ./test-ranking.sh
 ./test-eval-harness.sh
 ```
 
-The router test confirms task types map to the intended advisor path. The context-pack test creates `.codex-advisor/latest-context-pack.json`. The verifier-loop dry run creates `.codex-advisor/latest-verifier-loop.json` and runs a harmless local command as evidence. The advisor transport recovery test covers empty Pro/extended bodies, stale transcript refusal, and embedded conversation recovery. The memory test initializes searchable memory and records a sample decision/outcome. The ranking test confirms conclave JSON includes role rankings. The eval harness test confirms the benchmark structure.
+The router test confirms task types map to the intended advisor path. The context-pack test creates `.codex-advisor/latest-context-pack.json`. The verifier-loop dry run creates `.codex-advisor/latest-verifier-loop.json` and runs a harmless local command as evidence. The advisor transport recovery test covers empty Pro/extended bodies, stale transcript refusal, and embedded conversation recovery. The agent-mode test covers root validation, config-driven setup, automatic sanitized review workspaces, secret preflight fallback when sanitization is disabled, safe route-log exceptions, symlink denial, and deterministic handoff generation. The memory test initializes searchable memory and records a sample decision/outcome. The ranking test confirms conclave JSON includes role rankings. The eval harness test confirms the benchmark structure.
 
 ## Use From Codex
 

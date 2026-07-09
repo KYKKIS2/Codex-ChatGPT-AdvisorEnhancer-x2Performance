@@ -62,7 +62,10 @@ chmod +x \
   "$ROOT/test-ranking.sh" \
   "$ROOT/test-eval-harness.sh" \
   "$ROOT/test-advisor-transport-recovery.sh" \
-  "$ROOT/test-security-regressions.sh" 2>/dev/null || true
+  "$ROOT/test-security-regressions.sh" \
+  "$ROOT/test-agent-mode.sh" \
+  "$ROOT/codex-skill/external-advisor/scripts/agent_mode.py" \
+  "$ROOT/codex-skill/external-advisor/scripts/advisor_agent_setup.py" 2>/dev/null || true
 
 mkdir -p "$SKILLS_DEST"
 for skill_dir in "$SKILLS_SOURCE"/*; do

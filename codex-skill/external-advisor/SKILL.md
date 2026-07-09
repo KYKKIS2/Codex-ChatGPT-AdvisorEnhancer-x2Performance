@@ -9,7 +9,9 @@ Use this skill as a second-pass critique and verification layer. It does not rep
 
 For difficult judgment tasks, use the advisor as a bounded conclave rather than a single generic second opinion. Codex remains the orchestrator and final decision maker.
 
-The advisor does not have implicit access to the local repository, filesystem, terminal, git state, logs, tests, screenshots, or Codex's observations. It only sees the prompt, explicit context files, context packs, and synced advisor-chat transcript content that Codex sends. Do not imply that the advisor inspected repo files or runtime state unless those exact artifacts were included in the advisor call.
+Prompt-only advisor calls do not have implicit access to the local repository, filesystem, terminal, git state, logs, tests, screenshots, or Codex's observations. They only see the prompt, explicit context files, context packs, and synced advisor-chat transcript content that Codex sends. Do not imply that a prompt-only advisor inspected repo files or runtime state unless those exact artifacts were included in the advisor call.
+
+Repo-aware advisor agent-mode is the preferred default for non-trivial critique, planning, architecture, and broad repo-analysis requests when a safe allowed root and DevSpace-compatible MCP bridge are configured. Agent-mode generates a review-first ChatGPT handoff so ChatGPT can inspect the selected local project through the bridge. It does not replace Codex verification, and Codex remains the default implementer unless the user explicitly grants ChatGPT edit or shell authority.
 
 ## Decision
 
@@ -27,6 +29,8 @@ Default to using it for broad direction and judgment questions, such as:
 
 Skip the advisor for routine code edits, implementation work, direct debugging, simple terminal answers, fast status updates, or when it would require sending secrets, private keys, proprietary data, or unrelated user files to an external model.
 
+For repo-aware critique, prefer `scripts/router.py --execute`. The router chooses agent-mode only when a user-level advisor-agent config, `ADVISOR_AGENT_ALLOWED_ROOTS`, or `--agent-allowed-root` provides a narrow allowed root; the current project validates under that root after symlink resolution; a trusted bridge executable is available; and either the project secret preflight passes or a sanitized review workspace is generated cleanly. If any safety check fails, or if `--prompt-only`/`ADVISOR_AGENT_MODE=off` is set, the router falls back to the existing prompt-only advisor, conclave, or verifier path.
+
 Use `scripts/conclave.py` instead of `scripts/advisor.py` when the task would benefit from multiple specialist viewpoints, such as:
 
 - architecture or strategy decisions with meaningful tradeoffs
@@ -36,7 +40,9 @@ Use `scripts/conclave.py` instead of `scripts/advisor.py` when the task would be
 - high-impact recommendations where Codex should compare alternatives before answering
 - evidence checks where a verifier should identify commands, tests, inspections, and expected signals
 
-Use `scripts/router.py` when Codex needs to decide the path from the task shape. It chooses among no-advisor, single-advisor, conclave, verifier loop, and machine-json verifier loop.
+Use `scripts/router.py` when Codex needs to decide the path from the task shape. It chooses among no-advisor, agent-mode, single-advisor, conclave, verifier loop, and machine-json verifier loop.
+
+Use `scripts/advisor_agent_setup.py --auto --project-dir .` to write the current project as an exact allowed root in the user-level config after validation. If the project contains blocked local files, setup can generate a sanitized workspace under `~/.codex/advisor-agent/workspaces/` and record that generated root too. Use `scripts/agent_mode.py --doctor` to validate local agent-mode readiness without launching DevSpace, opening a tunnel, invoking `npx`, contacting ChatGPT, or writing credentials. Use `scripts/agent_mode.py --print-handoff` to generate the review-first ChatGPT handoff. The handoff tells ChatGPT to inspect and review only, avoid secrets, prefer worktrees or sanitized copies, and ask before edits or shell commands.
 
 Use `scripts/context_pack.py` before advisor calls that need repository context. It builds a compact task bundle with the task, draft/plan, selected files, git status/diff, failures, constraints, and existing advisor memory summaries.
 
@@ -52,30 +58,33 @@ Use `scripts/eval_harness.py` to compare Codex-only, single-advisor, conclave, a
 
 ## Workflow
 
-1. Gather the smallest useful context: the user's request, draft answer or plan, and only the files or snippets needed for critique. State clearly in the prompt when the advisor has not been given repo files and should reason only from the supplied summary.
-2. Do not send secrets, credentials, private keys, wallet keys, tokens, `.env` values, HAR contents, cookies, customer data, or unrelated private files. Context packs filter common sensitive paths and redact obvious secret-looking values, but Codex is still responsible for choosing safe context.
-3. If using a local OpenAI-compatible server, set `ADVISOR_PROVIDER=openai-compatible`, `ADVISOR_BASE_URL`, and `ADVISOR_MODEL`. Set `ADVISOR_API_KEY` only when that compatible endpoint requires a token; `OPENAI_API_KEY` is not forwarded to arbitrary compatible endpoints by default.
-4. Before calling the advisor, check whether `http://127.0.0.1:8080/v1/models` is reachable.
-5. If it is not reachable, automatically start the local g4f API before continuing:
+1. For non-trivial repo-analysis or architecture critique, first prefer `scripts/router.py --execute` so configured agent-mode can be selected. If agent-mode is unavailable or unsafe, fall back to prompt-only advisor context.
+2. Gather the smallest useful context: the user's request, draft answer or plan, and only the files or snippets needed for critique. State clearly in the prompt when the advisor has not been given repo files and should reason only from the supplied summary.
+3. Do not send secrets, credentials, private keys, wallet keys, tokens, `.env` values, HAR contents, cookies, customer data, or unrelated private files. Context packs filter common sensitive paths and redact obvious secret-looking values, but Codex is still responsible for choosing safe context.
+4. Repo-aware agent-mode has a stronger local safety gate because the bridge can inspect files directly. By default, when the selected project contains obvious sensitive paths such as `.env*`, HAR/cookie/auth files, key material, wallet/seed files, browser profiles, symlink escapes, or advisor transcript/conversation state under `.codex-advisor`, it creates a sanitized review workspace under `~/.codex/advisor-agent/workspaces/` and exposes that copy instead of the real checkout. Only `.codex-advisor/latest-route.json` and `.codex-advisor/routes/*.json` are allowed for router bookkeeping. If sanitization is disabled or fails, fall back to prompt-only. Use `ADVISOR_AGENT_ALLOW_SENSITIVE_PROJECT=true` or `--agent-allow-sensitive-project` only for deliberate diagnostics, not normal work.
+5. Treat sanitized workspaces as incomplete review copies. They skip `.git`, dependency/cache/build directories, `.env*`, HAR/cookie/auth files, key material, wallet/seed files, browser profiles, advisor transcript state, symlinks, secret-looking file contents, archives, databases, and large model/data artifacts. Codex must verify final facts and apply edits in the original checkout.
+6. If using a local OpenAI-compatible server, set `ADVISOR_PROVIDER=openai-compatible`, `ADVISOR_BASE_URL`, and `ADVISOR_MODEL`. Set `ADVISOR_API_KEY` only when that compatible endpoint requires a token; `OPENAI_API_KEY` is not forwarded to arbitrary compatible endpoints by default.
+7. Before calling the advisor, check whether `http://127.0.0.1:8080/v1/models` is reachable.
+8. If it is not reachable, automatically start the local g4f API before continuing:
    - First read `advisor-config.json` from this skill folder and use its `start_g4f` path if present.
    - If `ADVISOR_SETUP_DIR` is set, check `$env:ADVISOR_SETUP_DIR\start-g4f.ps1`.
    - Otherwise prefer `.\start-g4f.ps1` in the current working directory, then parent directories.
    - The starter script should install `vendor/gpt4free` automatically by running setup if it is missing.
    - Start it in the background with `Start-Process` and `-WindowStyle Hidden`, then wait until `http://127.0.0.1:8080/v1/models` responds.
-6. If using official OpenAI, set `ADVISOR_PROVIDER=openai`, `OPENAI_API_KEY`, and optionally `ADVISOR_MODEL` plus `ADVISOR_REASONING_EFFORT`.
-7. Run `scripts/advisor.py` with `--prompt` or stdin.
-8. For local OpenAI-compatible calls, the script persists the returned `conversation` object by default under `.codex-advisor` in the nearest Git repo root or current working directory. Later Codex sessions in the same repo continue the same ChatGPT advisor chat.
-9. Before and after each persistent local advisor call, the script syncs the remote ChatGPT conversation when possible and writes `.codex-advisor/transcript.json` plus `.codex-advisor/transcript.md`. Codex may inspect those files when it needs the advisor chat history.
-10. If `.codex-advisor/project.json` exists, advisor calls should pass its normalized `chatgpt_project_id`/`g-p-...` id to g4f so new ChatGPT chats are created inside that ChatGPT Project. Default local state moves under `.codex-advisor/projects/<g-p-id>/`.
-11. If no project binding exists, persistent non-temporary local advisor calls auto-create a private ChatGPT Project named from the repo/folder and write `.codex-advisor/project.json`. Set `ADVISOR_AUTO_CREATE_PROJECT=false` to disable this.
-12. To create and bind manually, run `scripts/project_bind.py --create --name "my-project"`. To bind an existing Project, run `scripts/project_bind.py --url "https://chatgpt.com/g/g-p-.../project"`, or set `ADVISOR_CHATGPT_PROJECT_URL`/`ADVISOR_CHATGPT_PROJECT_ID`; the advisor persists the normalized Project id into `.codex-advisor/project.json` on use.
-13. To migrate old `.codex-advisor/conversation.json` state after pulling updates, run `scripts/project_migrate.py --url "https://chatgpt.com/g/g-p-.../project" --archive-root`, or omit `--url` to infer a Project id from old remote conversation metadata when possible. Use `--create-missing --archive-root` to create a new private Project when nothing can be inferred.
-14. Set `ADVISOR_CONVERSATION_KEY` only when multiple advisor chats are needed in the same folder; keyed state is project-scoped under `.codex-advisor/conversations/` or `.codex-advisor/projects/<g-p-id>/conversations/`. The key is sanitized into a path-safe slug.
-15. Set `ADVISOR_STATE_PATH` when a caller needs an explicit project-local state file, such as `.codex-advisor\roles\critic\conversation.json`.
-16. Do not set `ADVISOR_TEMPORARY=true`, `ADVISOR_PERSIST_CONVERSATION=false`, or `ADVISOR_SYNC_REMOTE=false` for normal advisor calls. Those flags disable transcript recovery and can make g4f tail-fragment transport bugs look like bad advisor answers.
-17. Use `ADVISOR_TEMPORARY=true`, `ADVISOR_PERSIST_CONVERSATION=false`, or `ADVISOR_SYNC_REMOTE=false` only for deliberate throwaway diagnostics where losing transcript recovery is acceptable.
-18. For failed tests or evidence-heavy work, prefer `scripts/verifier_loop.py` over plain `conclave.py --mode verification` because it connects verifier advice to actual command output. The verifier runs commands with `shell=False` and a constrained allowlist; use `--allow-unsafe-commands` only as an explicit escape hatch.
-19. Treat the result as advisory. Verify facts, reject weak advice, and incorporate only the parts that improve the final answer. In user-facing answers, distinguish advisor-derived guidance from facts Codex confirmed by reading files, running commands, or inspecting artifacts.
+9. If using official OpenAI, set `ADVISOR_PROVIDER=openai`, `OPENAI_API_KEY`, and optionally `ADVISOR_MODEL` plus `ADVISOR_REASONING_EFFORT`.
+10. Run `scripts/advisor.py` with `--prompt` or stdin for explicit prompt-only critique, or when router fallback selects that path.
+11. For local OpenAI-compatible calls, the script persists the returned `conversation` object by default under `.codex-advisor` in the nearest Git repo root or current working directory. Later Codex sessions in the same repo continue the same ChatGPT advisor chat.
+12. Before and after each persistent local advisor call, the script syncs the remote ChatGPT conversation when possible and writes `.codex-advisor/transcript.json` plus `.codex-advisor/transcript.md`. Codex may inspect those files when it needs the advisor chat history.
+13. If `.codex-advisor/project.json` exists, advisor calls should pass its normalized `chatgpt_project_id`/`g-p-...` id to g4f so new ChatGPT chats are created inside that ChatGPT Project. Default local state moves under `.codex-advisor/projects/<g-p-id>/`.
+14. If no project binding exists, persistent non-temporary local advisor calls auto-create a private ChatGPT Project named from the repo/folder and write `.codex-advisor/project.json`. Set `ADVISOR_AUTO_CREATE_PROJECT=false` to disable this.
+15. To create and bind manually, run `scripts/project_bind.py --create --name "my-project"`. To bind an existing Project, run `scripts/project_bind.py --url "https://chatgpt.com/g/g-p-.../project"`, or set `ADVISOR_CHATGPT_PROJECT_URL`/`ADVISOR_CHATGPT_PROJECT_ID`; the advisor persists the normalized Project id into `.codex-advisor/project.json` on use.
+16. To migrate old `.codex-advisor/conversation.json` state after pulling updates, run `scripts/project_migrate.py --url "https://chatgpt.com/g/g-p-.../project" --archive-root`, or omit `--url` to infer a Project id from old remote conversation metadata when possible. Use `--create-missing --archive-root` to create a new private Project when nothing can be inferred.
+17. Set `ADVISOR_CONVERSATION_KEY` only when multiple advisor chats are needed in the same folder; keyed state is project-scoped under `.codex-advisor/conversations/` or `.codex-advisor/projects/<g-p-id>/conversations/`. The key is sanitized into a path-safe slug.
+18. Set `ADVISOR_STATE_PATH` when a caller needs an explicit project-local state file, such as `.codex-advisor\roles\critic\conversation.json`.
+19. Do not set `ADVISOR_TEMPORARY=true`, `ADVISOR_PERSIST_CONVERSATION=false`, or `ADVISOR_SYNC_REMOTE=false` for normal advisor calls. Those flags disable transcript recovery and can make g4f tail-fragment transport bugs look like bad advisor answers.
+20. Use `ADVISOR_TEMPORARY=true`, `ADVISOR_PERSIST_CONVERSATION=false`, or `ADVISOR_SYNC_REMOTE=false` only for deliberate throwaway diagnostics where losing transcript recovery is acceptable.
+21. For failed tests or evidence-heavy work, prefer `scripts/verifier_loop.py` over plain `conclave.py --mode verification` because it connects verifier advice to actual command output. The verifier runs commands with `shell=False` and a constrained allowlist; use `--allow-unsafe-commands` only as an explicit escape hatch.
+22. Treat the result as advisory. Verify facts, reject weak advice, and incorporate only the parts that improve the final answer. In user-facing answers, distinguish advisor-derived guidance from facts Codex confirmed by reading files, running commands, or inspecting artifacts.
 
 ## Auto-Start Command
 
@@ -104,6 +113,16 @@ $env:ADVISOR_BASE_URL = "http://127.0.0.1:8080/v1"
 $env:ADVISOR_MODEL = "gpt-5-5-thinking"
 $env:ADVISOR_REASONING_EFFORT = "high"
 python $HOME\.codex\skills\external-advisor\scripts\advisor.py --prompt "Review this draft answer: ..."
+```
+
+Repo-aware agent-mode doctor and handoff:
+
+```powershell
+python $HOME\.codex\skills\external-advisor\scripts\advisor_agent_setup.py --auto --project-dir .
+python $HOME\.codex\skills\external-advisor\scripts\agent_mode.py --doctor --project-dir .
+python $HOME\.codex\skills\external-advisor\scripts\router.py --execute --prompt "Review this architecture decision."
+python $HOME\.codex\skills\external-advisor\scripts\router.py --execute --agent-sanitized-workspace always --prompt "Review this architecture decision through a sanitized copy."
+python $HOME\.codex\skills\external-advisor\scripts\router.py --prompt-only --prompt "Review this with prompt-only critique."
 ```
 
 For ChatGPT web Intelligence/thinking choices, set the private ChatGPT field explicitly with `ADVISOR_THINKING_EFFORT` or `--thinking-effort`. Examples: `extended`, `max`, `pro-extended`, `extra-high`, or `high`. This is separate from `ADVISOR_REASONING_EFFORT`; the advisor maps these values to ChatGPT's private web `thinking_effort` field and defaults normal advisor calls to `extended`.

@@ -82,6 +82,14 @@ def split_csv(value: str | None) -> list[str]:
     return [item.strip() for item in value.split(",") if item.strip()]
 
 
+def truthy(value: str | None) -> bool:
+    return str(value or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def falsey(value: str | None) -> bool:
+    return str(value or "").strip().lower() in {"0", "false", "no", "off"}
+
+
 def advisor_dir(project_dir: Path) -> Path:
     return project_dir / ".codex-advisor"
 
@@ -106,6 +114,38 @@ def resolve_project_dir(project_dir: Path | None) -> Path:
 def command_preview(decision: RouteDecision, args: argparse.Namespace) -> list[str]:
     if decision.route == "no-advisor":
         return []
+    if decision.command_kind == "agent-mode":
+        command = [
+            sys.executable,
+            str(script_path("agent_mode.py")),
+            "--print-handoff",
+            "--project-dir", str(args.project_dir),
+            "--agent-mode", args.agent_mode,
+            "--bridge-executable", args.agent_bridge_executable,
+        ]
+        for root in args.agent_allowed_root:
+            command.extend(["--allowed-root", root])
+        if args.agent_no_require_bridge:
+            command.append("--no-require-bridge")
+        allow_project_bridge = args.agent_allow_project_bridge or truthy(os.environ.get("ADVISOR_AGENT_ALLOW_PROJECT_BRIDGE"))
+        allow_sensitive_project = args.agent_allow_sensitive_project or truthy(os.environ.get("ADVISOR_AGENT_ALLOW_SENSITIVE_PROJECT"))
+        secret_scan_disabled = args.agent_no_secret_scan or falsey(os.environ.get("ADVISOR_AGENT_SECRET_SCAN"))
+        if allow_project_bridge:
+            command.append("--allow-project-bridge")
+        if allow_sensitive_project:
+            command.append("--allow-sensitive-project")
+        if secret_scan_disabled:
+            command.append("--no-secret-scan")
+        command.extend(["--sanitized-workspace", args.agent_sanitized_workspace])
+        if args.agent_workspace_root:
+            command.extend(["--workspace-root", args.agent_workspace_root])
+        if args.agent_config_path:
+            command.extend(["--config-path", args.agent_config_path])
+        if args.agent_case_insensitive_paths:
+            command.append("--case-insensitive-paths")
+        if args.agent_checkout:
+            command.append("--checkout")
+        return command
     if decision.command_kind == "advisor":
         return [
             sys.executable,
@@ -234,6 +274,8 @@ def route_task(args: argparse.Namespace, prompt: str) -> RouteDecision:
 def forced_decision(route: str, reasons: list[str]) -> RouteDecision:
     if route == "no-advisor":
         return RouteDecision(route, "none", None, [], False, 1.0, reasons, "Forced no-advisor route.")
+    if route == "agent-mode":
+        return RouteDecision(route, "agent-mode", "review", [], False, 1.0, reasons)
     if route == "single-advisor":
         return RouteDecision(route, "advisor", None, [], False, 1.0, reasons)
     if route == "conclave":
@@ -245,7 +287,41 @@ def forced_decision(route: str, reasons: list[str]) -> RouteDecision:
     raise ValueError(f"Unknown forced route: {route}")
 
 
-def build_payload(args: argparse.Namespace, prompt: str, decision: RouteDecision) -> dict[str, Any]:
+def evaluate_agent_preference(args: argparse.Namespace, decision: RouteDecision) -> tuple[RouteDecision, dict[str, Any] | None]:
+    if args.prompt_only:
+        return decision, {"available": False, "notes": ["prompt-only override selected"]}
+    if args.force_route and args.force_route != "agent-mode":
+        return decision, {"available": False, "notes": [f"forced route bypassed agent-mode: {args.force_route}"]}
+    if decision.route == "no-advisor":
+        return decision, None
+    try:
+        import agent_mode  # noqa: PLC0415
+    except Exception as exc:  # pragma: no cover - defensive import guard
+        return decision, {"available": False, "errors": [f"agent-mode helper import failed: {exc}"]}
+    status = agent_mode.evaluate_agent_mode(
+        args.project_dir,
+        mode=args.agent_mode,
+        allowed_roots=args.agent_allowed_root,
+        bridge_executable=args.agent_bridge_executable,
+        require_bridge=not args.agent_no_require_bridge,
+        allow_project_bridge=args.agent_allow_project_bridge or truthy(os.environ.get("ADVISOR_AGENT_ALLOW_PROJECT_BRIDGE")),
+        allow_sensitive_project=args.agent_allow_sensitive_project or truthy(os.environ.get("ADVISOR_AGENT_ALLOW_SENSITIVE_PROJECT")),
+        secret_scan=not args.agent_no_secret_scan and not falsey(os.environ.get("ADVISOR_AGENT_SECRET_SCAN")),
+        sanitized_workspace_mode=args.agent_sanitized_workspace,
+        workspace_root_path=args.agent_workspace_root,
+        config=args.agent_config_path,
+        case_insensitive=args.agent_case_insensitive_paths or None,
+    )
+    payload = status.to_dict()
+    if status.available:
+        reasons = [*decision.reasons, "safe repo-aware agent-mode configured"]
+        return RouteDecision("agent-mode", "agent-mode", "review", [], False, 0.92, reasons), payload
+    if decision.route == "agent-mode":
+        return decision, payload
+    return decision, payload
+
+
+def build_payload(args: argparse.Namespace, prompt: str, decision: RouteDecision, agent_status: dict[str, Any] | None = None) -> dict[str, Any]:
     preview = safety.truncate(safety.redact_sensitive_text(prompt.strip()), 1200)
     command = command_preview(decision, args)
     return {
@@ -272,6 +348,7 @@ def build_payload(args: argparse.Namespace, prompt: str, decision: RouteDecision
         "reasons": decision.reasons,
         "skip_reason": decision.skip_reason,
         "command_preview": safety.redact_argv(command),
+        "agent_mode": agent_status,
     }
 
 
@@ -333,6 +410,20 @@ def execute_route(args: argparse.Namespace, prompt: str, decision: RouteDecision
         print(decision.skip_reason)
         return 0
     command = command_preview(decision, args)
+    if decision.command_kind == "agent-mode":
+        started = time.monotonic()
+        completed = subprocess.run(
+            [*command, "--task-stdin"],
+            cwd=args.project_dir,
+            input=prompt,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=30,
+        )
+        elapsed = time.monotonic() - started
+        print(f"\nRouter agent-mode handoff finished in {elapsed:.1f}s with exit code {completed.returncode}.")
+        return completed.returncode
     context_files: list[str] = []
     if not args.no_context_pack:
         pack_path = build_context_pack(args, prompt)
@@ -400,7 +491,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--high-impact", action="store_true", help="Signal that a wrong answer has meaningful cost.")
     parser.add_argument("--before-final", action="store_true", help="Route to critic-only before final answer.")
     parser.add_argument("--machine-verify", action="store_true", help="Route to machine-json verifier.")
-    parser.add_argument("--force-route", choices=["no-advisor", "single-advisor", "conclave", "verifier", "machine-json-verifier"])
+    parser.add_argument("--force-route", choices=["no-advisor", "agent-mode", "single-advisor", "conclave", "verifier", "machine-json-verifier"])
     parser.add_argument("--execute", action="store_true", help="Execute the selected advisor route.")
     parser.add_argument("--json", action="store_true", help="Print only JSON route decision.")
     parser.add_argument("--provider", choices=["openai", "openai-compatible"], default=os.environ.get("ADVISOR_PROVIDER", "openai-compatible"))
@@ -426,6 +517,29 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--no-sync", action="store_true")
     parser.add_argument("--no-synthesis", action="store_true")
     parser.add_argument("--no-context-pack", action="store_true", help="Do not auto-build a compact context pack during --execute.")
+    parser.add_argument("--prompt-only", action="store_true", help="Disable repo-aware agent-mode preference for this router call.")
+    parser.add_argument("--agent-mode", choices=["auto", "on", "off"], default=os.environ.get("ADVISOR_AGENT_MODE", "auto"))
+    parser.add_argument(
+        "--agent-allowed-root",
+        action="append",
+        default=[item.strip() for item in os.environ.get("ADVISOR_AGENT_ALLOWED_ROOTS", os.environ.get("DEVSPACE_ALLOWED_ROOTS", "")).split(",") if item.strip()],
+        help="Allowed root for repo-aware advisor agent-mode. Can be passed multiple times.",
+    )
+    parser.add_argument("--agent-bridge-executable", default=os.environ.get("ADVISOR_AGENT_BRIDGE_EXECUTABLE", "devspace"))
+    parser.add_argument("--agent-no-require-bridge", action="store_true", help="Allow handoff routing without a local bridge executable, for diagnostics.")
+    parser.add_argument("--agent-allow-project-bridge", action="store_true", help="Allow a bridge executable inside the project, for diagnostics only.")
+    parser.add_argument("--agent-allow-sensitive-project", action="store_true", help="Allow agent-mode despite secret preflight findings, for diagnostics only.")
+    parser.add_argument("--agent-no-secret-scan", action="store_true", help="Disable agent-mode project secret preflight, for diagnostics only.")
+    parser.add_argument(
+        "--agent-sanitized-workspace",
+        choices=["auto", "always", "off"],
+        default=os.environ.get("ADVISOR_AGENT_SANITIZED_WORKSPACE", "auto"),
+        help="Use a generated sanitized review workspace automatically, always, or never.",
+    )
+    parser.add_argument("--agent-workspace-root", default=os.environ.get("ADVISOR_AGENT_WORKSPACE_ROOT"), help="Root for generated sanitized agent workspaces.")
+    parser.add_argument("--agent-config-path", default=os.environ.get("ADVISOR_AGENT_CONFIG"), help="User-level advisor agent config path.")
+    parser.add_argument("--agent-case-insensitive-paths", action="store_true", help="Use case-insensitive path checks for agent-mode root validation.")
+    parser.add_argument("--agent-checkout", action="store_true", help="Generate an agent-mode checkout handoff instead of preferring worktree.")
     return parser.parse_args()
 
 
@@ -455,7 +569,8 @@ def main() -> int:
         return 2
 
     decision = route_task(args, prompt)
-    payload = build_payload(args, prompt, decision)
+    decision, agent_status = evaluate_agent_preference(args, decision)
+    payload = build_payload(args, prompt, decision, agent_status)
     path = write_route(args.project_dir, payload)
     if args.json:
         print(json.dumps(payload, indent=2))
