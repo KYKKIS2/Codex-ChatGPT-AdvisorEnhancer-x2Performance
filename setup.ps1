@@ -75,7 +75,7 @@ Get-ChildItem -Directory -Path $SkillsSource | ForEach-Object {
     setup_dir = $Root
     start_g4f = (Join-Path $Root "start-g4f.ps1")
     base_url = "http://127.0.0.1:8080/v1"
-    model = "gpt-5-5-thinking"
+    model = "gpt-5-6-thinking"
 } | ConvertTo-Json | Set-Content -Encoding UTF8 -Path $SkillConfig
 
 Write-Host ""
@@ -84,4 +84,7 @@ Write-Host "Pinned gpt4free ref: $Gpt4FreeRef"
 Write-Host "Next steps:"
 Write-Host "1. Put your ChatGPT HAR file in: $G4f\har_and_cookies"
 Write-Host "2. Start the local API: .\start-g4f.ps1"
-Write-Host "3. Restart Codex so it discovers the bundled skills."
+Write-Host "3. For repo-aware ChatGPT agent mode, run from a project:"
+Write-Host "   python $HOME\.codex\skills\external-advisor\scripts\advisor_agent_connect.py serve --project-dir ."
+Write-Host "   Then paste the printed /mcp URL into ChatGPT Developer Mode."
+Write-Host "4. Restart Codex so it discovers the bundled skills."

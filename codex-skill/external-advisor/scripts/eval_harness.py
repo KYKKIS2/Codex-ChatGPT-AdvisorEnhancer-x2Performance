@@ -59,7 +59,7 @@ BENCHMARKS = {
         "The local g4f server fails because port 8080 is already in use.",
     ],
     "model-choice": [
-        "Choose default model slug between gpt-5-5 and gpt-5-5-pro.",
+        "Choose default model slug between gpt-5-6-thinking and gpt-5-6-pro.",
         "Decide whether model-choice questions need planner, alternative, critic, and verifier roles.",
         "Choose when to use machine JSON instead of readable advisor text.",
         "Decide whether Pro should be used for every advisor call.",

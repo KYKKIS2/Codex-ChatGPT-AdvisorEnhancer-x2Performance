@@ -89,10 +89,10 @@ Return:
 }
 PRO_STANDARD_ALIASES = {"pro", "pro standard", "pro-standard", "pro_standard"}
 PRO_EXTENDED_ALIASES = {"pro extended", "pro-extended", "pro_extended"}
-DEFAULT_MODEL = "gpt-5-5-thinking"
+DEFAULT_MODEL = "gpt-5-6-thinking"
 SAFE_NON_THINKING_MODEL = "gpt-5-5"
-DEFAULT_CHATGPT_THINKING_EFFORT = "extended"
-DEFAULT_PRO_EXTENDED_MODEL = "gpt-5-5-pro"
+DEFAULT_CHATGPT_THINKING_EFFORT = "max"
+DEFAULT_PRO_EXTENDED_MODEL = "gpt-5-6-pro"
 ALLOW_NON_DEFAULT_ROUTE_ENV = "ADVISOR_ALLOW_NON_DEFAULT_ROUTE"
 LEGACY_THINKING_MODELS = {"gpt-5-5-thinking", "gpt-5.5-thinking", "gpt-5_5-thinking"}
 

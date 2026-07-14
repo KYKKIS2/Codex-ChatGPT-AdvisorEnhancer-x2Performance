@@ -90,7 +90,7 @@ project = Path(sys.argv[1]).resolve()
 base_env = {
     "ADVISOR_PROJECT_DIR": str(project),
     "ADVISOR_BASE_URL": "http://127.0.0.1:8080/v1",
-    "ADVISOR_MODEL": "gpt-5-5-thinking",
+    "ADVISOR_MODEL": "gpt-5-6-thinking",
     "ADVISOR_THINKING_EFFORT": "pro-extended",
     "ADVISOR_AUTO_CREATE_PROJECT": "false",
     "ADVISOR_VALIDATE_MODEL": "false",
@@ -99,10 +99,10 @@ base_env = {
 
 
 with patched_env(ADVISOR_PRO_EXTENDED_MODEL=None, ADVISOR_ALLOW_PRO_MODEL_OVERRIDE=None):
-    if advisor.DEFAULT_MODEL != "gpt-5-5-thinking":
+    if advisor.DEFAULT_MODEL != "gpt-5-6-thinking":
         raise SystemExit(f"Unexpected default model: {advisor.DEFAULT_MODEL!r}")
-    if advisor.configured_thinking_effort(None) != "extended":
-        raise SystemExit("Default advisor thinking effort should be ChatGPT extended.")
+    if advisor.configured_thinking_effort(None) != "max":
+        raise SystemExit("Default advisor thinking effort should be ChatGPT max.")
     if advisor.normalize_thinking_effort("high") != "extended":
         raise SystemExit("high did not normalize to ChatGPT's current extended effort")
     if advisor.normalize_thinking_effort("xhigh") != "max":
@@ -117,26 +117,26 @@ with patched_env(ADVISOR_PRO_EXTENDED_MODEL=None, ADVISOR_ALLOW_PRO_MODEL_OVERRI
     else:
         raise SystemExit("Unknown thinking effort was not rejected locally.")
     selected_effort = advisor.select_request_thinking_effort(None)
-    if selected_effort != "extended":
-        raise SystemExit(f"Unset advisor thinking effort should clamp to extended: {selected_effort!r}")
+    if selected_effort != "max":
+        raise SystemExit(f"Unset advisor thinking effort should clamp to max: {selected_effort!r}")
     selected_effort = advisor.select_request_thinking_effort("none")
-    if selected_effort != "extended":
-        raise SystemExit(f"Explicit no-thinking route should clamp to extended: {selected_effort!r}")
+    if selected_effort != "max":
+        raise SystemExit(f"Explicit no-thinking route should clamp to max: {selected_effort!r}")
     selected_effort = advisor.select_request_thinking_effort("medium")
-    if selected_effort != "extended":
-        raise SystemExit(f"Weak non-Pro effort should clamp to extended: {selected_effort!r}")
+    if selected_effort != "max":
+        raise SystemExit(f"Weak non-Pro effort should clamp to max: {selected_effort!r}")
     selected = advisor.select_request_model(None, "gpt-5-5-thinking")
-    if selected != "gpt-5-5-thinking":
-        raise SystemExit(f"Default Thinking model should be preserved: {selected!r}")
+    if selected != "gpt-5-6-thinking":
+        raise SystemExit(f"Legacy Thinking model should clamp to GPT-5.6 Thinking by default: {selected!r}")
     selected = advisor.select_request_model(None, "default")
-    if selected != "gpt-5-5-thinking":
+    if selected != "gpt-5-6-thinking":
         raise SystemExit(f"ADVISOR_MODEL=default should use the safe default model: {selected!r}")
     selected = advisor.select_request_model("extended", "gpt-5-5")
-    if selected != "gpt-5-5-thinking":
-        raise SystemExit(f"Explicit non-thinking model should clamp to default Thinking model: {selected!r}")
+    if selected != "gpt-5-6-thinking":
+        raise SystemExit(f"Explicit non-thinking model should clamp to default GPT-5.6 Thinking model: {selected!r}")
     selected = advisor.select_request_model("extended", "gpt-4o")
-    if selected != "gpt-5-5-thinking":
-        raise SystemExit(f"Arbitrary non-Pro model should clamp to default Thinking model: {selected!r}")
+    if selected != "gpt-5-6-thinking":
+        raise SystemExit(f"Arbitrary non-Pro model should clamp to default GPT-5.6 Thinking model: {selected!r}")
     with patched_env(ADVISOR_ALLOW_NON_DEFAULT_ROUTE="true"):
         selected_effort = advisor.select_request_thinking_effort("none")
         if selected_effort != "none":
@@ -145,16 +145,16 @@ with patched_env(ADVISOR_PRO_EXTENDED_MODEL=None, ADVISOR_ALLOW_PRO_MODEL_OVERRI
         if selected != "gpt-4o":
             raise SystemExit(f"Diagnostic route override did not preserve explicit model: {selected!r}")
     selected = advisor.select_request_model("high", "gpt-5-5-thinking")
-    if selected != "gpt-5-5-thinking":
-        raise SystemExit(f"Legacy Thinking model with extended effort should be allowed: {selected!r}")
+    if selected != "gpt-5-6-thinking":
+        raise SystemExit(f"Legacy Thinking model should clamp to GPT-5.6 Thinking with normal policy: {selected!r}")
     selected = advisor.select_request_model("pro-extended", "gpt-5-5-thinking")
-    if selected != "gpt-5-5-pro":
+    if selected != "gpt-5-6-pro":
         raise SystemExit(f"Pro Extended did not override normal thinking model: {selected!r}")
     selected = advisor.select_request_model("pro-extended", "default")
-    if selected != "gpt-5-5-pro":
+    if selected != "gpt-5-6-pro":
         raise SystemExit(f"ADVISOR_MODEL=default with Pro Extended should use Pro model: {selected!r}")
-    selected = advisor.select_request_model("pro-extended", "gpt-5-5-pro")
-    if selected != "gpt-5-5-pro":
+    selected = advisor.select_request_model("pro-extended", "gpt-5-6-pro")
+    if selected != "gpt-5-6-pro":
         raise SystemExit(f"Pro Extended changed the Pro request model unexpectedly: {selected!r}")
 
 
@@ -167,7 +167,7 @@ with patched_env(**base_env):
         load_chatgpt_auth=lambda: {"headers": {"Authorization": "Bearer fake"}, "user_id": "fake"},
     ):
         try:
-            advisor.call_compatible("current prompt", "gpt-5-5-pro", 1)
+            advisor.call_compatible("current prompt", "gpt-5-6-pro", 1)
         except RuntimeError as exc:
             if "empty response" not in str(exc):
                 raise SystemExit(f"Unexpected empty Pro error: {exc}") from exc
@@ -185,9 +185,61 @@ with patched_env(**base_env):
         fetch_remote_final_text=lambda *a, **k: "",
         load_chatgpt_auth=lambda: {"headers": {"Authorization": "Bearer fake"}, "user_id": "fake"},
     ):
-        result = advisor.call_compatible(prompt, "gpt-5-5-pro", 1)
+        result = advisor.call_compatible(prompt, "gpt-5-6-pro", 1)
         if result != "embedded final":
             raise SystemExit(f"Embedded conversation recovery failed: {result!r}")
+
+
+agent_progress = conversation_data("agent prompt", "Still inspecting files.", conv_id="conv-agent")
+agent_progress["mapping"]["a1"]["message"]["end_turn"] = False
+if advisor.latest_finished_assistant_text_for_prompt_data(agent_progress, "agent prompt"):
+    raise SystemExit("Agent progress text with end_turn=false was accepted as a final response.")
+agent_final = json.loads(json.dumps(agent_progress))
+agent_final["mapping"]["a2"] = {
+    "id": "a2",
+    "parent": "a1",
+    "message": {
+        "id": "a2",
+        "author": {"role": "assistant"},
+        "content": {"parts": ["REVIEWER REPORT\nFinal findings."]},
+        "status": "finished_successfully",
+        "end_turn": True,
+    },
+}
+agent_final["current_node"] = "a2"
+if advisor.latest_finished_assistant_text_for_prompt_data(agent_final, "agent prompt") != "REVIEWER REPORT\nFinal findings.":
+    raise SystemExit("Final agent response with end_turn=true was not recovered.")
+
+
+agent_state = project / ".codex-advisor" / "agent.conversation.json"
+agent_conv = {"conversation_id": "conv-agent", "message_id": "adapter-msg"}
+conversation_fetches = {"count": 0}
+
+
+def agent_get_json(url, *_args, **_kwargs):
+    if url.endswith("/stream_status"):
+        return {"status": "IS_STREAMING"}
+    conversation_fetches["count"] += 1
+    return agent_progress if conversation_fetches["count"] == 1 else agent_final
+
+
+with patched_env(
+    ADVISOR_FINAL_FETCH_TIMEOUT="2",
+    ADVISOR_FINAL_FETCH_POLL_SECONDS="0.5",
+    ADVISOR_FINAL_FETCH_MAX_POLLS="2",
+):
+    with patched(
+        advisor,
+        get_json=agent_get_json,
+        load_chatgpt_auth=lambda: {"headers": {"Authorization": "Bearer fake"}, "user_id": "fake"},
+        time=type("FakeTime", (), {"monotonic": staticmethod(__import__("time").monotonic), "sleep": staticmethod(lambda _seconds: None)}),
+    ):
+        result = advisor.fetch_remote_final_text(agent_state, agent_conv.copy(), "agent prompt", 2)
+if result != "REVIEWER REPORT\nFinal findings.":
+    raise SystemExit(f"Streaming agent final fetch failed: {result!r}")
+saved_agent = advisor.load_conversation(agent_state)
+if saved_agent.get("parent_message_id") != "a2":
+    raise SystemExit("Streaming agent recovery did not advance state to the final assistant message.")
 
 
 state = project / ".codex-advisor" / "conversation.json"
@@ -242,10 +294,10 @@ pro_ambiguous = conversation_data(
     "pro answer",
     conv_id="conv-pro",
     assistant_metadata={
-        "model_slug": "gpt-5-5-pro",
+        "model_slug": "gpt-5-6-pro",
         "resolved_model_slug": "gpt-5-3-mini",
-        "default_model_slug": "gpt-5-5-pro",
-        "thinking_effort": "extended",
+        "default_model_slug": "gpt-5-6-pro",
+        "thinking_effort": "standard",
     },
 )
 advisor.write_transcript(state, pro_ambiguous, advisor.transcript_from_conversation(pro_ambiguous))

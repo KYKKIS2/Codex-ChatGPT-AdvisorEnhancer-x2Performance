@@ -24,7 +24,7 @@ if (-not (Test-Path (Join-Path $G4f "g4f"))) {
 
 if ([string]::IsNullOrWhiteSpace($Model)) {
     if ([string]::IsNullOrWhiteSpace($env:G4F_MODEL)) {
-        $Model = "gpt-5-5-thinking"
+        $Model = "gpt-5-6-thinking"
     } else {
         $Model = $env:G4F_MODEL
     }

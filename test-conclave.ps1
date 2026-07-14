@@ -1,5 +1,5 @@
 param(
-    [string]$Model = "gpt-5-5-thinking",
+    [string]$Model = "gpt-5-6-thinking",
     [int]$Port = 8080
 )
 
@@ -14,6 +14,11 @@ $env:ADVISOR_BASE_URL = "http://127.0.0.1:$Port/v1"
 $env:ADVISOR_MODEL = $Model
 $env:ADVISOR_REASONING_EFFORT = "high"
 $env:ADVISOR_MAX_OUTPUT_TOKENS = "700"
+$env:ADVISOR_AUTO_CREATE_PROJECT = "false"
+$env:ADVISOR_PERSIST_CONVERSATION = "false"
+$env:ADVISOR_TEMPORARY = "true"
+$env:ADVISOR_SYNC_REMOTE = "false"
+$env:ADVISOR_AUTO_RETRY_TAIL_FRAGMENT = "false"
 
 try {
     New-Item -ItemType Directory -Force -Path $Project | Out-Null

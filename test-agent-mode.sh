@@ -26,7 +26,18 @@ printf 'safe\n' > "$PROJECT/README.md"
 git -C "$PROJECT" add README.md
 git -C "$PROJECT" commit -m "initial" >/dev/null
 
-printf '#!/usr/bin/env bash\necho fake devspace\n' > "$FAKE_BIN/devspace"
+cat > "$FAKE_BIN/devspace" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+if [[ "${1:-}" == "serve" ]]; then
+  echo "DevSpace listening at https://fake-devspace.trycloudflare.com"
+  sleep 300
+elif [[ "${1:-}" == "config" && "${2:-}" == "get" && "${3:-}" == "publicBaseUrl" ]]; then
+  echo "null"
+else
+  echo fake devspace
+fi
+EOF
 chmod +x "$FAKE_BIN/devspace"
 
 python3 "$SCRIPTS/agent_mode.py" \
@@ -306,5 +317,62 @@ python3 "$SCRIPTS/router.py" \
   --agent-bridge-executable "$FAKE_BIN/devspace" \
   --prompt "Decide the architecture for advisor memory" >/tmp/advisor-agent-router-exec.txt
 grep -q "Advisor Agent-Mode Handoff" /tmp/advisor-agent-router-exec.txt
+
+python3 "$SCRIPTS/advisor_agent_connect.py" \
+  prepare \
+  --project-dir "$PROJECT" \
+  --allowed-root "$PROJECT" \
+  --bridge-executable "$FAKE_BIN/devspace" \
+  --config-path "$CONFIG" \
+  --workspace-root "$WORKSPACES" \
+  --public-base-url "https://manual-devspace.trycloudflare.com" \
+  --task "Review via connected advisor." >/tmp/advisor-agent-connect-prepare.txt
+grep -q "chatgpt_connector_url: https://manual-devspace.trycloudflare.com/mcp" /tmp/advisor-agent-connect-prepare.txt
+grep -q "Advisor Agent-Mode Handoff" /tmp/advisor-agent-connect-prepare.txt
+
+if python3 "$SCRIPTS/advisor_agent_connect.py" \
+  prepare \
+  --project-dir "$PROJECT" \
+  --allowed-root "$PROJECT" \
+  --bridge-executable "$FAKE_BIN/devspace" \
+  --config-path "$CONFIG" \
+  --public-base-url "http://localhost:8080" >/tmp/advisor-agent-connect-bad-url.txt 2>&1; then
+  echo "Expected insecure ChatGPT connector URL to be rejected" >&2
+  exit 1
+fi
+grep -q "must use https" /tmp/advisor-agent-connect-bad-url.txt
+
+python3 "$SCRIPTS/advisor_agent_connect.py" \
+  serve \
+  --project-dir "$PROJECT" \
+  --allowed-root "$PROJECT" \
+  --bridge-executable "$FAKE_BIN/devspace" \
+  --config-path "$CONFIG" \
+  --workspace-root "$WORKSPACES" \
+  --runtime-root "$PROJECT_ROOT/runtime" \
+  --timeout 5 \
+  --task "Review via running bridge." >/tmp/advisor-agent-connect-serve.txt
+grep -q "chatgpt_connector_url: https://fake-devspace.trycloudflare.com/mcp" /tmp/advisor-agent-connect-serve.txt
+grep -q "devspace_pid:" /tmp/advisor-agent-connect-serve.txt
+
+python3 "$SCRIPTS/advisor_agent_connect.py" \
+  status \
+  --project-dir "$PROJECT" \
+  --runtime-root "$PROJECT_ROOT/runtime" >/tmp/advisor-agent-connect-status.json
+python3 - <<'PY' /tmp/advisor-agent-connect-status.json
+import json
+import sys
+data = json.load(open(sys.argv[1], encoding="utf-8"))
+if data.get("mcp_url") != "https://fake-devspace.trycloudflare.com/mcp":
+    raise SystemExit("wrong mcp_url in status")
+if not data.get("running"):
+    raise SystemExit("expected fake devspace process to be running")
+PY
+
+python3 "$SCRIPTS/advisor_agent_connect.py" \
+  stop \
+  --project-dir "$PROJECT" \
+  --runtime-root "$PROJECT_ROOT/runtime" >/tmp/advisor-agent-connect-stop.txt
+grep -q "stopped: yes" /tmp/advisor-agent-connect-stop.txt
 
 echo "Agent-mode tests passed."

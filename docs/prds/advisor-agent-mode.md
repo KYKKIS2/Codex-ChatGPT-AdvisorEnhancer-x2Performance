@@ -92,7 +92,7 @@ When complete, Codex should have durable scripts/docs/instructions for:
 ## Constraints
 
 - Preserve existing environment variables and CLI behavior for prompt-only advisor calls, except where new route-selection flags are explicitly added.
-- Preserve `gpt-5-5-thinking` plus `thinking_effort=extended` as the normal advisor route and `ADVISOR_THINKING_EFFORT=pro-extended` as the hard-question route.
+- Preserve `gpt-5-6-thinking` plus `thinking_effort=max` as the normal advisor route and `ADVISOR_THINKING_EFFORT=pro-extended` as the hard-question route.
 - Preserve `.codex-advisor/` state layout for normal advisor, conclave, router, verifier, and project binding.
 - Preserve setup scripts for g4f/HAR advisor use unless a change is explicitly needed for default agent-mode setup or detection.
 - Use project-local docs and tests; do not rely on this chat history.

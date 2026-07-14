@@ -1,5 +1,5 @@
 param(
-    [string]$Model = "gpt-5-5-thinking",
+    [string]$Model = "gpt-5-6-thinking",
     [int]$Port = 8080
 )
 

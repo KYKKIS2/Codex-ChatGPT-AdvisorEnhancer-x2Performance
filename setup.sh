@@ -62,10 +62,12 @@ chmod +x \
   "$ROOT/test-ranking.sh" \
   "$ROOT/test-eval-harness.sh" \
   "$ROOT/test-advisor-transport-recovery.sh" \
+  "$ROOT/test-advisor-live-activity.sh" \
   "$ROOT/test-security-regressions.sh" \
   "$ROOT/test-agent-mode.sh" \
   "$ROOT/codex-skill/external-advisor/scripts/agent_mode.py" \
-  "$ROOT/codex-skill/external-advisor/scripts/advisor_agent_setup.py" 2>/dev/null || true
+  "$ROOT/codex-skill/external-advisor/scripts/advisor_agent_setup.py" \
+  "$ROOT/codex-skill/external-advisor/scripts/advisor_agent_connect.py" 2>/dev/null || true
 
 mkdir -p "$SKILLS_DEST"
 for skill_dir in "$SKILLS_SOURCE"/*; do
@@ -86,7 +88,7 @@ payload = {
     "setup_dir": os.environ["ROOT"],
     "start_g4f": os.environ["START_G4F"],
     "base_url": "http://127.0.0.1:8080/v1",
-    "model": "gpt-5-5-thinking",
+    "model": "gpt-5-6-thinking",
 }
 path = Path(os.environ["SKILL_CONFIG"])
 path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
@@ -99,5 +101,8 @@ Pinned gpt4free ref: $GPT4FREE_REF
 Next steps:
 1. Put your ChatGPT HAR file in: $G4F/har_and_cookies
 2. Start the local API: ./start-g4f.sh
-3. Restart Codex so it discovers the bundled skills.
+3. For repo-aware ChatGPT agent mode, run from a project:
+   python3 ~/.codex/skills/external-advisor/scripts/advisor_agent_connect.py serve --project-dir .
+   Then paste the printed /mcp URL into ChatGPT Developer Mode.
+4. Restart Codex so it discovers the bundled skills.
 EOF

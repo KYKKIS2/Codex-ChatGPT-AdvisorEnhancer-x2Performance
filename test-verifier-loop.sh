@@ -9,7 +9,7 @@ LATEST="$PROJECT/.codex-advisor/latest-verifier-loop.json"
 
 export ADVISOR_PROVIDER="openai-compatible"
 export ADVISOR_BASE_URL="${ADVISOR_BASE_URL:-http://127.0.0.1:8080/v1}"
-export ADVISOR_MODEL="${ADVISOR_MODEL:-gpt-5-5-thinking}"
+export ADVISOR_MODEL="${ADVISOR_MODEL:-gpt-5-6-thinking}"
 export ADVISOR_REASONING_EFFORT="high"
 export ADVISOR_MAX_OUTPUT_TOKENS="700"
 

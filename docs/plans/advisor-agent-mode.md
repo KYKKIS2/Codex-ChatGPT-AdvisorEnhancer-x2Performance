@@ -235,6 +235,7 @@ Rollback:
 - Added `advisor_agent_setup.py` with user-level allowed-root config writing, exact project-root defaults, config-path safety checks, and no DevSpace/tunnel/ChatGPT side effects.
 - Added agent-mode secret preflight scanning for `.env*`, HAR/cookie/auth files, key material, wallets/seeds, browser profiles, symlink escapes, secret-looking config contents, and unsafe `.codex-advisor` state.
 - Added automatic sanitized review workspace generation under `~/.codex/advisor-agent/workspaces/`, including deterministic rebuilds, conservative skip rules, a Markdown marker, and `SANITIZED_WORKSPACE_MANIFEST.json`.
+- Added `advisor_agent_connect.py` so an explicit user/Codex command can validate the local project, start a trusted DevSpace bridge, print the exact ChatGPT `/mcp` connector URL, and emit the review-first handoff. Setup, doctor, and router dry runs remain passive.
 - Updated `router.py` so suitable non-trivial advisor routes prefer `agent-mode` only when safe allowed-root and bridge configuration validate; otherwise existing prompt-only advisor/conclave/verifier behavior remains the fallback.
 - Added `--prompt-only`, agent-mode route flags, and route metadata for transparent fallback/selection.
 - Updated README, skill instructions, setup chmods, and tests.

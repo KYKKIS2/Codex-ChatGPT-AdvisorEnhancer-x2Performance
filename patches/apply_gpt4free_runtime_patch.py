@@ -40,6 +40,14 @@ def patch_openai_model_registry(g4f: Path) -> None:
     text = path.read_text(encoding="utf-8")
     changed = False
 
+    if '"gpt-5-6-thinking"' not in text:
+        text = text.replace(
+            'text_models = [default_model, ',
+            'text_models = [default_model, "gpt-5-6-thinking", "gpt-5-6-pro", "gpt-5.6-sol-wm", "gpt-5.6-terra-wm", "gpt-5.6-luna-wm", ',
+            1,
+        )
+        changed = True
+
     if '"gpt-5-5-thinking"' not in text:
         needle = 'text_models = [default_model, '
         replacement = (
@@ -53,6 +61,27 @@ def patch_openai_model_registry(g4f: Path) -> None:
         changed = True
     if '"gpt-5-pro"' not in text:
         text = text.replace('"gpt-5-5-pro", ', '"gpt-5-5-pro", "gpt-5-pro", ', 1)
+        changed = True
+
+    if '"gpt-5.6-sol": "gpt-5-6-thinking"' not in text:
+        needle = 'model_aliases = {\n'
+        block = (
+            '    "gpt-5.6": "gpt-5-6-thinking",\n'
+            '    "gpt-5_6": "gpt-5-6-thinking",\n'
+            '    "gpt-5-6": "gpt-5-6-thinking",\n'
+            '    "gpt-5.6-sol": "gpt-5-6-thinking",\n'
+            '    "gpt-5-6-sol": "gpt-5-6-thinking",\n'
+            '    "gpt-5_6_sol": "gpt-5-6-thinking",\n'
+            '    "gpt-5.6-pro": "gpt-5-6-pro",\n'
+            '    "gpt-5_6_pro": "gpt-5-6-pro",\n'
+            '    "gpt-5.6-terra": "gpt-5.6-terra-wm",\n'
+            '    "gpt-5-6-terra": "gpt-5.6-terra-wm",\n'
+            '    "gpt-5_6_terra": "gpt-5.6-terra-wm",\n'
+            '    "gpt-5.6-luna": "gpt-5.6-luna-wm",\n'
+            '    "gpt-5-6-luna": "gpt-5.6-luna-wm",\n'
+            '    "gpt-5_6_luna": "gpt-5.6-luna-wm",\n'
+        )
+        text, _ = replace_once(text, needle, needle + block, "OpenAI GPT-5.6 model_aliases declaration")
         changed = True
 
     if '"gpt-5.5-thinking": "gpt-5-5-thinking"' not in text:
@@ -84,6 +113,24 @@ def patch_any_model_map(g4f: Path) -> None:
     text = path.read_text(encoding="utf-8")
     changed = False
 
+    gpt56_vision_prefix = (
+        "vision_models = ['gpt-5-6-thinking', 'gpt-5-6-pro', "
+        "'gpt-5.6-sol-wm', 'gpt-5.6-terra-wm', 'gpt-5.6-luna-wm', "
+    )
+    stale_gpt56_vision_prefix = "vision_models = ['gpt-5-6-sol', 'gpt-5-6-terra', 'gpt-5-6-luna', "
+    if stale_gpt56_vision_prefix in text:
+        text, _ = replace_once(
+            text,
+            stale_gpt56_vision_prefix,
+            gpt56_vision_prefix,
+            "stale any_model_map GPT-5.6 vision_models declaration",
+        )
+        changed = True
+    elif gpt56_vision_prefix not in text:
+        needle = "vision_models = ["
+        text, _ = replace_once(text, needle, gpt56_vision_prefix, "any_model_map GPT-5.6 vision_models declaration")
+        changed = True
+
     if "'gpt-5-5-thinking'" not in text:
         needle = "vision_models = ["
         replacement = "vision_models = ['gpt-5-5', 'gpt-5-5-instant', 'gpt-5-5-thinking', 'gpt-5-5-pro', "
@@ -94,6 +141,40 @@ def patch_any_model_map(g4f: Path) -> None:
         changed = True
     if "'gpt-5-pro'" not in text:
         text = text.replace("'gpt-5-5-pro', ", "'gpt-5-5-pro', 'gpt-5-pro', ", 1)
+        changed = True
+
+    if '"gpt-5-6-thinking": {' not in text:
+        needle = '  "gpt-5-5": {\n'
+        block = (
+            '  "gpt-5-6-thinking": {\n'
+            '    "OpenaiChat": "gpt-5-6-thinking"\n'
+            '  },\n'
+            '  "gpt-5-6-pro": {\n'
+            '    "OpenaiChat": "gpt-5-6-pro"\n'
+            '  },\n'
+            '  "gpt-5.6-sol-wm": {\n'
+            '    "OpenaiChat": "gpt-5.6-sol-wm"\n'
+            '  },\n'
+            '  "gpt-5.6-terra-wm": {\n'
+            '    "OpenaiChat": "gpt-5.6-terra-wm"\n'
+            '  },\n'
+            '  "gpt-5.6-luna-wm": {\n'
+            '    "OpenaiChat": "gpt-5.6-luna-wm"\n'
+            '  },\n'
+            '  "gpt-5-6-sol": {\n'
+            '    "OpenaiChat": "gpt-5-6-thinking"\n'
+            '  },\n'
+            '  "gpt-5-6-terra": {\n'
+            '    "OpenaiChat": "gpt-5.6-terra-wm"\n'
+            '  },\n'
+            '  "gpt-5-6-luna": {\n'
+            '    "OpenaiChat": "gpt-5.6-luna-wm"\n'
+            '  },\n'
+            '  "gpt-5-6": {\n'
+            '    "OpenaiChat": "gpt-5-6-thinking"\n'
+            '  },\n'
+        )
+        text, _ = replace_once(text, needle, block + needle, "any_model_map GPT-5.6 model map")
         changed = True
 
     if '"gpt-5-5-thinking": {' not in text:
@@ -141,6 +222,23 @@ def patch_any_model_map(g4f: Path) -> None:
             '  },\n',
             1,
         )
+        changed = True
+
+    if '"gpt-5.6-sol": "gpt-5-6-thinking"' not in text:
+        needle = '  "gpt-5.5": "gpt-5-5",\n'
+        block = (
+            '  "gpt-5.6": "gpt-5-6-thinking",\n'
+            '  "gpt-5_6": "gpt-5-6-thinking",\n'
+            '  "gpt-5.6-sol": "gpt-5-6-thinking",\n'
+            '  "gpt-5_6_sol": "gpt-5-6-thinking",\n'
+            '  "gpt-5.6-pro": "gpt-5-6-pro",\n'
+            '  "gpt-5_6_pro": "gpt-5-6-pro",\n'
+            '  "gpt-5.6-terra": "gpt-5.6-terra-wm",\n'
+            '  "gpt-5_6_terra": "gpt-5.6-terra-wm",\n'
+            '  "gpt-5.6-luna": "gpt-5.6-luna-wm",\n'
+            '  "gpt-5_6_luna": "gpt-5.6-luna-wm",\n'
+        )
+        text, _ = replace_once(text, needle, block + needle, "any_model_map GPT-5.6 aliases")
         changed = True
 
     if '"gpt-5.5-thinking": "gpt-5-5-thinking"' not in text:
@@ -237,6 +335,17 @@ def patch_openai_chat(g4f: Path) -> None:
     )
     if text.count("data[\"thinking_effort\"] = thinking_effort") < 2:
         text, _ = replace_once(text, needle, replacement, "OpenaiChat conversation payload insertion point")
+        changed = True
+
+    if "use_prepare = not (model.endswith(\"-pro\") and thinking_effort is not None)" not in text:
+        text, _ = replace_once(
+            text,
+            "                conduit_token = None\n                if cls._api_key is not None:\n",
+            "                conduit_token = None\n"
+            "                use_prepare = not (model.endswith(\"-pro\") and thinking_effort is not None)\n"
+            "                if cls._api_key is not None and use_prepare:\n",
+            "OpenaiChat Pro conduit prewarm guard",
+        )
         changed = True
 
     pro_streaming_prepare_block = (
@@ -485,9 +594,13 @@ def verify_markers(g4f: Path) -> None:
         '"force_parallel_switch": "auto"': openai_chat,
         "def get_resume_turn_topic_id": openai_chat,
         "iter_conversation_turn_ws": openai_chat,
+        '"gpt-5-6-thinking"': openai_models,
+        '"gpt-5-6-pro"': openai_models,
         '"gpt-5-5-thinking"': openai_models,
         '"gpt-5-5-pro"': openai_models,
         '"gpt-5-pro"': openai_models,
+        '"gpt-5-6-thinking": {': any_model_map,
+        '"gpt-5-6-pro": {': any_model_map,
         '"gpt-5-5-thinking": {': any_model_map,
         '"gpt-5-5-pro": {': any_model_map,
         '"OpenaiChat": "gpt-5-pro"': any_model_map,
