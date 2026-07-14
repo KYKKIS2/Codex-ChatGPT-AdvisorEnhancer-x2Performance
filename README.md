@@ -161,7 +161,7 @@ sudo apt install -y git python3 python3-pip python3-venv
 Run setup:
 
 ```bash
-chmod +x setup.sh start-g4f.sh test-advisor.sh test-conclave.sh test-router.sh test-context-pack.sh test-verifier-loop.sh test-memory.sh test-ranking.sh test-eval-harness.sh test-advisor-transport-recovery.sh test-advisor-live-activity.sh test-security-regressions.sh test-agent-mode.sh codex-skill/external-advisor/scripts/advisor_agent_connect.py
+chmod +x setup.sh start-g4f.sh test-advisor.sh test-conclave.sh test-router.sh test-context-pack.sh test-verifier-loop.sh test-memory.sh test-ranking.sh test-eval-harness.sh test-advisor-transport-recovery.sh test-advisor-live-activity.sh test-advisor-concurrency.sh test-security-regressions.sh test-agent-mode.sh codex-skill/external-advisor/scripts/advisor_agent_connect.py
 ./setup.sh
 ```
 
@@ -214,8 +214,27 @@ Ubuntu/Linux:
 ```
 
 If `vendor/gpt4free` is missing, the start script will run setup automatically before starting the API.
-If port `8080` is already in use, stop the existing server or start on another port with `.\start-g4f.ps1 -Port 8081` or `G4F_PORT=8081 ./start-g4f.sh`.
+The starter supervises two isolated g4f worker processes by default, on ports `8080` and `8081`. Set `G4F_WORKERS=1` for a single-worker diagnostic, or change the base port with `.\start-g4f.ps1 -Port 8180` or `G4F_PORT=8180 ./start-g4f.sh`. All required worker ports must be available. A second starter invocation reuses the healthy machine-wide pool instead of launching competing processes.
 Debug logging is off by default. Use `.\start-g4f.ps1 -DebugLog` or `G4F_DEBUG=true ./start-g4f.sh` only when troubleshooting.
+
+### Concurrent Advisor Calls
+
+Every local `advisor.py` invocation automatically uses the machine-wide coordinator under `~/.codex/advisor-runtime/`. Callers should keep `ADVISOR_BASE_URL=http://127.0.0.1:8080/v1`; the coordinator reads the private pool manifest and leases an available worker itself.
+
+- Different saved conversations can run concurrently, up to the worker count.
+- Calls targeting the same conversation state are serialized, even across repos or Codex sessions when they share a conversation id.
+- Excess calls wait in a cross-process FIFO queue instead of hitting one g4f process simultaneously.
+- Repeated transport failures across workers temporarily reduce capacity to one worker. This limits pressure on a fragile ChatGPT web session while preserving the normal route.
+- Ambiguous `401`, `403`, `422`, stream, or connection failures are not blindly replayed. Only an explicit missing-conversation response can clear stale state and retry once.
+
+Use the normal advisor wrapper rather than posting directly to `/v1/chat/completions`; direct calls bypass conversation locks, worker leasing, transcript recovery, and route validation. Inspect the pool without exposing HAR or auth data:
+
+```bash
+python3 ~/.codex/skills/external-advisor/scripts/g4f_pool.py status
+python3 ~/.codex/skills/external-advisor/scripts/g4f_pool.py stop
+```
+
+For a bounded conclave that should use both workers, pass `--parallel`. The coordinator still serializes roles that intentionally share one state file. Environment controls for diagnostics are `G4F_WORKERS`, `G4F_WORKER_PORT_STEP`, `ADVISOR_QUEUE_TIMEOUT`, `ADVISOR_POOL_ENABLED`, and `ADVISOR_COORDINATION`; disabling coordination is unsafe for normal browser-backed calls.
 
 ## Default Repo-Aware Agent Mode
 
@@ -445,6 +464,7 @@ These tests do not require a live advisor endpoint:
 .\test-router.ps1
 .\test-context-pack.ps1
 .\test-verifier-loop.ps1
+.\test-advisor-concurrency.ps1
 .\test-memory.ps1
 .\test-ranking.ps1
 .\test-eval-harness.ps1
@@ -456,13 +476,14 @@ These tests do not require a live advisor endpoint:
 ./test-verifier-loop.sh
 ./test-advisor-transport-recovery.sh
 ./test-advisor-live-activity.sh
+./test-advisor-concurrency.sh
 ./test-agent-mode.sh
 ./test-memory.sh
 ./test-ranking.sh
 ./test-eval-harness.sh
 ```
 
-The router test confirms task types map to the intended advisor path. The context-pack test creates `.codex-advisor/latest-context-pack.json`. The verifier-loop dry run creates `.codex-advisor/latest-verifier-loop.json` and runs a harmless local command as evidence. The advisor transport recovery test covers empty Pro/extended bodies, stale transcript refusal, and embedded conversation recovery. The live-activity test covers EOF-only tailing, safe event projection, heartbeat output, fail-closed log discovery, explicit disablement, and unchanged final-response transport. The agent-mode test covers root validation, config-driven setup, automatic sanitized review workspaces, secret preflight fallback when sanitization is disabled, safe route-log exceptions, symlink denial, and deterministic handoff generation. The memory test initializes searchable memory and records a sample decision/outcome. The ranking test confirms conclave JSON includes role rankings. The eval harness test confirms the benchmark structure.
+The router test confirms task types map to the intended advisor path. The context-pack test creates `.codex-advisor/latest-context-pack.json`. The verifier-loop dry run creates `.codex-advisor/latest-verifier-loop.json` and runs a harmless local command as evidence. The advisor transport recovery test covers empty Pro/extended bodies, stale transcript refusal, embedded conversation recovery, and fail-closed ambiguous errors. The live-activity test covers EOF-only tailing, safe event projection, heartbeat output, fail-closed log discovery, explicit disablement, and unchanged final-response transport. The concurrency test covers FIFO worker leases, same-conversation serialization, first-turn state transitions, pool degradation, duplicate startup suppression, supervisor cleanup, and the `advisor.py` coordination boundary. The agent-mode test covers root validation, config-driven setup, automatic sanitized review workspaces, secret preflight fallback when sanitization is disabled, safe route-log exceptions, symlink denial, and deterministic handoff generation. The memory test initializes searchable memory and records a sample decision/outcome. The ranking test confirms conclave JSON includes role rankings. The eval harness test confirms the benchmark structure.
 
 ## Use From Codex
 
@@ -783,7 +804,7 @@ Each role gets its own project-local memory:
 
 Text and JSON role memories are intentionally separated so machine-format runs do not make the online readable ChatGPT chats awkward to use.
 
-By default, role calls run serially because browser-backed ChatGPT bridges can be fragile under concurrent calls. Add `--parallel` only after the local endpoint proves it can handle concurrency reliably.
+Conclave roles remain serial by default. Add `--parallel` to use the supervised worker pool; the machine-wide coordinator caps concurrency, queues excess roles, and prevents two roles from mutating the same saved conversation simultaneously.
 
 Conclave uses readable text by default. For machine parsing, validation, or internal automation, request JSON explicitly:
 

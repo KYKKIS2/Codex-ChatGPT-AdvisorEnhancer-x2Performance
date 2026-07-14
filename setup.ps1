@@ -76,6 +76,7 @@ Get-ChildItem -Directory -Path $SkillsSource | ForEach-Object {
     start_g4f = (Join-Path $Root "start-g4f.ps1")
     base_url = "http://127.0.0.1:8080/v1"
     model = "gpt-5-6-thinking"
+    workers = 2
 } | ConvertTo-Json | Set-Content -Encoding UTF8 -Path $SkillConfig
 
 Write-Host ""

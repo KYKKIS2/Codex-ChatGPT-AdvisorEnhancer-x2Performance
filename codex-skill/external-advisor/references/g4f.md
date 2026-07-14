@@ -15,12 +15,16 @@ The HAR file must be placed in:
 vendor\gpt4free\har_and_cookies
 ```
 
+The starter supervises two isolated workers by default on `8080` and `8081`. `advisor.py` discovers them through the private machine-wide manifest, serializes calls to the same saved ChatGPT conversation, and leases different workers to independent conversations. Keep callers pointed at the base URL rather than selecting `8081` directly. Use `G4F_WORKERS=1` only for a bounded diagnostic.
+
+Inspect or stop the pool with `python3 ~/.codex/skills/external-advisor/scripts/g4f_pool.py status` and `python3 ~/.codex/skills/external-advisor/scripts/g4f_pool.py stop`.
+
 Recommended local settings:
 
 ```powershell
 $env:ADVISOR_PROVIDER = "openai-compatible"
 $env:ADVISOR_BASE_URL = "http://127.0.0.1:8080/v1"
-$env:ADVISOR_MODEL = "gpt-5-5-thinking"
+$env:ADVISOR_MODEL = "gpt-5-6-thinking"
 $env:ADVISOR_REASONING_EFFORT = "high"
 ```
 
@@ -35,4 +39,5 @@ Boundary:
 - Do not commit or print HAR/cookie contents.
 - Do not rely on `OPENAI_API_KEY` for local compatible mode; set `ADVISOR_API_KEY` only if the compatible endpoint requires a token.
 - Do not assume local `g4f` behavior exactly matches official OpenAI API behavior.
+- Do not post directly to `/v1/chat/completions`; that bypasses cross-session worker leasing and conversation locks.
 - Treat external output as advisory critique and verify important claims.

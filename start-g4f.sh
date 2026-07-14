@@ -4,9 +4,11 @@ set -euo pipefail
 MODEL="${1:-${G4F_MODEL:-gpt-5-6-thinking}}"
 PROVIDER="${G4F_PROVIDER:-OpenaiAccount}"
 PORT="${G4F_PORT:-8080}"
+WORKERS="${G4F_WORKERS:-2}"
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 G4F="$ROOT/vendor/gpt4free"
 PY="$G4F/.venv/bin/python"
+POOL="$ROOT/codex-skill/external-advisor/scripts/g4f_pool.py"
 
 if [[ ! -d "$G4F/g4f" ]]; then
   SETUP="$ROOT/setup.sh"
@@ -34,44 +36,21 @@ if [[ -f "$RUNTIME_PATCH" ]]; then
   python3 "$RUNTIME_PATCH" "$G4F" >/dev/null
 fi
 
-can_bind_port() {
-  "$PY" - "$PORT" <<'PY'
-import socket
-import sys
-
-port = int(sys.argv[1])
-sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-try:
-    sock.bind(("127.0.0.1", port))
-except OSError:
-    sys.exit(1)
-finally:
-    sock.close()
-PY
-}
-
-port_ready=false
-for _ in $(seq 1 "${G4F_PORT_WAIT_SECONDS:-15}"); do
-  if can_bind_port; then
-    port_ready=true
-    break
-  fi
-  sleep 1
-done
-
-if [[ "$port_ready" != true ]]
-then
-  echo "Port $PORT is already in use. Stop the existing g4f server or set G4F_PORT to another port." >&2
+if [[ ! -f "$POOL" ]]; then
+  echo "g4f worker-pool supervisor was not found: $POOL" >&2
   exit 1
 fi
 
-echo "Starting g4f API on http://127.0.0.1:$PORT/v1"
-echo "Provider: $PROVIDER"
-echo "Model: $MODEL"
-
-cd "$G4F"
-ARGS=(-m g4f api --port "$PORT")
+ARGS=(
+  "$POOL" serve
+  --python "$PY"
+  --g4f-dir "$G4F"
+  --port "$PORT"
+  --workers "$WORKERS"
+  --model "$MODEL"
+  --provider "$PROVIDER"
+)
 if [[ "${G4F_DEBUG:-}" =~ ^(1|true|yes|on)$ ]]; then
   ARGS+=(--debug)
 fi
-"$PY" "${ARGS[@]}"
+exec "$PY" "${ARGS[@]}"

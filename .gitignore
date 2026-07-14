@@ -1,6 +1,13 @@
+# Vendored dependencies and generated runtime state
 vendor/
 har_and_cookies/
 .codex-advisor/
+.codex/
+.devspace/
+.cloudflared/
+advisor-config.json
+
+# Browser/session authentication exports
 *.har
 *.cookie.json
 *.cookies.json
@@ -8,10 +15,45 @@ auth_*.json
 conversation.json
 transcript.json
 transcript.md
-__pycache__/
-*.pyc
+
+# Environment and machine-local credentials
 .env
 .env.*
 !.env.example
 secrets.env
+.netrc
+.npmrc
+.pypirc
+credentials*.json
+client_secret*.json
+service-account*.json
+service_account*.json
+*.credentials.json
+
+# Private keys, signing stores, and VPN profiles
+*.pem
+*.key
+*.p12
+*.pfx
+*.jks
+*.keystore
+*.kdbx
+id_rsa
+id_rsa.*
+id_ed25519
+id_ed25519.*
+*.ovpn
+wg*.conf
+
+# Generated Python, databases, logs, and editor backups
+__pycache__/
+*.pyc
+*.db
+*.sqlite
+*.sqlite3
 *.log
+*.bak
+*.swp
+*.swo
+*~
+.DS_Store

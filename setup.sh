@@ -63,6 +63,7 @@ chmod +x \
   "$ROOT/test-eval-harness.sh" \
   "$ROOT/test-advisor-transport-recovery.sh" \
   "$ROOT/test-advisor-live-activity.sh" \
+  "$ROOT/test-advisor-concurrency.sh" \
   "$ROOT/test-security-regressions.sh" \
   "$ROOT/test-agent-mode.sh" \
   "$ROOT/codex-skill/external-advisor/scripts/agent_mode.py" \
@@ -89,6 +90,7 @@ payload = {
     "start_g4f": os.environ["START_G4F"],
     "base_url": "http://127.0.0.1:8080/v1",
     "model": "gpt-5-6-thinking",
+    "workers": 2,
 }
 path = Path(os.environ["SKILL_CONFIG"])
 path.write_text(json.dumps(payload, indent=2), encoding="utf-8")

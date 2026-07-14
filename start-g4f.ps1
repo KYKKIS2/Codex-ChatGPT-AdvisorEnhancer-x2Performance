@@ -9,6 +9,7 @@ $ErrorActionPreference = "Stop"
 $Root = Split-Path -Parent $MyInvocation.MyCommand.Path
 $G4f = Join-Path $Root "vendor\gpt4free"
 $Py = Join-Path $G4f ".venv\Scripts\python.exe"
+$Pool = Join-Path $Root "codex-skill\external-advisor\scripts\g4f_pool.py"
 
 if (-not (Test-Path (Join-Path $G4f "g4f"))) {
     $Setup = Join-Path $Root "setup.ps1"
@@ -42,49 +43,24 @@ if (Test-Path $RuntimePatch) {
     & python $RuntimePatch $G4f | Out-Null
 }
 
-function Test-PortBindable {
-    param([int]$PortToCheck)
-    $listener = $null
-    try {
-        $listener = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Parse("127.0.0.1"), $PortToCheck)
-        $listener.Start()
-        return $true
-    }
-    catch {
-        return $false
-    }
-    finally {
-        if ($listener) {
-            $listener.Stop()
-        }
-    }
+if (-not (Test-Path $Pool)) {
+    throw "g4f worker-pool supervisor was not found: $Pool"
 }
 
-$portReady = $false
-$waitSeconds = if ($env:G4F_PORT_WAIT_SECONDS) { [int]$env:G4F_PORT_WAIT_SECONDS } else { 15 }
-for ($i = 0; $i -lt $waitSeconds; $i++) {
-    if (Test-PortBindable -PortToCheck $Port) {
-        $portReady = $true
-        break
-    }
-    Start-Sleep -Seconds 1
-}
-if (-not $portReady) {
-    throw "Port $Port is already in use. Stop the existing g4f server or start this one with -Port <other-port>."
+$Workers = if ($env:G4F_WORKERS) { [int]$env:G4F_WORKERS } else { 2 }
+$poolArgs = @(
+    $Pool,
+    "serve",
+    "--python", $Py,
+    "--g4f-dir", $G4f,
+    "--port", $Port,
+    "--workers", $Workers,
+    "--model", $Model,
+    "--provider", $Provider
+)
+if ($DebugLog -or $env:G4F_DEBUG -in @("1", "true", "yes", "on")) {
+    $poolArgs += "--debug"
 }
 
-Write-Host "Starting g4f API on http://127.0.0.1:$Port/v1"
-Write-Host "Provider: $Provider"
-Write-Host "Model: $Model"
-
-Push-Location $G4f
-try {
-    $apiArgs = @("-m", "g4f", "api", "--port", "$Port")
-    if ($DebugLog -or $env:G4F_DEBUG -in @("1", "true", "yes", "on")) {
-        $apiArgs += "--debug"
-    }
-    & $Py @apiArgs
-}
-finally {
-    Pop-Location
-}
+& $Py @poolArgs
+exit $LASTEXITCODE

@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any
 
 import activity_monitor
+import advisor_concurrency as concurrency
 import advisor_safety as safety
 
 
@@ -711,17 +712,10 @@ def remove_state_files(state_path: Path) -> None:
 def stale_conversation_error(exc: RuntimeError) -> bool:
     text = str(exc)
     markers = (
-        "HTTP 401",
-        "HTTP 403",
         "HTTP 404",
+        "HTTP 410",
         "conversation_deleted",
         "conversation_not_found",
-        "conversation_inaccessible",
-        "Invalid conversation body",
-        "invalid conversation body",
-        "invalid_conversation",
-        "Response 422",
-        "HTTP 422",
     )
     return any(marker in text for marker in markers)
 
@@ -1809,6 +1803,22 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def coordinated_state_path(timeout: int) -> Path | None:
+    persist = os.environ.get("ADVISOR_PERSIST_CONVERSATION", "true").lower() in ("1", "true", "yes")
+    temporary = os.environ.get("ADVISOR_TEMPORARY", "false").lower() in ("1", "true", "yes")
+    if not persist or temporary:
+        return None
+    with concurrency.project_binding_lock(advisor_project_dir()):
+        chatgpt_project_id(timeout, allow_create=True)
+        return default_state_path()
+
+
+def write_guidance_outputs(args: argparse.Namespace, guidance: str) -> list[Path]:
+    if args.save:
+        safety.atomic_write_text(Path(args.save), guidance)
+    return [path for path in latest_response_paths() if write_latest_response(path, guidance)]
+
+
 def main() -> int:
     configure_stdio()
     args = parse_args()
@@ -1830,11 +1840,34 @@ def main() -> int:
         print("Provide --prompt or pipe text on stdin.", file=sys.stderr)
         return 2
 
-    guidance = call_openai(prompt, args.model, args.timeout) if args.provider == "openai" else call_compatible(prompt, args.model, args.timeout)
+    if args.provider == "openai":
+        guidance = call_openai(prompt, args.model, args.timeout)
+        written_latest_paths = write_guidance_outputs(args, guidance)
+    else:
+        configured_base_url = os.environ.get("ADVISOR_BASE_URL", "http://127.0.0.1:8080/v1").rstrip("/")
+        state_path = coordinated_state_path(args.timeout)
+        with concurrency.coordinated_call(
+            configured_base_url,
+            state_path,
+            request_timeout=args.timeout,
+        ) as lease:
+            previous_base_url = os.environ.get("ADVISOR_BASE_URL")
+            os.environ["ADVISOR_BASE_URL"] = lease.url
+            try:
+                guidance = call_compatible(prompt, args.model, args.timeout)
+                written_latest_paths = write_guidance_outputs(args, guidance)
+            except BaseException as exc:
+                if concurrency.transport_failure(exc):
+                    lease.report_failure()
+                raise
+            else:
+                lease.report_success()
+            finally:
+                if previous_base_url is None:
+                    os.environ.pop("ADVISOR_BASE_URL", None)
+                else:
+                    os.environ["ADVISOR_BASE_URL"] = previous_base_url
 
-    if args.save:
-        safety.atomic_write_text(Path(args.save), guidance)
-    written_latest_paths = [path for path in latest_response_paths() if write_latest_response(path, guidance)]
     if written_latest_paths:
         print(
             "Advisor latest-response saved: " + ", ".join(str(path) for path in written_latest_paths),

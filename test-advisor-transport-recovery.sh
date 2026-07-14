@@ -313,24 +313,49 @@ with patched_env(**base_env):
     state_path.write_text(json.dumps({"conversation": {"conversation_id": "bad-conv", "message_id": "bad-msg"}}), encoding="utf-8")
     calls = {"count": 0}
 
-    def post_then_recover(*_args, **_kwargs):
+    def post_ambiguous(*_args, **_kwargs):
         calls["count"] += 1
-        if calls["count"] == 1:
-            raise RuntimeError("HTTP 500 from local adapter: ResponseStatusError: Response 422: {'detail': 'Invalid conversation body'}")
-        return fake_chat_response("fresh recovered", conv_id="new-conv")
+        raise RuntimeError("HTTP 500 from local adapter: ResponseStatusError: Response 422: {'detail': 'Invalid conversation body'}")
 
     with patched(
         advisor,
-        post_json=post_then_recover,
+        post_json=post_ambiguous,
         sync_remote_conversation=lambda *a, **k: a[1],
         fetch_remote_final_text=lambda *a, **k: "",
         load_chatgpt_auth=lambda: {"headers": {"Authorization": "Bearer fake"}, "user_id": "fake"},
     ):
-        result = advisor.call_compatible("retry prompt", "gpt-5-5-thinking", 1)
+        try:
+            advisor.call_compatible("ambiguous prompt", "gpt-5-5-thinking", 1)
+        except RuntimeError as exc:
+            if "Invalid conversation body" not in str(exc):
+                raise SystemExit(f"Ambiguous failure changed unexpectedly: {exc}") from exc
+        else:
+            raise SystemExit("Ambiguous 422 failure was retried instead of failing closed.")
+        if calls["count"] != 1:
+            raise SystemExit(f"Ambiguous failure performed an unsafe retry: {calls['count']}")
+        if not state_path.exists():
+            raise SystemExit("Ambiguous failure removed conversation state.")
+
+    calls["count"] = 0
+
+    def post_missing_then_recover(*_args, **_kwargs):
+        calls["count"] += 1
+        if calls["count"] == 1:
+            raise RuntimeError("HTTP 404 from local adapter: conversation_not_found")
+        return fake_chat_response("fresh recovered", conv_id="new-conv")
+
+    with patched(
+        advisor,
+        post_json=post_missing_then_recover,
+        sync_remote_conversation=lambda *a, **k: a[1],
+        fetch_remote_final_text=lambda *a, **k: "",
+        load_chatgpt_auth=lambda: {"headers": {"Authorization": "Bearer fake"}, "user_id": "fake"},
+    ):
+        result = advisor.call_compatible("missing prompt", "gpt-5-5-thinking", 1)
         if result != "fresh recovered":
-            raise SystemExit(f"Invalid conversation retry did not return fresh response: {result!r}")
+            raise SystemExit(f"Missing conversation retry did not return fresh response: {result!r}")
         if calls["count"] != 2:
-            raise SystemExit(f"Invalid conversation retry did not call post twice: {calls['count']}")
+            raise SystemExit(f"Missing conversation retry did not call post twice: {calls['count']}")
 
 print("Advisor transport recovery tests passed.")
 PY
