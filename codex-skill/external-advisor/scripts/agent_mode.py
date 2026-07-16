@@ -18,11 +18,13 @@ import re
 import shutil
 import subprocess
 import sys
+import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+import advisor_concurrency as concurrency
 import advisor_safety as safety
 
 
@@ -43,7 +45,7 @@ WORKSPACE_ROOT_ENV = "ADVISOR_AGENT_WORKSPACE_ROOT"
 DEFAULT_BRIDGE_EXECUTABLE = "devspace"
 DEFAULT_AGENT_MODE = "auto"
 VALID_AGENT_MODES = {"auto", "on", "off"}
-DEFAULT_SANITIZED_WORKSPACE_MODE = "auto"
+DEFAULT_SANITIZED_WORKSPACE_MODE = "always"
 VALID_SANITIZED_WORKSPACE_MODES = {"auto", "always", "off"}
 CONFIG_SCHEMA_VERSION = "1.0"
 DEFAULT_SECRET_SCAN_MAX_FILES = 20000
@@ -238,8 +240,13 @@ class SanitizedWorkspaceStatus:
     source_dir: str
     workspace_dir: str = ""
     workspace_root: str = ""
+    workspace_allowed_root: str = ""
+    generation_id: str = ""
+    source_fingerprint: str = ""
+    reused: bool = False
     copied_files: int = 0
     copied_dirs: int = 0
+    redacted_files: int = 0
     skipped_files: int = 0
     skipped_dirs: int = 0
     skipped_symlinks: int = 0
@@ -254,8 +261,13 @@ class SanitizedWorkspaceStatus:
             "source_dir": self.source_dir,
             "workspace_dir": self.workspace_dir,
             "workspace_root": self.workspace_root,
+            "workspace_allowed_root": self.workspace_allowed_root,
+            "generation_id": self.generation_id,
+            "source_fingerprint": self.source_fingerprint,
+            "reused": self.reused,
             "copied_files": self.copied_files,
             "copied_dirs": self.copied_dirs,
+            "redacted_files": self.redacted_files,
             "skipped_files": self.skipped_files,
             "skipped_dirs": self.skipped_dirs,
             "skipped_symlinks": self.skipped_symlinks,
@@ -263,6 +275,32 @@ class SanitizedWorkspaceStatus:
             "errors": self.errors,
             "warnings": self.warnings,
         }
+
+
+@dataclass(frozen=True)
+class SanitizedCopyEntry:
+    source: Path
+    relative: Path
+    size: int
+    mtime_ns: int
+    mode: int
+    source_sha256: str
+    target_sha256: str
+    redacted_content: bytes | None = None
+    redaction_reason: str = ""
+
+
+@dataclass
+class SanitizedCopyPlan:
+    entries: list[SanitizedCopyEntry] = field(default_factory=list)
+    skipped_files: int = 0
+    skipped_dirs: int = 0
+    skipped_symlinks: int = 0
+    skipped_samples: list[str] = field(default_factory=list)
+    skipped_paths: list[str] = field(default_factory=list)
+    redacted_paths: list[str] = field(default_factory=list)
+    fingerprint: str = ""
+    errors: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -564,6 +602,43 @@ def content_secret_reason(path: Path, *, max_bytes: int) -> str:
     return ""
 
 
+def content_secret_reason_text(text: str) -> str:
+    for pattern, reason in CONTENT_SECRET_PATTERNS:
+        if pattern.search(text):
+            return reason
+    return ""
+
+
+PRIVATE_KEY_BLOCK_PATTERN = re.compile(
+    r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----.*?-----END [A-Z0-9 ]*PRIVATE KEY-----",
+    re.DOTALL,
+)
+
+
+def redact_sanitized_text(text: str) -> str:
+    value = PRIVATE_KEY_BLOCK_PATTERN.sub("[REDACTED_PRIVATE_KEY]", text)
+    replacements = (
+        (CONTENT_SECRET_PATTERNS[1][0], "[REDACTED_JWT]"),
+        (CONTENT_SECRET_PATTERNS[2][0], "sk-[REDACTED]"),
+        (CONTENT_SECRET_PATTERNS[3][0], "[REDACTED_SECRET_ASSIGNMENT]"),
+    )
+    for pattern, replacement in replacements:
+        value = pattern.sub(replacement, value)
+    return safety.redact_sensitive_text(value)
+
+
+def sha256_bytes(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
 def scan_project_secrets(
     project_dir: str | Path,
     *,
@@ -690,11 +765,208 @@ def should_skip_sanitized_file(project: Path, path: Path, *, max_content_bytes: 
         stat_result = path.stat()
     except OSError as exc:
         return True, f"could not stat file safely: {exc}"
-    if stat_result.st_size <= max_content_bytes:
-        reason = content_secret_reason(path, max_bytes=max_content_bytes)
-        if reason:
-            return True, reason
+    if stat_result.st_size > max_content_bytes:
+        return True, f"file exceeds sanitized content inspection limit ({max_content_bytes} bytes)"
     return False, ""
+
+
+def sanitized_file_entry(
+    project: Path,
+    path: Path,
+    relative: Path,
+    *,
+    max_content_bytes: int,
+) -> tuple[SanitizedCopyEntry | None, str]:
+    skip, reason = should_skip_sanitized_file(
+        project,
+        path,
+        max_content_bytes=max_content_bytes,
+    )
+    if skip:
+        return None, reason
+    try:
+        stat_result = path.stat()
+        source_content = path.read_bytes()
+    except OSError as exc:
+        return None, f"could not inspect file safely: {exc}"
+    source_hash = sha256_bytes(source_content)
+    redacted_content: bytes | None = None
+    redaction_reason = ""
+    if file_looks_binary(source_content):
+        return None, "binary file omitted because its content cannot be safely redacted"
+    text = source_content.decode("utf-8", errors="replace")
+    redaction_reason = content_secret_reason_text(text)
+    if redaction_reason:
+        redacted_text = redact_sanitized_text(text)
+        remaining_reason = content_secret_reason_text(redacted_text)
+        if remaining_reason:
+            return None, f"could not safely redact secret-looking content ({remaining_reason})"
+        redacted_content = redacted_text.encode("utf-8")
+    target_content = redacted_content if redacted_content is not None else source_content
+    return (
+        SanitizedCopyEntry(
+            source=path,
+            relative=relative,
+            size=stat_result.st_size,
+            mtime_ns=stat_result.st_mtime_ns,
+            mode=stat_result.st_mode,
+            source_sha256=source_hash,
+            target_sha256=sha256_bytes(target_content),
+            redacted_content=redacted_content,
+            redaction_reason=redaction_reason,
+        ),
+        "",
+    )
+
+
+def build_sanitized_copy_plan(project: Path, *, max_content_bytes: int) -> SanitizedCopyPlan:
+    plan = SanitizedCopyPlan()
+    digest = hashlib.sha256()
+
+    def record(kind: str, relative: Path, detail: str = "") -> None:
+        digest.update(kind.encode("ascii"))
+        digest.update(b"\0")
+        digest.update(relative.as_posix().encode("utf-8", errors="replace"))
+        digest.update(b"\0")
+        digest.update(detail.encode("utf-8", errors="replace"))
+        digest.update(b"\0")
+
+    def remember_skip(path: Path, skip_reason: str) -> None:
+        relative = Path(safe_relative_label(project, path))
+        record("skip", relative, skip_reason)
+        plan.skipped_paths.append(f"{relative.as_posix()}: {skip_reason}")
+        if len(plan.skipped_samples) < 12:
+            plan.skipped_samples.append(f"{relative.as_posix()}: {skip_reason}")
+
+    for root_dir, dirs, files in os.walk(project, topdown=True, followlinks=False):
+        source_root = Path(root_dir)
+        try:
+            rel_root = source_root.resolve().relative_to(project)
+        except ValueError:
+            plan.errors.append("sanitized copy encountered a path outside the project")
+            break
+        dirs.sort()
+        files.sort()
+
+        kept_dirs: list[str] = []
+        for name in dirs:
+            source = source_root / name
+            if source.is_symlink():
+                plan.skipped_symlinks += 1
+                remember_skip(source, "symlink omitted")
+                continue
+            if name in SECRET_SCAN_SKIP_DIR_NAMES:
+                plan.skipped_dirs += 1
+                remember_skip(source, "generated/dependency directory omitted")
+                continue
+            if contains_sensitive_project_marker(project, source):
+                plan.skipped_dirs += 1
+                remember_skip(source, project_sensitive_reason(project, source))
+                continue
+            kept_dirs.append(name)
+            record("dir", rel_root / name)
+        dirs[:] = kept_dirs
+
+        for name in files:
+            source = source_root / name
+            if source.is_symlink():
+                plan.skipped_symlinks += 1
+                remember_skip(source, "symlink omitted")
+                continue
+            relative = rel_root / name
+            entry, skip_reason = sanitized_file_entry(
+                project,
+                source,
+                relative,
+                max_content_bytes=max_content_bytes,
+            )
+            if entry is None:
+                plan.skipped_files += 1
+                remember_skip(source, skip_reason)
+                continue
+            plan.entries.append(entry)
+            if entry.redacted_content is not None:
+                plan.redacted_paths.append(
+                    f"{relative.as_posix()}: {entry.redaction_reason}"
+                )
+            record(
+                "file",
+                relative,
+                f"{entry.source_sha256}:{entry.target_sha256}:{entry.mode}",
+            )
+    plan.fingerprint = digest.hexdigest()
+    return plan
+
+
+def populate_sanitized_status_from_manifest(
+    status: SanitizedWorkspaceStatus,
+    workspace: Path,
+    manifest: dict[str, Any],
+    *,
+    reused: bool,
+) -> None:
+    status.workspace_dir = str(workspace)
+    status.generation_id = str(manifest.get("generation_id") or workspace.name)
+    status.source_fingerprint = str(manifest.get("source_fingerprint") or "")
+    status.reused = reused
+    status.copied_files = int(manifest.get("copied_files") or 0)
+    status.copied_dirs = int(manifest.get("copied_dirs") or 0)
+    status.redacted_files = int(manifest.get("redacted_files") or 0)
+    status.skipped_files = int(manifest.get("skipped_files") or 0)
+    status.skipped_dirs = int(manifest.get("skipped_dirs") or 0)
+    status.skipped_symlinks = int(manifest.get("skipped_symlinks") or 0)
+    if status.skipped_files or status.skipped_dirs or status.skipped_symlinks:
+        status.warnings.append("sanitized workspace omits some files from the original checkout")
+
+
+def reusable_sanitized_generation(
+    workspace: Path,
+    *,
+    fingerprint: str,
+) -> dict[str, Any] | None:
+    marker = workspace / "ADVISOR_SANITIZED_WORKSPACE.md"
+    manifest_path = workspace / "SANITIZED_WORKSPACE_MANIFEST.json"
+    if not workspace.is_dir() or not marker.is_file() or not manifest_path.is_file():
+        return None
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(manifest, dict) or manifest.get("source_fingerprint") != fingerprint:
+        return None
+    clean_scan = scan_project_secrets(workspace)
+    if not clean_scan.ok:
+        return None
+    return manifest
+
+
+def make_tree_read_only(root: Path) -> None:
+    for path in sorted(root.rglob("*"), key=lambda item: len(item.parts), reverse=True):
+        if path.is_symlink():
+            raise RuntimeError("sanitized workspace unexpectedly contains a symlink")
+        if path.is_dir():
+            os.chmod(path, 0o500)
+        elif path.is_file():
+            source_mode = path.stat().st_mode
+            os.chmod(path, 0o500 if source_mode & 0o111 else 0o400)
+    os.chmod(root, 0o500)
+
+
+def make_tree_writable_for_cleanup(root: Path) -> None:
+    if not root.exists():
+        return
+    for path in sorted(root.rglob("*"), key=lambda item: len(item.parts)):
+        try:
+            if path.is_dir():
+                os.chmod(path, 0o700)
+            elif path.is_file():
+                os.chmod(path, 0o600)
+        except OSError:
+            pass
+    try:
+        os.chmod(root, 0o700)
+    except OSError:
+        pass
 
 
 def create_sanitized_workspace(
@@ -729,126 +1001,139 @@ def create_sanitized_workspace(
     elif not root_result.ok:
         status.errors.extend(root_result.errors)
         return status
-    workspace = root / sanitized_workspace_slug(project) / "workspace"
-    status.workspace_dir = str(workspace)
-    if not is_safe_generated_workspace_path(workspace, root):
+    project_root = root / sanitized_workspace_slug(project)
+    generations_root = project_root / "generations"
+    status.workspace_allowed_root = str(project_root)
+    if not is_safe_generated_workspace_path(generations_root, root):
         status.errors.append("sanitized workspace path is not safely under the workspace root")
         return status
-
-    if workspace.exists():
-        try:
-            shutil.rmtree(workspace)
-        except OSError as exc:
-            status.errors.append(f"could not remove old sanitized workspace: {exc}")
-            return status
     try:
-        safety.ensure_private_dir(workspace)
+        safety.ensure_private_dir(generations_root)
     except OSError as exc:
-        status.errors.append(f"could not create sanitized workspace: {exc}")
+        status.errors.append(f"could not create sanitized workspace generation root: {exc}")
         return status
 
-    skipped_samples: list[str] = []
+    plan = build_sanitized_copy_plan(project, max_content_bytes=max_content_bytes)
+    if plan.errors:
+        status.errors.extend(plan.errors)
+        return status
+    status.source_fingerprint = plan.fingerprint
+    generation_id = plan.fingerprint[:24]
+    workspace = generations_root / generation_id
+    status.workspace_dir = str(workspace)
+    status.generation_id = generation_id
 
-    def remember_skip(path: Path, skip_reason: str) -> None:
-        if len(skipped_samples) < 12:
-            skipped_samples.append(f"{safe_relative_label(project, path)}: {skip_reason}")
+    lock = concurrency.InterProcessLock(
+        project_root / ".workspace.lock",
+        timeout=300.0,
+        wait_message="Advisor agent-mode is waiting for another session to finish the sanitized workspace snapshot.",
+    )
+    with lock:
+        existing_manifest = reusable_sanitized_generation(workspace, fingerprint=plan.fingerprint)
+        if existing_manifest is not None:
+            populate_sanitized_status_from_manifest(status, workspace, existing_manifest, reused=True)
+            return status
 
-    for root_dir, dirs, files in os.walk(project, topdown=True, followlinks=False):
-        source_root = Path(root_dir)
+        staging = project_root / f".staging-{uuid.uuid4().hex}"
+        if not is_safe_generated_workspace_path(staging, root):
+            status.errors.append("sanitized staging path is not safely under the workspace root")
+            return status
         try:
-            rel_root = source_root.resolve().relative_to(project)
-        except ValueError:
-            status.errors.append("sanitized copy encountered a path outside the project")
-            break
-        target_root = workspace / rel_root
-
-        kept_dirs: list[str] = []
-        for name in dirs:
-            source = source_root / name
-            if source.is_symlink():
-                status.skipped_symlinks += 1
-                remember_skip(source, "symlink omitted")
-                continue
-            if name in SECRET_SCAN_SKIP_DIR_NAMES:
-                status.skipped_dirs += 1
-                remember_skip(source, "generated/dependency directory omitted")
-                continue
-            if contains_sensitive_project_marker(project, source):
-                status.skipped_dirs += 1
-                remember_skip(source, project_sensitive_reason(project, source))
-                continue
-            kept_dirs.append(name)
-        dirs[:] = kept_dirs
-
-        for name in files:
-            source = source_root / name
-            if source.is_symlink():
-                status.skipped_symlinks += 1
-                remember_skip(source, "symlink omitted")
-                continue
-            skip, skip_reason = should_skip_sanitized_file(project, source, max_content_bytes=max_content_bytes)
-            if skip:
-                status.skipped_files += 1
-                remember_skip(source, skip_reason)
-                continue
-            target = target_root / name
-            try:
+            safety.ensure_private_dir(staging)
+            for entry in plan.entries:
+                before = entry.source.stat()
+                if (
+                    before.st_size != entry.size
+                    or before.st_mtime_ns != entry.mtime_ns
+                    or before.st_mode != entry.mode
+                ):
+                    raise RuntimeError("source project changed while the sanitized snapshot was being prepared; retry")
+                target = staging / entry.relative
                 target.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(source, target, follow_symlinks=False)
-                status.copied_files += 1
-            except OSError as exc:
-                status.skipped_files += 1
-                remember_skip(source, f"copy failed: {exc}")
+                if entry.redacted_content is None:
+                    shutil.copy2(entry.source, target, follow_symlinks=False)
+                else:
+                    target.write_bytes(entry.redacted_content)
+                    os.chmod(target, entry.mode & 0o777)
+                after = entry.source.stat()
+                if (
+                    after.st_size != entry.size
+                    or after.st_mtime_ns != entry.mtime_ns
+                    or after.st_mode != entry.mode
+                ):
+                    raise RuntimeError("source project changed while the sanitized snapshot was being prepared; retry")
+                if sha256_file(entry.source) != entry.source_sha256:
+                    raise RuntimeError("source project content changed while the sanitized snapshot was being prepared; retry")
+                if sha256_file(target) != entry.target_sha256:
+                    raise RuntimeError("sanitized workspace content hash verification failed")
 
-    status.copied_dirs = sum(1 for item in workspace.rglob("*") if item.is_dir())
-    marker = workspace / "ADVISOR_SANITIZED_WORKSPACE.md"
-    marker_lines = [
-        "# Advisor Sanitized Workspace",
-        "",
-        "This directory is an automatically generated review copy for ChatGPT/DevSpace advisor agent-mode.",
-        "It omits local secrets, advisor transcripts, dependency caches, generated build outputs, archives, databases, and symlinks.",
-        "Codex must verify final facts against the original checkout before acting on advisor claims.",
-        "",
-        f"source_project_name: {project.name}",
-        f"generated_utc: {datetime.now(timezone.utc).isoformat()}",
-        f"copied_files: {status.copied_files}",
-        f"skipped_files: {status.skipped_files}",
-        f"skipped_dirs: {status.skipped_dirs}",
-        f"skipped_symlinks: {status.skipped_symlinks}",
-    ]
-    if skipped_samples:
-        marker_lines.extend(["", "Skipped path samples:"])
-        marker_lines.extend(f"- {item}" for item in skipped_samples)
-    try:
-        safety.atomic_write_text(marker, "\n".join(marker_lines) + "\n")
-        safety.atomic_write_json(
-            workspace / "SANITIZED_WORKSPACE_MANIFEST.json",
-            {
-                "schema_version": "1.0",
+            copied_dirs = sum(1 for item in staging.rglob("*") if item.is_dir())
+            generated_utc = datetime.now(timezone.utc).isoformat()
+            marker_lines = [
+                "# Advisor Sanitized Workspace",
+                "",
+                "This directory is an automatically generated content-hashed, read-only review snapshot for ChatGPT/DevSpace advisor agent-mode.",
+                "It omits local secrets, advisor transcripts, dependency caches, generated build outputs, archives, databases, and symlinks.",
+                "Codex must verify final facts against the original checkout before acting on advisor claims.",
+                "",
+                f"source_project_name: {project.name}",
+                f"generation_id: {generation_id}",
+                f"generated_utc: {generated_utc}",
+                f"copied_files: {len(plan.entries)}",
+                f"redacted_files: {len(plan.redacted_paths)}",
+                f"skipped_files: {plan.skipped_files}",
+                f"skipped_dirs: {plan.skipped_dirs}",
+                f"skipped_symlinks: {plan.skipped_symlinks}",
+            ]
+            if plan.skipped_samples:
+                marker_lines.extend(["", "Skipped path samples:"])
+                marker_lines.extend(f"- {item}" for item in plan.skipped_samples)
+            if plan.redacted_paths:
+                marker_lines.extend(["", "Redacted source paths:"])
+                marker_lines.extend(f"- {item}" for item in plan.redacted_paths)
+            manifest = {
+                "schema_version": "2.0",
                 "scanner": "external-advisor-agent-mode",
                 "source_path_hash": hashlib.sha256(str(project).encode("utf-8", errors="replace")).hexdigest(),
                 "source_project_name": project.name,
-                "generated_utc": datetime.now(timezone.utc).isoformat(),
-                "copied_files": status.copied_files,
-                "copied_dirs": status.copied_dirs,
-                "skipped_files": status.skipped_files,
-                "skipped_dirs": status.skipped_dirs,
-                "skipped_symlinks": status.skipped_symlinks,
-                "skipped_samples": skipped_samples,
-                "warning": "This is an incomplete sanitized review copy. Codex must verify final facts in the original checkout.",
-            },
-        )
-    except OSError as exc:
-        status.errors.append(f"could not write sanitized workspace marker: {exc}")
-        return status
+                "source_fingerprint": plan.fingerprint,
+                "generation_id": generation_id,
+                "generated_utc": generated_utc,
+                "copied_files": len(plan.entries),
+                "copied_dirs": copied_dirs,
+                "redacted_files": len(plan.redacted_paths),
+                "skipped_files": plan.skipped_files,
+                "skipped_dirs": plan.skipped_dirs,
+                "skipped_symlinks": plan.skipped_symlinks,
+                "skipped_samples": plan.skipped_samples,
+                "skipped_paths": plan.skipped_paths,
+                "redacted_paths": plan.redacted_paths,
+                "warning": "This is an incomplete content-hashed, read-only sanitized review snapshot. Codex must verify final facts in the original checkout.",
+            }
+            safety.atomic_write_text(staging / "ADVISOR_SANITIZED_WORKSPACE.md", "\n".join(marker_lines) + "\n")
+            safety.atomic_write_json(staging / "SANITIZED_WORKSPACE_MANIFEST.json", manifest)
 
-    clean_scan = scan_project_secrets(workspace)
-    if not clean_scan.ok:
-        status.errors.append("sanitized workspace still contains sensitive-looking files")
-        for finding in clean_scan.findings[:12]:
-            status.errors.append(f"{finding.path}: {finding.reason}")
-    if status.skipped_files or status.skipped_dirs or status.skipped_symlinks:
-        status.warnings.append("sanitized workspace omits some files from the original checkout")
+            clean_scan = scan_project_secrets(staging)
+            if not clean_scan.ok:
+                status.errors.append("sanitized workspace still contains sensitive-looking files")
+                for finding in clean_scan.findings[:12]:
+                    status.errors.append(f"{finding.path}: {finding.reason}")
+                return status
+            if workspace.exists():
+                make_tree_writable_for_cleanup(workspace)
+                shutil.rmtree(workspace)
+            os.replace(staging, workspace)
+            make_tree_read_only(workspace)
+            populate_sanitized_status_from_manifest(status, workspace, manifest, reused=False)
+        except (OSError, RuntimeError) as exc:
+            status.errors.append(f"could not create sanitized workspace generation: {exc}")
+        finally:
+            if staging.exists():
+                try:
+                    make_tree_writable_for_cleanup(staging)
+                    shutil.rmtree(staging)
+                except OSError:
+                    pass
     return status
 
 
@@ -1111,8 +1396,8 @@ def evaluate_agent_mode(
         return status
     if not require_bridge and not bridge.ok:
         status.warnings.extend(bridge.errors)
-    status.warnings.append(
-        "DevSpace tool surfaces can expose edit and shell tools; this workflow generates a review-first handoff and does not mechanically disable remote tools."
+    status.notes.append(
+        "connector startup requires the patched DevSpace read-only tool mode before exposing this workspace"
     )
     status.available = True
     if agent_project != project:
@@ -1164,6 +1449,9 @@ def render_status_text(status: AgentModeStatus, *, include_node: bool = True) ->
         sanitized = status.sanitized_workspace
         lines.append(f"sanitized_workspace_used: {'yes' if sanitized.used else 'no'}")
         lines.append(f"sanitized_workspace_dir: {sanitized.workspace_dir or 'none'}")
+        lines.append(f"sanitized_workspace_allowed_root: {sanitized.workspace_allowed_root or 'none'}")
+        lines.append(f"sanitized_workspace_generation: {sanitized.generation_id or 'none'}")
+        lines.append(f"sanitized_workspace_reused: {'yes' if sanitized.reused else 'no'}")
         lines.append(f"sanitized_workspace_reason: {sanitized.reason or 'none'}")
         lines.append(f"sanitized_copied_files: {sanitized.copied_files}")
         lines.append(f"sanitized_skipped_files: {sanitized.skipped_files}")

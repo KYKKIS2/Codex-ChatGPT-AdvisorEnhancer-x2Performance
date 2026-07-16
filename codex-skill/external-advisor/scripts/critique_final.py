@@ -104,9 +104,9 @@ def main() -> int:
             allow_outside_project=args.allow_outside_project,
         )
     elif args.draft is None:
-        args.draft = sanitize_text(sys.stdin.read())
+        args.draft = safety.redact_sensitive_text(sanitize_text(sys.stdin.read()))
     else:
-        args.draft = sanitize_text(args.draft)
+        args.draft = safety.redact_sensitive_text(sanitize_text(args.draft))
     if not args.draft.strip():
         print("Provide --draft, --draft-file, or pipe a draft on stdin.", file=sys.stderr)
         return 2

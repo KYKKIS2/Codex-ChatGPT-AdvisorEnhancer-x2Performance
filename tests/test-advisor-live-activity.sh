@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SCRIPTS="$ROOT/codex-skill/external-advisor/scripts"
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
@@ -65,7 +65,7 @@ log_path.write_text(
 )
 state_path = state_dir / "state.json"
 state_path.write_text(
-    json.dumps({"project_dir": str(project), "log_path": str(log_path), "pid": os.getpid()}),
+    json.dumps({"project_dir": str(project), "log_path": str(log_path), "devspace_pid": os.getpid()}),
     encoding="utf-8",
 )
 
@@ -113,6 +113,13 @@ disabled = activity_monitor.ActivityMonitor.for_project(
 )
 if disabled.active:
     raise SystemExit("Explicitly disabled monitor was active.")
+
+state_path.write_text(
+    json.dumps({"project_dir": str(project), "log_path": str(log_path), "pid": os.getpid()}),
+    encoding="utf-8",
+)
+if activity_monitor.discover_log_path(project, root=runtime, process_validator=lambda _pid: True) != log_path:
+    raise SystemExit("Legacy connector pid state was not accepted.")
 
 outside = work / "outside.log"
 outside.write_text("", encoding="utf-8")

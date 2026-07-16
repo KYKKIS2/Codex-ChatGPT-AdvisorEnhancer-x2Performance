@@ -1835,7 +1835,9 @@ def main() -> int:
         os.environ["ADVISOR_THINKING_EFFORT"] = args.thinking_effort
     args.model = select_request_model(args.thinking_effort, args.model)
     prompt = args.prompt if args.prompt is not None else sys.stdin.read()
-    prompt = sanitize_text(build_prompt(prompt, args.context_file))
+    prompt = safety.redact_sensitive_text(
+        sanitize_text(build_prompt(prompt, args.context_file))
+    )
     if not prompt.strip():
         print("Provide --prompt or pipe text on stdin.", file=sys.stderr)
         return 2

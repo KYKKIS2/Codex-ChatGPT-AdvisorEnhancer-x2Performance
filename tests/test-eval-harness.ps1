@@ -1,5 +1,5 @@
 $ErrorActionPreference = "Stop"
-$Root = Split-Path -Parent $MyInvocation.MyCommand.Path
+$Root = Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path)
 $EvalHarness = Join-Path $Root "codex-skill\external-advisor\scripts\eval_harness.py"
 $Project = Join-Path $env:TEMP ("advisor-eval-test-" + [guid]::NewGuid())
 $Latest = Join-Path $Project ".codex-advisor\latest-evaluation.json"

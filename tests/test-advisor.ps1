@@ -4,7 +4,7 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
-$Root = Split-Path -Parent $MyInvocation.MyCommand.Path
+$Root = Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path)
 $Advisor = Join-Path $Root "codex-skill\external-advisor\scripts\advisor.py"
 $Project = Join-Path $env:TEMP ("advisor-live-test-" + [guid]::NewGuid())
 

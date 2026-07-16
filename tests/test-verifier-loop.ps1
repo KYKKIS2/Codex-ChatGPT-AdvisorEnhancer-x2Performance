@@ -4,7 +4,7 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
-$Root = Split-Path -Parent $MyInvocation.MyCommand.Path
+$Root = Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path)
 $VerifierLoop = Join-Path $Root "codex-skill\external-advisor\scripts\verifier_loop.py"
 $Project = Join-Path $env:TEMP ("advisor-verifier-test-" + [guid]::NewGuid())
 $Latest = Join-Path $Project ".codex-advisor\latest-verifier-loop.json"

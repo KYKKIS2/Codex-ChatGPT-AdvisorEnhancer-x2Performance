@@ -3,7 +3,7 @@ set -euo pipefail
 
 MODEL="${1:-gpt-5-6-thinking}"
 PORT="${G4F_PORT:-8080}"
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 ADVISOR="$ROOT/codex-skill/external-advisor/scripts/advisor.py"
 PROJECT="$(mktemp -d)"
 trap 'rm -rf "$PROJECT"' EXIT

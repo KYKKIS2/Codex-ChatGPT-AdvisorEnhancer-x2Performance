@@ -112,7 +112,7 @@ def discover_log_path(
             continue
         raw_project = state.get("project_dir")
         raw_log = state.get("log_path")
-        pid = state.get("pid")
+        pid = state.get("devspace_pid", state.get("pid"))
         if not isinstance(raw_project, str) or not isinstance(raw_log, str) or not isinstance(pid, int):
             continue
         try:

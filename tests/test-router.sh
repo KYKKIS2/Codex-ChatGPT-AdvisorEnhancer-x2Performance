@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 ROUTER="$ROOT/codex-skill/external-advisor/scripts/router.py"
 PROJECT="$(mktemp -d)"
 FAKE_BIN="$(mktemp -d)"
@@ -45,3 +45,12 @@ assert_route "machine-json-verifier" "verifier-loop" --machine-verify --prompt "
 assert_route "agent-mode" "agent-mode" --agent-allowed-root "$PROJECT" --agent-bridge-executable "$FAKE_BIN/devspace" --prompt "Decide the architecture for advisor memory"
 assert_route "single-advisor" "" --prompt-only --agent-allowed-root "$PROJECT" --agent-bridge-executable "$FAKE_BIN/devspace" --prompt "Decide the architecture for advisor memory"
 assert_route "single-advisor" "" --agent-allowed-root "$PROJECT" --agent-bridge-executable "$FAKE_BIN/missing-devspace" --prompt "Decide the architecture for advisor memory"
+
+if python3 "$ROUTER" \
+  --project-dir "$PROJECT" \
+  --agent-allow-shell \
+  --prompt "Review this repository." >/tmp/advisor-router-shell-out.txt 2>/tmp/advisor-router-shell-err.txt; then
+  echo "Expected the deprecated repo-aware shell flag to be rejected." >&2
+  exit 1
+fi
+grep -q "mechanically read-only" /tmp/advisor-router-shell-err.txt

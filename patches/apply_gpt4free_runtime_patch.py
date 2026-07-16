@@ -144,7 +144,7 @@ def patch_any_model_map(g4f: Path) -> None:
         changed = True
 
     if '"gpt-5-6-thinking": {' not in text:
-        needle = '  "gpt-5-5": {\n'
+        needle = '  "gpt-5-5": {\n' if '  "gpt-5-5": {\n' in text else '  "gpt-5.2": {\n'
         block = (
             '  "gpt-5-6-thinking": {\n'
             '    "OpenaiChat": "gpt-5-6-thinking"\n'
@@ -225,7 +225,11 @@ def patch_any_model_map(g4f: Path) -> None:
         changed = True
 
     if '"gpt-5.6-sol": "gpt-5-6-thinking"' not in text:
-        needle = '  "gpt-5.5": "gpt-5-5",\n'
+        needle = (
+            '  "gpt-5.5": "gpt-5-5",\n'
+            if '  "gpt-5.5": "gpt-5-5",\n' in text
+            else '  "gpt-5-2": "gpt-5.2",\n'
+        )
         block = (
             '  "gpt-5.6": "gpt-5-6-thinking",\n'
             '  "gpt-5_6": "gpt-5-6-thinking",\n'
@@ -264,10 +268,106 @@ def patch_any_model_map(g4f: Path) -> None:
         path.write_text(text, encoding="utf-8")
 
 
+def patch_har_file(g4f: Path) -> None:
+    path = g4f / "g4f" / "Provider" / "openai" / "har_file.py"
+    text = path.read_text(encoding="utf-8")
+    changed = False
+
+    if "CLIENT_HEADER_NAMES = {" not in text:
+        needle = 'conversation_url = "https://chatgpt.com/c/"\n'
+        block = '''
+
+CLIENT_HEADER_NAMES = {
+    "oai-client-build-number",
+    "oai-client-version",
+    "oai-device-id",
+    "oai-language",
+    "oai-session-id",
+    "origin",
+    "x-openai-target-path",
+    "x-openai-target-route",
+}
+_client_request_context = None
+'''
+        text, _ = replace_once(text, needle, needle + block, "ChatGPT conversation_url declaration")
+        changed = True
+
+    if "def get_client_request_context()" not in text:
+        needle = "def parseHAREntry(entry) -> arkReq:\n"
+        helpers = '''def get_client_request_context() -> tuple[dict, str | None]:
+    """Return non-secret web-client headers and the frontend conduit seed."""
+    global _client_request_context
+    if _client_request_context is not None:
+        return _client_request_context
+    try:
+        paths = reversed(get_har_files())
+    except NoValidHarFileError:
+        _client_request_context = ({}, None)
+        return _client_request_context
+    for path in paths:
+        try:
+            with open(path, "rb") as file:
+                har_file = json.loads(file.read())
+        except (OSError, json.JSONDecodeError):
+            continue
+        entries = har_file.get("log", {}).get("entries", [])
+        selected = {}
+        conduit_seed = None
+        for entry in reversed(entries):
+            request = entry.get("request", {})
+            request_url = request.get("url", "").split("?", 1)[0]
+            if request_url not in (backend_url, prepare_url):
+                continue
+            headers = get_headers(entry)
+            if not selected:
+                selected = {name: headers[name] for name in CLIENT_HEADER_NAMES if headers.get(name)}
+            candidate = headers.get("x-conduit-token")
+            if (
+                conduit_seed is None
+                and candidate
+                and candidate.count(".") != 2
+                and len(candidate) <= 64
+            ):
+                conduit_seed = candidate
+            if selected and conduit_seed:
+                _client_request_context = (selected, conduit_seed)
+                return _client_request_context
+        if selected:
+            _client_request_context = (selected, conduit_seed)
+            return _client_request_context
+    _client_request_context = ({}, None)
+    return _client_request_context
+
+def get_client_headers() -> dict:
+    return dict(get_client_request_context()[0])
+
+def get_conduit_seed() -> str | None:
+    return get_client_request_context()[1]
+
+'''
+        text, _ = replace_once(text, needle, helpers + needle, "har_file parseHAREntry declaration")
+        changed = True
+
+    if changed:
+        path.write_text(text, encoding="utf-8")
+
+
 def patch_openai_chat(g4f: Path) -> None:
     path = g4f / "g4f" / "Provider" / "needs_auth" / "OpenaiChat.py"
     text = path.read_text(encoding="utf-8")
     changed = False
+
+    if "from ..openai.har_file import get_client_headers, get_conduit_seed, get_request_config" not in text:
+        needle = "from ..openai.har_file import get_request_config\n"
+        replacement = "from ..openai.har_file import get_client_headers, get_conduit_seed, get_request_config\n"
+        text, _ = replace_once(text, needle, replacement, "OpenaiChat HAR helper import")
+        changed = True
+
+    if '"metadata": {"selected_sources": [],' not in text:
+        needle = '"metadata": {"serialization_metadata": {"custom_symbol_offsets": []},\n'
+        replacement = '"metadata": {"selected_sources": [],\n                         "serialization_metadata": {"custom_symbol_offsets": []},\n'
+        text, _ = replace_once(text, needle, replacement, "OpenaiChat message metadata")
+        changed = True
 
     needle = "        reasoning_effort: Optional[str] = None,\n        **kwargs\n"
     replacement = (
@@ -348,6 +448,18 @@ def patch_openai_chat(g4f: Path) -> None:
         )
         changed = True
 
+    if "conduit_token = get_conduit_seed()" not in text:
+        needle = (
+            "                conduit_token = None\n"
+            "                use_prepare = not (model.endswith(\"-pro\") and thinking_effort is not None)\n"
+        )
+        replacement = (
+            "                conduit_token = get_conduit_seed()\n"
+            "                use_prepare = not (model.endswith(\"-pro\") and thinking_effort is not None)\n"
+        )
+        text, _ = replace_once(text, needle, replacement, "OpenaiChat conduit seed initialization")
+        changed = True
+
     pro_streaming_prepare_block = (
         "                    if thinking_effort == \"extended\" and model in {\"gpt-5-pro\", \"gpt-5-5-pro\"}:\n"
         "                        data[\"pro_mode_turn_topic_streaming\"] = True\n"
@@ -380,6 +492,20 @@ def patch_openai_chat(g4f: Path) -> None:
         )
         changed = True
 
+    if '"client_prepare_dispatch": "immediate"' not in text:
+        needle = (
+            '                        "client_prepare_state": "none",\n'
+            '                        "timezone_offset_min": -120,\n'
+        )
+        replacement = (
+            '                        "client_prepare_state": "none",\n'
+            '                        "client_prepare_dispatch": "immediate",\n'
+            '                        "client_prepare_source": "context_change",\n'
+            '                        "timezone_offset_min": -120,\n'
+        )
+        text, _ = replace_once(text, needle, replacement, "OpenaiChat prepare client metadata")
+        changed = True
+
     if '"force_parallel_switch": "auto"' not in text:
         text = text.replace(
             '                        "supported_encodings": ["v1"]\n'
@@ -397,6 +523,75 @@ def patch_openai_chat(g4f: Path) -> None:
             '                }\n',
             1,
         )
+        changed = True
+
+    if '"has_web_push_capabilities": True' not in text:
+        needle = (
+            '                        "supported_encodings": ["v1"],\n'
+            '                        "force_parallel_switch": "auto"\n'
+        )
+        replacement = (
+            '                        "supported_encodings": ["v1"],\n'
+            '                        "client_contextual_info": {\n'
+            '                            "app_name": "chatgpt.com",\n'
+            '                            "has_web_push_capabilities": True,\n'
+            '                            "web_push_notification_permission": "default",\n'
+            '                        },\n'
+            '                        "force_parallel_switch": "auto"\n'
+        )
+        text, _ = replace_once(text, needle, replacement, "OpenaiChat prepare contextual info")
+        changed = True
+
+        needle = (
+            '                                               "screen_height": 1080, "screen_width": 1920},\n'
+            '                    "paragen_cot_summary_display_override": "allow",\n'
+        )
+        replacement = (
+            '                                               "screen_height": 1080, "screen_width": 1920,\n'
+            '                                               "app_name": "chatgpt.com",\n'
+            '                                               "has_web_push_capabilities": True,\n'
+            '                                               "web_push_notification_permission": "default"},\n'
+            '                    "paragen_cot_summary_display_override": "allow",\n'
+        )
+        text, _ = replace_once(text, needle, replacement, "OpenaiChat conversation contextual info")
+        changed = True
+
+    if '"x-conduit-token": conduit_token' not in text.split("async with session.post(\n                        prepare_url", 1)[-1].split(") as response:", 1)[0]:
+        needle = (
+            "                        prepare_url,\n"
+            "                        json=data,\n"
+            "                        headers=cls._headers\n"
+        )
+        replacement = (
+            "                        prepare_url,\n"
+            "                        json=data,\n"
+            "                        headers={\n"
+            "                            **cls._headers,\n"
+            "                            **({} if conduit_token is None else {\"x-conduit-token\": conduit_token}),\n"
+            "                        }\n"
+        )
+        text, _ = replace_once(text, needle, replacement, "OpenaiChat prepare request headers")
+        changed = True
+
+    if '(await response.json()).get("conduit_token") or conduit_token' not in text:
+        needle = '                        conduit_token = (await response.json())["conduit_token"]\n'
+        replacement = '                        conduit_token = (await response.json()).get("conduit_token") or conduit_token\n'
+        text, _ = replace_once(text, needle, replacement, "OpenaiChat prepare conduit response")
+        changed = True
+
+    if "auth_result.headers = cls._headers" not in text:
+        needle = (
+            '                if not cls._set_api_key(getattr(auth_result, "api_key", None)):\n'
+            '                    raise MissingAuthError("Access token is not valid")\n'
+            '                async with session.get(cls.url, headers=cls._headers) as response:\n'
+        )
+        replacement = (
+            '                if not cls._set_api_key(getattr(auth_result, "api_key", None)):\n'
+            '                    raise MissingAuthError("Access token is not valid")\n'
+            '                auth_result.headers = cls._headers\n'
+            '                async with session.get(cls.url, headers=cls._headers) as response:\n'
+        )
+        text, _ = replace_once(text, needle, replacement, "OpenaiChat authenticated header propagation")
         changed = True
 
     needle = (
@@ -576,6 +771,18 @@ def patch_openai_chat(g4f: Path) -> None:
         text, _ = replace_once(text, needle, helpers + needle, "OpenaiChat wait_media insertion point")
         changed = True
 
+    if "**get_client_headers()," not in text:
+        needle = "        cls._headers = cls.get_default_headers() if headers is None else headers\n"
+        replacement = (
+            "        cls._headers = {\n"
+            "            **cls.get_default_headers(),\n"
+            "            **get_client_headers(),\n"
+            "            **({} if headers is None else headers),\n"
+            "        }\n"
+        )
+        text, _ = replace_once(text, needle, replacement, "OpenaiChat request header merge")
+        changed = True
+
     if changed:
         path.write_text(text, encoding="utf-8")
 
@@ -583,17 +790,27 @@ def patch_openai_chat(g4f: Path) -> None:
 def verify_markers(g4f: Path) -> None:
     stubs = (g4f / "g4f" / "api" / "stubs.py").read_text(encoding="utf-8")
     openai_chat = (g4f / "g4f" / "Provider" / "needs_auth" / "OpenaiChat.py").read_text(encoding="utf-8")
+    har_file = (g4f / "g4f" / "Provider" / "openai" / "har_file.py").read_text(encoding="utf-8")
     openai_models = (g4f / "g4f" / "Provider" / "openai" / "models.py").read_text(encoding="utf-8")
     any_model_map = (g4f / "g4f" / "providers" / "any_model_map.py").read_text(encoding="utf-8")
     required = {
         "gizmo_id: Optional[str]": stubs,
         "conversation_mode: Optional[dict]": stubs,
         "thinking_effort: Optional[str]": stubs,
+        '"metadata": {"selected_sources": [],': openai_chat,
         "data[\"thinking_effort\"] = thinking_effort": openai_chat,
         '"client_prepare_state": "none"': openai_chat,
+        '"client_prepare_dispatch": "immediate"': openai_chat,
+        '"has_web_push_capabilities": True': openai_chat,
         '"force_parallel_switch": "auto"': openai_chat,
+        "conduit_token = get_conduit_seed()": openai_chat,
+        "**get_client_headers(),": openai_chat,
+        "auth_result.headers = cls._headers": openai_chat,
         "def get_resume_turn_topic_id": openai_chat,
         "iter_conversation_turn_ws": openai_chat,
+        "CLIENT_HEADER_NAMES = {": har_file,
+        "def get_client_request_context()": har_file,
+        "def get_conduit_seed()": har_file,
         '"gpt-5-6-thinking"': openai_models,
         '"gpt-5-6-pro"': openai_models,
         '"gpt-5-5-thinking"': openai_models,
@@ -618,6 +835,7 @@ def main() -> int:
     patch_stubs(g4f)
     patch_openai_model_registry(g4f)
     patch_any_model_map(g4f)
+    patch_har_file(g4f)
     patch_openai_chat(g4f)
     verify_markers(g4f)
     print("gpt4free advisor runtime patch verified.")

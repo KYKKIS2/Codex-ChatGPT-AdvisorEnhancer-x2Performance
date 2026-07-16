@@ -4,7 +4,7 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
-$Root = Split-Path -Parent $MyInvocation.MyCommand.Path
+$Root = Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path)
 $Conclave = Join-Path $Root "codex-skill\external-advisor\scripts\conclave.py"
 $Validate = Join-Path $Root "codex-skill\external-advisor\scripts\validate_conclave.py"
 $Project = Join-Path $env:TEMP ("advisor-conclave-test-" + [guid]::NewGuid())

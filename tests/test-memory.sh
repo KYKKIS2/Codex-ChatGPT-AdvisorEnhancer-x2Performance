@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 MEMORY="$ROOT/codex-skill/external-advisor/scripts/memory_manager.py"
 PROJECT="$(mktemp -d)"
 trap 'rm -rf "$PROJECT"' EXIT

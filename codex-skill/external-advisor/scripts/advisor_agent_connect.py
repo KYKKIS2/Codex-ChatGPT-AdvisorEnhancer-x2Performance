@@ -14,6 +14,7 @@ import ipaddress
 import json
 import os
 import re
+import shutil
 import signal
 import subprocess
 import sys
@@ -22,8 +23,11 @@ import webbrowser
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+from urllib.error import HTTPError, URLError
 from urllib.parse import urlparse, urlunparse
+from urllib.request import Request, urlopen
 
+import advisor_concurrency as concurrency
 import advisor_safety as safety
 import agent_mode
 
@@ -32,6 +36,8 @@ PUBLIC_BASE_URL_ENV = "ADVISOR_AGENT_PUBLIC_BASE_URL"
 RUNTIME_ROOT_ENV = "ADVISOR_AGENT_RUNTIME_ROOT"
 DEFAULT_CONNECT_TIMEOUT = 30
 HTTPS_URL_RE = re.compile(r"https://[^\s\"'<>]+")
+QUICK_TUNNEL_URL_RE = re.compile(r"https://[A-Za-z0-9-]+\.trycloudflare\.com(?:/[^\s\"'<>]*)?")
+VALID_TUNNEL_MODES = {"auto", "configured", "off"}
 
 
 def configure_stdio() -> None:
@@ -67,6 +73,8 @@ def state_paths(project: Path, root: Path) -> dict[str, Path]:
         "dir": project_dir,
         "state": project_dir / "state.json",
         "log": project_dir / "devspace.log",
+        "tunnel_log": project_dir / "cloudflared.log",
+        "lock": project_dir / "lifecycle.lock",
     }
 
 
@@ -153,6 +161,111 @@ def discover_public_url(args: argparse.Namespace, bridge_path: str, cwd: Path) -
     return "", "", ""
 
 
+def read_devspace_runtime(bridge_path: str, cwd: Path) -> dict[str, Any]:
+    code, output = run_small_command([bridge_path, "config", "get"], cwd=cwd, timeout=5)
+    config: dict[str, Any] = {}
+    if code == 0 and output:
+        try:
+            parsed = json.loads(output)
+        except json.JSONDecodeError:
+            parsed = {}
+        if isinstance(parsed, dict):
+            config = parsed
+    host = str(os.environ.get("HOST") or config.get("host") or "127.0.0.1").strip()
+    if host in {"0.0.0.0", "::"}:
+        host = "127.0.0.1"
+    try:
+        port = int(os.environ.get("PORT") or config.get("port") or 7676)
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError("DevSpace port must be an integer.") from exc
+    if port < 1 or port > 65535:
+        raise RuntimeError("DevSpace port must be between 1 and 65535.")
+    formatted_host = f"[{host}]" if ":" in host and not host.startswith("[") else host
+    return {
+        "host": host,
+        "port": port,
+        "origin": f"http://{formatted_host}:{port}",
+        "mcp_url": f"http://{formatted_host}:{port}/mcp",
+    }
+
+
+def probe_mcp_url(url: str, *, timeout: float = 5.0) -> dict[str, Any]:
+    result: dict[str, Any] = {
+        "ready": False,
+        "status": 0,
+        "oauth_challenge": False,
+        "checked_utc": utc_now(),
+        "error": "",
+    }
+    request = Request(
+        url,
+        method="GET",
+        headers={"Accept": "application/json, text/event-stream"},
+    )
+    try:
+        with urlopen(request, timeout=timeout) as response:
+            result["status"] = int(getattr(response, "status", 0) or 0)
+            challenge = str(response.headers.get("WWW-Authenticate") or "")
+            result["oauth_challenge"] = "bearer" in challenge.lower()
+    except HTTPError as exc:
+        result["status"] = int(exc.code)
+        challenge = str(exc.headers.get("WWW-Authenticate") or "")
+        result["oauth_challenge"] = "bearer" in challenge.lower()
+        if exc.code != 401:
+            result["error"] = f"HTTP {exc.code}"
+    except (URLError, OSError, TimeoutError) as exc:
+        reason = getattr(exc, "reason", exc)
+        result["error"] = safety.truncate(safety.redact_sensitive_text(str(reason)), 240)
+        return result
+    result["ready"] = result["status"] == 401 and result["oauth_challenge"]
+    if not result["ready"] and not result["error"]:
+        result["error"] = "endpoint did not return the expected OAuth Bearer challenge"
+    return result
+
+
+def wait_for_mcp_readiness(
+    *,
+    local_url: str,
+    public_url: str,
+    processes: list[subprocess.Popen[Any]],
+    timeout: int,
+    skip_public_probe: bool = False,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    deadline = time.time() + timeout
+    local_probe: dict[str, Any] = {}
+    public_probe: dict[str, Any] = {}
+    while time.time() < deadline:
+        if any(proc.poll() is not None for proc in processes):
+            break
+        local_probe = probe_mcp_url(local_url, timeout=2.0)
+        if skip_public_probe:
+            public_probe = {
+                "ready": True,
+                "status": 0,
+                "oauth_challenge": False,
+                "checked_utc": utc_now(),
+                "error": "",
+                "skipped": True,
+            }
+        elif local_probe["ready"]:
+            public_probe = probe_mcp_url(public_url, timeout=4.0)
+        if local_probe.get("ready") and public_probe.get("ready"):
+            return local_probe, public_probe
+        time.sleep(0.5)
+    return local_probe or probe_mcp_url(local_url, timeout=2.0), public_probe or (
+        {
+            "ready": True,
+            "status": 0,
+            "oauth_challenge": False,
+            "checked_utc": utc_now(),
+            "error": "",
+            "skipped": True,
+        }
+        if skip_public_probe
+        else probe_mcp_url(public_url, timeout=4.0)
+    )
+
+
 def configure_allowed_roots(args: argparse.Namespace, *, dry_run: bool = False) -> dict[str, Any]:
     project = resolve_project(args.project_dir)
     allowed_root = agent_mode.resolve_path(args.allowed_root) if args.allowed_root else project
@@ -203,7 +316,13 @@ def configure_allowed_roots(args: argparse.Namespace, *, dry_run: bool = False) 
     existing_roots = agent_mode.config_allowed_roots(config_path)
     additions = [str(allowed_root)]
     if sanitized and sanitized.workspace_dir:
-        additions.append(str(agent_mode.resolve_path(sanitized.workspace_dir)))
+        additions.append(
+            str(
+                agent_mode.resolve_path(
+                    sanitized.workspace_allowed_root or sanitized.workspace_dir
+                )
+            )
+        )
     merged_roots = agent_mode.merge_roots(existing_roots, additions, case_insensitive=case_insensitive)
     ok = not errors
     if ok and not dry_run and not args.no_write_config:
@@ -259,35 +378,33 @@ def read_state(path: Path) -> dict[str, Any]:
         return {}
 
 
-def process_alive(pid: int) -> bool:
-    if pid <= 0:
-        return False
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-    return True
+def process_alive(pid: int, expected_identity: str = "") -> bool:
+    return concurrency.process_alive(pid, expected_identity)
 
 
-def terminate_process(pid: int, timeout: int = 8) -> bool:
-    if not process_alive(pid):
+def terminate_process(pid: int, *, expected_identity: str = "", timeout: int = 8) -> bool:
+    if not process_alive(pid, expected_identity):
         return False
     try:
-        os.kill(pid, signal.SIGTERM)
+        if os.name == "posix" and os.getpgid(pid) == pid:
+            os.killpg(pid, signal.SIGTERM)
+        else:
+            os.kill(pid, signal.SIGTERM)
     except ProcessLookupError:
         return False
     deadline = time.time() + timeout
     while time.time() < deadline:
-        if not process_alive(pid):
+        if not process_alive(pid, expected_identity):
             return True
         time.sleep(0.2)
     try:
-        os.kill(pid, signal.SIGKILL)
+        if os.name == "posix" and os.getpgid(pid) == pid:
+            os.killpg(pid, signal.SIGKILL)
+        else:
+            os.kill(pid, signal.SIGKILL)
     except ProcessLookupError:
         return True
-    return not process_alive(pid)
+    return not process_alive(pid, expected_identity)
 
 
 def command_for_devspace(args: argparse.Namespace, status: agent_mode.AgentModeStatus) -> list[str]:
@@ -313,6 +430,199 @@ def wait_for_url(log_path: Path, proc: subprocess.Popen[Any], timeout: int) -> t
     return "", ""
 
 
+def wait_for_quick_tunnel_url(log_path: Path, proc: subprocess.Popen[Any], timeout: int) -> tuple[str, str]:
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if log_path.exists():
+            try:
+                text = log_path.read_text(encoding="utf-8", errors="replace")[-20000:]
+            except OSError:
+                text = ""
+            matches = list(QUICK_TUNNEL_URL_RE.finditer(text))
+            if matches:
+                return normalize_public_url(matches[-1].group(0))
+        if proc.poll() is not None:
+            break
+        time.sleep(0.5)
+    return "", ""
+
+
+def start_logged_process(
+    command: list[str],
+    *,
+    cwd: Path,
+    env: dict[str, str],
+    log_path: Path,
+    label: str,
+) -> subprocess.Popen[Any]:
+    with log_path.open("ab", buffering=0) as log_handle:
+        header = f"\n--- advisor_agent_connect {label} {utc_now()} cwd={cwd} ---\n"
+        log_handle.write(header.encode("utf-8", errors="replace"))
+        return subprocess.Popen(
+            command,
+            cwd=cwd,
+            env=env,
+            stdout=log_handle,
+            stderr=subprocess.STDOUT,
+            stdin=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+
+
+def start_quick_tunnel(
+    args: argparse.Namespace,
+    *,
+    local_origin: str,
+    cwd: Path,
+    log_path: Path,
+) -> tuple[subprocess.Popen[Any], str, str]:
+    executable = shutil.which(args.cloudflared_executable)
+    if not executable:
+        raise RuntimeError(
+            "No cloudflared executable was found for automatic tunnel mode. "
+            "Install cloudflared, pass --cloudflared-executable, or provide --public-base-url."
+        )
+    command = [executable, "tunnel", "--no-autoupdate", "--url", local_origin]
+    safety.atomic_write_text(log_path, "")
+    proc = start_logged_process(command, cwd=cwd, env=os.environ.copy(), log_path=log_path, label="cloudflared start")
+    base_url, mcp_url = wait_for_quick_tunnel_url(log_path, proc, args.timeout)
+    if not mcp_url:
+        terminate_process(proc.pid, expected_identity=concurrency.process_identity(proc.pid))
+        raise RuntimeError("cloudflared started but did not publish a public HTTPS URL before timeout")
+    return proc, base_url, mcp_url
+
+
+def exposure_root_for_status(status: agent_mode.AgentModeStatus) -> Path:
+    sanitized = status.sanitized_workspace
+    if sanitized and sanitized.used and sanitized.workspace_allowed_root:
+        return Path(sanitized.workspace_allowed_root).resolve()
+    return Path(status.selected_root or status.project_dir).resolve()
+
+
+def verify_devspace_readonly_mode(executable: str) -> None:
+    patcher = Path(__file__).resolve().with_name("devspace_readonly_patch.py")
+    completed = subprocess.run(
+        [sys.executable, str(patcher), "--check", "--executable", executable],
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        capture_output=True,
+        timeout=15,
+    )
+    if completed.returncode != 0:
+        details = safety.redact_sensitive_text(completed.stderr.strip() or completed.stdout.strip())
+        raise RuntimeError(
+            "DevSpace does not have the required read-only advisor tool mode. "
+            "Rerun this repository's setup script before serving the connector."
+            + (f" Diagnostic: {details}" if details else "")
+        )
+
+
+def start_devspace_process(
+    args: argparse.Namespace,
+    *,
+    status: agent_mode.AgentModeStatus,
+    base_url: str,
+    runtime: dict[str, Any],
+    log_path: Path,
+) -> subprocess.Popen[Any]:
+    command = command_for_devspace(args, status)
+    if not args.allow_unpatched_devspace:
+        verify_devspace_readonly_mode(args.bridge_executable)
+    env = os.environ.copy()
+    env["DEVSPACE_PUBLIC_BASE_URL"] = base_url
+    env["DEVSPACE_ALLOWED_ROOTS"] = str(exposure_root_for_status(status))
+    env["HOST"] = str(runtime["host"])
+    env["PORT"] = str(runtime["port"])
+    env["DEVSPACE_TOOL_MODE"] = "readonly"
+    env.setdefault("DEVSPACE_SKILLS", "false")
+    env.setdefault("DEVSPACE_SUBAGENTS", "false")
+    env.setdefault("DEVSPACE_LOG_REQUESTS", "false")
+    env.setdefault("DEVSPACE_LOG_TOOL_CALLS", "true")
+    env.setdefault("DEVSPACE_LOG_SHELL_COMMANDS", "false")
+    env.setdefault("DEVSPACE_TRUST_PROXY", "false")
+    return start_logged_process(
+        command,
+        cwd=Path(status.project_dir),
+        env=env,
+        log_path=log_path,
+        label="devspace start",
+    )
+
+
+def stop_recorded_processes(state: dict[str, Any]) -> dict[str, bool]:
+    results: dict[str, bool] = {}
+    for name in ("devspace", "tunnel"):
+        pid_key = f"{name}_pid"
+        identity_key = f"{name}_process_identity"
+        pid = int(state.get(pid_key) or (state.get("pid") if name == "devspace" else 0) or 0)
+        identity = str(state.get(identity_key) or "")
+        results[name] = terminate_process(pid, expected_identity=identity) if pid else False
+    return results
+
+
+def connector_runtime_status(
+    project: Path,
+    *,
+    root: Path,
+    probe_timeout: float = 4.0,
+    skip_public_probe: bool = False,
+) -> dict[str, Any]:
+    paths = state_paths(project, root)
+    state = read_state(paths["state"])
+    if not state:
+        return {
+            "lifecycle_state": "absent",
+            "connector_ready": False,
+            "state_path": str(paths["state"]),
+        }
+    devspace_pid = int(state.get("devspace_pid") or state.get("pid") or 0)
+    tunnel_pid = int(state.get("tunnel_pid") or 0)
+    devspace_running = process_alive(devspace_pid, str(state.get("devspace_process_identity") or ""))
+    tunnel_managed = bool(tunnel_pid)
+    tunnel_running = process_alive(tunnel_pid, str(state.get("tunnel_process_identity") or "")) if tunnel_managed else True
+    workspace = Path(str(state.get("agent_workspace") or ""))
+    workspace_exists = workspace.is_dir() if str(workspace) not in {"", "."} else False
+    local_url = str(state.get("local_mcp_url") or "")
+    public_url = str(state.get("mcp_url") or "")
+    readonly_tool_mode = state.get("tool_mode") == "readonly"
+    local_probe = probe_mcp_url(local_url, timeout=probe_timeout) if devspace_running and local_url else {}
+    if skip_public_probe:
+        public_probe = {
+            "ready": True,
+            "status": 0,
+            "oauth_challenge": False,
+            "checked_utc": utc_now(),
+            "error": "",
+            "skipped": True,
+        }
+    else:
+        public_probe = probe_mcp_url(public_url, timeout=probe_timeout) if devspace_running and public_url else {}
+    ready = bool(
+        devspace_running
+        and tunnel_running
+        and workspace_exists
+        and readonly_tool_mode
+        and local_probe.get("ready")
+        and public_probe.get("ready")
+    )
+    result = {
+        **state,
+        "state_path": str(paths["state"]),
+        "devspace_running": devspace_running,
+        "tunnel_managed": tunnel_managed,
+        "tunnel_running": tunnel_running,
+        "workspace_exists": workspace_exists,
+        "readonly_tool_mode": readonly_tool_mode,
+        "local_probe": local_probe,
+        "public_probe": public_probe,
+        "connector_ready": ready,
+        "lifecycle_state": "connector-ready" if ready else "stale",
+        "checked_utc": utc_now(),
+    }
+    return result
+
+
 def print_connect_summary(
     *,
     setup: dict[str, Any],
@@ -336,7 +646,11 @@ def print_connect_summary(
         print("chatgpt_connector_url: unavailable")
         print("url_hint: pass --public-base-url https://your-tunnel.example.com or set DEVSPACE_PUBLIC_BASE_URL")
     if state:
-        print(f"devspace_pid: {state.get('pid', '')}")
+        print(f"lifecycle_state: {state.get('lifecycle_state', 'unknown')}")
+        print(f"connector_ready: {'yes' if state.get('connector_ready') else 'no'}")
+        print(f"devspace_pid: {state.get('devspace_pid', state.get('pid', ''))}")
+        if state.get("tunnel_pid"):
+            print(f"tunnel_pid: {state.get('tunnel_pid')}")
         print(f"devspace_log: {state.get('log_path', '')}")
     print("chatgpt_steps:")
     print("- ChatGPT Settings -> Apps & Connectors -> Advanced settings -> enable Developer Mode.")
@@ -367,108 +681,252 @@ def command_prepare(args: argparse.Namespace) -> int:
 
 
 def command_serve(args: argparse.Namespace) -> int:
-    setup = configure_allowed_roots(args, dry_run=False)
-    if not setup["ok"]:
-        print("Advisor agent serve failed during setup:", file=sys.stderr)
-        for item in setup["errors"]:
-            print(f"- {item}", file=sys.stderr)
-        return 2
-    status = evaluate_status(args)
-    if not status.available:
-        print(agent_mode.render_status_text(status, include_node=False), file=sys.stderr)
-        return 2
-
-    bridge_path = status.bridge.resolved_path if status.bridge and status.bridge.resolved_path else args.bridge_executable
-    base_url, mcp_url, source = discover_public_url(args, bridge_path, Path(status.project_dir))
     paths = state_paths(resolve_project(args.project_dir), runtime_root(args.runtime_root))
-    existing = read_state(paths["state"])
-    pid = int(existing.get("pid") or 0)
-    if pid and process_alive(pid) and not args.force:
-        handoff = status_to_handoff(status, args.task or "")
-        print_connect_summary(setup=setup, status=status, mcp_url=existing.get("mcp_url", mcp_url), public_source=existing.get("url_source", source), handoff=handoff, state=existing)
-        print("note: existing DevSpace process is still running; use --force to restart or stop first.")
-        return 0
-    if pid and process_alive(pid):
-        terminate_process(pid)
+    lifecycle_lock = concurrency.InterProcessLock(
+        paths["lock"],
+        timeout=max(60.0, float(args.timeout) + 30.0),
+        wait_message="Advisor agent connector setup is queued behind another session for this project.",
+    )
+    with lifecycle_lock:
+        setup = configure_allowed_roots(args, dry_run=False)
+        if not setup["ok"]:
+            print("Advisor agent serve failed during setup:", file=sys.stderr)
+            for item in setup["errors"]:
+                print(f"- {item}", file=sys.stderr)
+            return 2
+        status = evaluate_status(args)
+        if not status.available:
+            print(agent_mode.render_status_text(status, include_node=False), file=sys.stderr)
+            return 2
 
-    command = command_for_devspace(args, status)
-    env = os.environ.copy()
-    if base_url:
-        env["DEVSPACE_PUBLIC_BASE_URL"] = base_url
-    if args.foreground:
-        if mcp_url:
-            print(f"chatgpt_connector_url: {mcp_url}")
-            print("Paste that URL into ChatGPT Settings -> Apps & Connectors -> Create app.")
-        print("Starting DevSpace in foreground. Press Ctrl-C to stop it.", file=sys.stderr)
-        os.execvpe(command[0], command, env)
-
-    with paths["log"].open("ab", buffering=0) as log_handle:
-        header = f"\n--- advisor_agent_connect start {utc_now()} cwd={status.project_dir} ---\n"
-        log_handle.write(header.encode("utf-8", errors="replace"))
-        proc = subprocess.Popen(
-            command,
-            cwd=status.project_dir,
-            env=env,
-            stdout=log_handle,
-            stderr=subprocess.STDOUT,
-            stdin=subprocess.DEVNULL,
-            start_new_session=True,
+        existing = connector_runtime_status(
+            resolve_project(args.project_dir),
+            root=runtime_root(args.runtime_root),
+            skip_public_probe=args.skip_public_probe,
         )
-    if not mcp_url:
-        base_url, mcp_url = wait_for_url(paths["log"], proc, args.timeout)
-        source = "devspace output" if mcp_url else source
-    if not mcp_url:
-        terminate_process(proc.pid)
-        print("DevSpace started but no public HTTPS URL was found before timeout.", file=sys.stderr)
-        print("Set DEVSPACE_PUBLIC_BASE_URL or rerun with --public-base-url https://your-tunnel.example.com", file=sys.stderr)
-        print(f"devspace_log: {paths['log']}", file=sys.stderr)
-        return 2
+        existing_root = Path(str(existing.get("allowed_root") or "")) if existing.get("allowed_root") else None
+        latest_workspace = Path(status.project_dir).resolve()
+        existing_covers_workspace = bool(
+            existing_root
+            and existing_root.exists()
+            and agent_mode.path_is_same_or_child(latest_workspace, existing_root)
+        )
+        if (
+            existing.get("connector_ready")
+            and existing.get("readonly_tool_mode")
+            and existing_covers_workspace
+            and not args.force
+        ):
+            handoff = status_to_handoff(status, args.task or "")
+            print_connect_summary(
+                setup=setup,
+                status=status,
+                mcp_url=str(existing.get("mcp_url") or ""),
+                public_source=str(existing.get("url_source") or ""),
+                handoff=handoff,
+                state=existing,
+            )
+            print("note: verified connector reused; the handoff is pinned to the current sanitized workspace generation.")
+            return 0
+        if existing.get("devspace_running") or existing.get("tunnel_running"):
+            stop_recorded_processes(existing)
 
-    state = {
-        "schema_version": "1.0",
-        "started_utc": utc_now(),
-        "pid": proc.pid,
-        "project_dir": setup["project_dir"],
-        "agent_workspace": status.project_dir,
-        "mcp_url": mcp_url,
-        "public_base_url": base_url,
-        "url_source": source,
-        "log_path": str(paths["log"]),
-        "command": safety.redact_argv(command),
-    }
-    safety.atomic_write_json(paths["state"], state)
-    handoff = status_to_handoff(status, args.task or "")
-    print_connect_summary(setup=setup, status=status, mcp_url=mcp_url, public_source=source, handoff=handoff, state=state)
-    if args.open_chatgpt_settings:
-        webbrowser.open("https://chatgpt.com/#settings/Apps")
-    return 0
+        bridge_path = status.bridge.resolved_path if status.bridge and status.bridge.resolved_path else args.bridge_executable
+        runtime = read_devspace_runtime(bridge_path, Path(status.project_dir))
+        base_url, mcp_url, source = discover_public_url(args, bridge_path, Path(status.project_dir))
+        if source == "devspace config publicBaseUrl" and args.tunnel_mode == "auto":
+            configured_probe = probe_mcp_url(mcp_url, timeout=2.0)
+            if configured_probe.get("status") == 0:
+                base_url, mcp_url, source = "", "", ""
+        tunnel_proc: subprocess.Popen[Any] | None = None
+        devspace_proc: subprocess.Popen[Any] | None = None
+
+        if args.foreground:
+            if not base_url:
+                raise RuntimeError("foreground mode requires --public-base-url or a configured DevSpace publicBaseUrl")
+            command = command_for_devspace(args, status)
+            if not args.allow_unpatched_devspace:
+                verify_devspace_readonly_mode(args.bridge_executable)
+            env = os.environ.copy()
+            env["DEVSPACE_PUBLIC_BASE_URL"] = base_url
+            env["DEVSPACE_ALLOWED_ROOTS"] = str(exposure_root_for_status(status))
+            env["HOST"] = str(runtime["host"])
+            env["PORT"] = str(runtime["port"])
+            env["DEVSPACE_TOOL_MODE"] = "readonly"
+            env.setdefault("DEVSPACE_SKILLS", "false")
+            env.setdefault("DEVSPACE_SUBAGENTS", "false")
+            env.setdefault("DEVSPACE_LOG_REQUESTS", "false")
+            env.setdefault("DEVSPACE_LOG_TOOL_CALLS", "true")
+            env.setdefault("DEVSPACE_LOG_SHELL_COMMANDS", "false")
+            env.setdefault("DEVSPACE_TRUST_PROXY", "false")
+            print(f"chatgpt_connector_url: {mcp_url}")
+            print("Starting DevSpace in foreground. Press Ctrl-C to stop it.", file=sys.stderr)
+            os.execvpe(command[0], command, env)
+
+        def launch_with_url(selected_base: str, selected_mcp: str, selected_source: str) -> tuple[subprocess.Popen[Any], dict[str, Any], dict[str, Any]]:
+            proc = start_devspace_process(
+                args,
+                status=status,
+                base_url=selected_base,
+                runtime=runtime,
+                log_path=paths["log"],
+            )
+            local_probe, public_probe = wait_for_mcp_readiness(
+                local_url=str(runtime["mcp_url"]),
+                public_url=selected_mcp,
+                processes=[item for item in (proc, tunnel_proc) if item is not None],
+                timeout=args.timeout,
+                skip_public_probe=args.skip_public_probe,
+            )
+            return proc, local_probe, public_probe
+
+        try:
+            if not base_url:
+                if args.tunnel_mode != "auto":
+                    raise RuntimeError(
+                        "No public HTTPS URL is configured. Use --tunnel-mode auto, "
+                        "pass --public-base-url, or set DEVSPACE_PUBLIC_BASE_URL."
+                    )
+                tunnel_proc, base_url, mcp_url = start_quick_tunnel(
+                    args,
+                    local_origin=str(runtime["origin"]),
+                    cwd=Path(status.project_dir),
+                    log_path=paths["tunnel_log"],
+                )
+                source = "managed cloudflared quick tunnel"
+
+            devspace_proc, local_probe, public_probe = launch_with_url(base_url, mcp_url, source)
+            if not (local_probe.get("ready") and public_probe.get("ready")):
+                can_replace_stale_config = (
+                    args.tunnel_mode == "auto"
+                    and source == "devspace config publicBaseUrl"
+                    and tunnel_proc is None
+                )
+                if not can_replace_stale_config:
+                    raise RuntimeError(
+                        "DevSpace did not become connector-ready: "
+                        f"local={local_probe.get('error') or local_probe.get('status')}; "
+                        f"public={public_probe.get('error') or public_probe.get('status')}"
+                    )
+                terminate_process(
+                    devspace_proc.pid,
+                    expected_identity=concurrency.process_identity(devspace_proc.pid),
+                )
+                devspace_proc = None
+                tunnel_proc, base_url, mcp_url = start_quick_tunnel(
+                    args,
+                    local_origin=str(runtime["origin"]),
+                    cwd=Path(status.project_dir),
+                    log_path=paths["tunnel_log"],
+                )
+                source = "managed cloudflared quick tunnel replacing stale DevSpace config"
+                devspace_proc, local_probe, public_probe = launch_with_url(base_url, mcp_url, source)
+                if not (local_probe.get("ready") and public_probe.get("ready")):
+                    raise RuntimeError(
+                        "Managed quick tunnel did not become connector-ready: "
+                        f"local={local_probe.get('error') or local_probe.get('status')}; "
+                        f"public={public_probe.get('error') or public_probe.get('status')}"
+                    )
+
+            allowed_root = exposure_root_for_status(status)
+            state = {
+                "schema_version": "2.0",
+                "lifecycle_state": "connector-ready",
+                "connector_ready": True,
+                "started_utc": utc_now(),
+                "project_dir": setup["project_dir"],
+                "agent_workspace": status.project_dir,
+                "allowed_root": str(allowed_root),
+                "workspace_generation": (
+                    status.sanitized_workspace.generation_id
+                    if status.sanitized_workspace and status.sanitized_workspace.used
+                    else ""
+                ),
+                "workspace_fingerprint": (
+                    status.sanitized_workspace.source_fingerprint
+                    if status.sanitized_workspace and status.sanitized_workspace.used
+                    else ""
+                ),
+                "tool_mode": "readonly",
+                "local_mcp_url": str(runtime["mcp_url"]),
+                "mcp_url": mcp_url,
+                "public_base_url": base_url,
+                "url_source": source,
+                "devspace_pid": devspace_proc.pid,
+                "devspace_process_identity": concurrency.process_identity(devspace_proc.pid),
+                "tunnel_pid": tunnel_proc.pid if tunnel_proc else 0,
+                "tunnel_process_identity": concurrency.process_identity(tunnel_proc.pid) if tunnel_proc else "",
+                "log_path": str(paths["log"]),
+                "tunnel_log_path": str(paths["tunnel_log"]) if tunnel_proc else "",
+                "local_probe": local_probe,
+                "public_probe": public_probe,
+                "verified_utc": utc_now(),
+                "command": safety.redact_argv(command_for_devspace(args, status)),
+            }
+            safety.atomic_write_json(paths["state"], state)
+            handoff = status_to_handoff(status, args.task or "")
+            print_connect_summary(
+                setup=setup,
+                status=status,
+                mcp_url=mcp_url,
+                public_source=source,
+                handoff=handoff,
+                state=state,
+            )
+            if args.open_chatgpt_settings:
+                webbrowser.open("https://chatgpt.com/#settings/Apps")
+            return 0
+        except RuntimeError:
+            if devspace_proc is not None:
+                terminate_process(
+                    devspace_proc.pid,
+                    expected_identity=concurrency.process_identity(devspace_proc.pid),
+                )
+            if tunnel_proc is not None:
+                terminate_process(
+                    tunnel_proc.pid,
+                    expected_identity=concurrency.process_identity(tunnel_proc.pid),
+                )
+            raise
 
 
 def command_stop(args: argparse.Namespace) -> int:
-    paths = state_paths(resolve_project(args.project_dir), runtime_root(args.runtime_root))
-    state = read_state(paths["state"])
-    pid = int(state.get("pid") or 0)
-    if not pid:
-        print("No DevSpace process state recorded for this project.")
-        return 0
-    if not process_alive(pid):
-        print(f"Recorded DevSpace process is not running: pid={pid}")
-        return 0
-    stopped = terminate_process(pid)
-    print(f"stopped: {'yes' if stopped else 'no'}")
-    print(f"pid: {pid}")
+    project = resolve_project(args.project_dir)
+    root = runtime_root(args.runtime_root)
+    paths = state_paths(project, root)
+    with concurrency.InterProcessLock(paths["lock"], timeout=30.0):
+        state = read_state(paths["state"])
+        if not state:
+            print("No advisor connector process state recorded for this project.")
+            return 0
+        before = connector_runtime_status(
+            project,
+            root=root,
+            skip_public_probe=True,
+        )
+        stopped = stop_recorded_processes(state)
+        state.update(
+            {
+                "lifecycle_state": "stopped",
+                "connector_ready": False,
+                "stopped_utc": utc_now(),
+                "devspace_pid": 0,
+                "tunnel_pid": 0,
+            }
+        )
+        safety.atomic_write_json(paths["state"], state)
+    print(f"devspace_stopped: {'yes' if stopped['devspace'] or not before.get('devspace_running') else 'no'}")
+    print(f"tunnel_stopped: {'yes' if stopped['tunnel'] or not before.get('tunnel_managed') or not before.get('tunnel_running') else 'no'}")
     print(f"state_path: {paths['state']}")
-    return 0 if stopped else 2
+    return 0
 
 
 def command_status(args: argparse.Namespace) -> int:
-    paths = state_paths(resolve_project(args.project_dir), runtime_root(args.runtime_root))
-    state = read_state(paths["state"])
-    if not state:
-        print("No advisor DevSpace state recorded for this project.")
-        return 0
-    pid = int(state.get("pid") or 0)
-    state["running"] = process_alive(pid)
+    state = connector_runtime_status(
+        resolve_project(args.project_dir),
+        root=runtime_root(args.runtime_root),
+        skip_public_probe=args.skip_public_probe,
+    )
     print(json.dumps(state, indent=2))
     return 0
 
@@ -478,7 +936,14 @@ def add_common_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--allowed-root", type=Path, help="Allowed root to store. Defaults to the exact project directory.")
     parser.add_argument("--config-path", help="User-level config path. Defaults to ~/.codex/advisor-agent/config.json.")
     parser.add_argument("--bridge-executable", default=os.environ.get(agent_mode.BRIDGE_EXECUTABLE_ENV, agent_mode.DEFAULT_BRIDGE_EXECUTABLE))
-    parser.add_argument("--sanitized-workspace", choices=sorted(agent_mode.VALID_SANITIZED_WORKSPACE_MODES), default=os.environ.get(agent_mode.SANITIZED_WORKSPACE_ENV, "auto"))
+    parser.add_argument(
+        "--sanitized-workspace",
+        choices=sorted(agent_mode.VALID_SANITIZED_WORKSPACE_MODES),
+        default=os.environ.get(
+            agent_mode.SANITIZED_WORKSPACE_ENV,
+            agent_mode.DEFAULT_SANITIZED_WORKSPACE_MODE,
+        ),
+    )
     parser.add_argument("--workspace-root", help="Root for generated sanitized workspaces. Defaults to ~/.codex/advisor-agent/workspaces.")
     parser.add_argument("--runtime-root", help="Root for DevSpace pid/log state. Defaults to ~/.codex/advisor-agent/devspace.")
     parser.add_argument("--public-base-url", help="Public HTTPS tunnel base URL. The script prints this with /mcp for ChatGPT.")
@@ -502,7 +967,20 @@ def parse_args() -> argparse.Namespace:
 
     serve = sub.add_parser("serve", help="Prepare config/workspace, start DevSpace, and print the ChatGPT connector URL/handoff.")
     add_common_args(serve)
-    serve.add_argument("--timeout", type=int, default=DEFAULT_CONNECT_TIMEOUT, help="Seconds to wait for DevSpace output to reveal a public URL.")
+    serve.add_argument("--timeout", type=int, default=DEFAULT_CONNECT_TIMEOUT, help="Seconds to wait for the tunnel and MCP readiness checks.")
+    serve.add_argument(
+        "--tunnel-mode",
+        choices=sorted(VALID_TUNNEL_MODES),
+        default="auto",
+        help="Use a managed cloudflared quick tunnel automatically, require configured URL state, or disable tunnel startup.",
+    )
+    serve.add_argument("--cloudflared-executable", default="cloudflared", help="cloudflared executable used by automatic tunnel mode.")
+    serve.add_argument("--skip-public-probe", action="store_true", help="Skip the public MCP health probe. Diagnostic/testing only.")
+    serve.add_argument(
+        "--allow-unpatched-devspace",
+        action="store_true",
+        help="Diagnostic/testing only: start without verifying the mechanically read-only DevSpace patch.",
+    )
     serve.add_argument("--foreground", action="store_true", help="Run DevSpace in the foreground after printing any known URL.")
     serve.add_argument("--force", action="store_true", help="Restart an existing recorded DevSpace process for this project.")
     serve.set_defaults(func=command_serve)
@@ -515,6 +993,7 @@ def parse_args() -> argparse.Namespace:
     status = sub.add_parser("status", help="Show recorded background DevSpace state for this project.")
     status.add_argument("--project-dir", type=Path, default=Path.cwd())
     status.add_argument("--runtime-root", help="Root for DevSpace pid/log state. Defaults to ~/.codex/advisor-agent/devspace.")
+    status.add_argument("--skip-public-probe", action="store_true", help="Skip the public MCP health probe. Diagnostic/testing only.")
     status.set_defaults(func=command_status)
     return parser.parse_args()
 

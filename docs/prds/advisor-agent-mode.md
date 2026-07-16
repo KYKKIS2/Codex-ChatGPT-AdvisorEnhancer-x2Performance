@@ -61,9 +61,9 @@ When complete, Codex should have durable scripts/docs/instructions for:
 ## Acceptance Criteria
 
 - Existing advisor tests still pass, including:
-  - `./test-advisor-transport-recovery.sh`
-  - `./test-router.sh`
-  - `./test-security-regressions.sh`
+  - `./tests/test-advisor-transport-recovery.sh`
+  - `./tests/test-router.sh`
+  - `./tests/test-security-regressions.sh`
 - A new or updated test covers agent-mode root validation and denies at least `~`, `/`, `.ssh`, `.env`, HAR/cookie paths, and `.codex-advisor`.
 - New tests cover symlink escape, allowed-root parent/child confusion, `.env.local`, OpenaiChat auth filenames, HAR filenames, browser profile directories, wallet/private-key patterns, path names containing spaces, and case-insensitive comparisons where the platform requires them.
 - New or updated tests cover user-level setup config, config path outside the project, secret preflight fallback, and prompt-only fallback when agent-mode is unsafe.
@@ -102,7 +102,7 @@ When complete, Codex should have durable scripts/docs/instructions for:
 ## Resolved Decisions
 
 - The first implementation routes through `scripts/agent_mode.py` plus `scripts/router.py`; `advisor.py` remains prompt-only and dependency-free.
-- General setup remains passive for agent mode. It does not install DevSpace, write allowed roots, launch DevSpace, open tunnels, or contact ChatGPT.
+- General setup installs and patches the pinned DevSpace package but remains passive with respect to project exposure: it does not write project allowed roots, launch DevSpace, open tunnels, modify ChatGPT settings, or contact ChatGPT.
 - The explicit `advisor_agent_setup.py` helper may write the current validated root to user-level config only, never repo-local config, and never launches DevSpace, opens tunnels, contacts ChatGPT, or writes credentials.
 - V1 writes no repo-local agent-mode state. `.codex-advisor/` transcript/conversation state remains denied for agent-mode exposure; only route-log bookkeeping files are allowed.
 - If blocked files are present, V1 creates a managed sanitized review copy under `~/.codex/advisor-agent/workspaces/`, skips sensitive/generated/bulk files, writes a manifest, and labels the handoff as `sanitized_copy`.

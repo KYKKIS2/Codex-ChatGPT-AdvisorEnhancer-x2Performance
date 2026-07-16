@@ -117,34 +117,48 @@ def command_preview(decision: RouteDecision, args: argparse.Namespace) -> list[s
     if decision.command_kind == "agent-mode":
         command = [
             sys.executable,
-            str(script_path("agent_mode.py")),
-            "--print-handoff",
+            str(script_path("advisor_agent.py")),
             "--project-dir", str(args.project_dir),
-            "--agent-mode", args.agent_mode,
-            "--bridge-executable", args.agent_bridge_executable,
+            "--provider", args.provider,
+            "--base-url", args.base_url,
+            "--model", args.model,
+            "--timeout", str(args.agent_timeout),
+            "--queue-timeout", str(args.agent_queue_timeout),
+            "--max-output-tokens", str(args.max_output_tokens),
+            "--role", decision.roles[0] if decision.roles else "reviewer",
         ]
-        for root in args.agent_allowed_root:
-            command.extend(["--allowed-root", root])
-        if args.agent_no_require_bridge:
-            command.append("--no-require-bridge")
-        allow_project_bridge = args.agent_allow_project_bridge or truthy(os.environ.get("ADVISOR_AGENT_ALLOW_PROJECT_BRIDGE"))
-        allow_sensitive_project = args.agent_allow_sensitive_project or truthy(os.environ.get("ADVISOR_AGENT_ALLOW_SENSITIVE_PROJECT"))
-        secret_scan_disabled = args.agent_no_secret_scan or falsey(os.environ.get("ADVISOR_AGENT_SECRET_SCAN"))
-        if allow_project_bridge:
-            command.append("--allow-project-bridge")
-        if allow_sensitive_project:
-            command.append("--allow-sensitive-project")
-        if secret_scan_disabled:
-            command.append("--no-secret-scan")
-        command.extend(["--sanitized-workspace", args.agent_sanitized_workspace])
-        if args.agent_workspace_root:
-            command.extend(["--workspace-root", args.agent_workspace_root])
-        if args.agent_config_path:
-            command.extend(["--config-path", args.agent_config_path])
-        if args.agent_case_insensitive_paths:
-            command.append("--case-insensitive-paths")
-        if args.agent_checkout:
-            command.append("--checkout")
+        if args.thinking_effort is not None:
+            command.extend(["--thinking-effort", args.thinking_effort])
+        if args.agent_allow_shell:
+            command.append("--allow-shell")
+        if args.agent_dry_run:
+            command.append("--dry-run")
+        return command
+    if decision.command_kind == "agent-conclave":
+        command = [
+            sys.executable,
+            str(script_path("agent_conclave.py")),
+            "--project-dir", str(args.project_dir),
+            "--provider", args.provider,
+            "--base-url", args.base_url,
+            "--model", args.model,
+            "--timeout", str(args.agent_timeout),
+            "--queue-timeout", str(args.agent_queue_timeout),
+            "--max-output-tokens", str(args.max_output_tokens),
+            "--mode", decision.mode or "general",
+            "--parallel",
+            "--max-workers", str(args.agent_max_workers),
+        ]
+        if decision.roles:
+            command.extend(["--roles", ",".join(decision.roles)])
+        if args.thinking_effort is not None:
+            command.extend(["--thinking-effort", args.thinking_effort])
+        if args.agent_allow_shell:
+            command.append("--allow-shell")
+        if args.no_synthesis:
+            command.append("--no-synthesis")
+        if args.agent_dry_run:
+            command.append("--dry-run")
         return command
     if decision.command_kind == "advisor":
         return [
@@ -275,7 +289,9 @@ def forced_decision(route: str, reasons: list[str]) -> RouteDecision:
     if route == "no-advisor":
         return RouteDecision(route, "none", None, [], False, 1.0, reasons, "Forced no-advisor route.")
     if route == "agent-mode":
-        return RouteDecision(route, "agent-mode", "review", [], False, 1.0, reasons)
+        return RouteDecision(route, "agent-mode", "review", ["reviewer"], False, 1.0, reasons)
+    if route == "agent-conclave":
+        return RouteDecision(route, "agent-conclave", "architecture", ["architect", "critic"], False, 1.0, reasons)
     if route == "single-advisor":
         return RouteDecision(route, "advisor", None, [], False, 1.0, reasons)
     if route == "conclave":
@@ -290,10 +306,12 @@ def forced_decision(route: str, reasons: list[str]) -> RouteDecision:
 def evaluate_agent_preference(args: argparse.Namespace, decision: RouteDecision) -> tuple[RouteDecision, dict[str, Any] | None]:
     if args.prompt_only:
         return decision, {"available": False, "notes": ["prompt-only override selected"]}
-    if args.force_route and args.force_route != "agent-mode":
+    if args.force_route and args.force_route not in {"agent-mode", "agent-conclave"}:
         return decision, {"available": False, "notes": [f"forced route bypassed agent-mode: {args.force_route}"]}
     if decision.route == "no-advisor":
         return decision, None
+    if decision.machine_json:
+        return decision, {"available": False, "notes": ["machine-json verifier keeps the prompt-only evidence loop"]}
     try:
         import agent_mode  # noqa: PLC0415
     except Exception as exc:  # pragma: no cover - defensive import guard
@@ -315,8 +333,28 @@ def evaluate_agent_preference(args: argparse.Namespace, decision: RouteDecision)
     payload = status.to_dict()
     if status.available:
         reasons = [*decision.reasons, "safe repo-aware agent-mode configured"]
-        return RouteDecision("agent-mode", "agent-mode", "review", [], False, 0.92, reasons), payload
-    if decision.route == "agent-mode":
+        if args.force_route == "agent-conclave" or (
+            decision.command_kind == "conclave" and len(decision.roles) > 1
+        ):
+            return RouteDecision(
+                "agent-conclave",
+                "agent-conclave",
+                decision.mode or "general",
+                decision.roles or ["planner", "critic"],
+                False,
+                0.94,
+                reasons,
+            ), payload
+        return RouteDecision(
+            "agent-mode",
+            "agent-mode",
+            decision.mode or "review",
+            decision.roles[:1] or ["reviewer"],
+            False,
+            0.92,
+            reasons,
+        ), payload
+    if decision.route in {"agent-mode", "agent-conclave"}:
         return decision, payload
     return decision, payload
 
@@ -410,22 +448,8 @@ def execute_route(args: argparse.Namespace, prompt: str, decision: RouteDecision
         print(decision.skip_reason)
         return 0
     command = command_preview(decision, args)
-    if decision.command_kind == "agent-mode":
-        started = time.monotonic()
-        completed = subprocess.run(
-            [*command, "--task-stdin"],
-            cwd=args.project_dir,
-            input=prompt,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=30,
-        )
-        elapsed = time.monotonic() - started
-        print(f"\nRouter agent-mode handoff finished in {elapsed:.1f}s with exit code {completed.returncode}.")
-        return completed.returncode
     context_files: list[str] = []
-    if not args.no_context_pack:
+    if decision.command_kind not in {"agent-mode", "agent-conclave"} and not args.no_context_pack:
         pack_path = build_context_pack(args, prompt)
         if pack_path:
             context_files.append(str(pack_path))
@@ -461,6 +485,24 @@ def execute_route(args: argparse.Namespace, prompt: str, decision: RouteDecision
         prompt = f"{prompt.strip()}\n\n--- Advisor context pack ---\n" + "\n\n---\n\n".join(blocks)
     if args.error_output:
         prompt = f"{prompt.strip()}\n\n--- Error output / failed evidence ---\n{args.error_output.strip()}"
+    execution_timeout = args.timeout + 30
+    if decision.command_kind == "agent-conclave":
+        role_waves = max(
+            1,
+            (len(decision.roles) + args.agent_max_workers - 1)
+            // args.agent_max_workers,
+        )
+        synthesis_wave = 0 if args.no_synthesis else 1
+        execution_timeout = (
+            (role_waves + synthesis_wave)
+            * (args.agent_queue_timeout + args.agent_timeout)
+            + 90
+        )
+    elif decision.command_kind == "agent-mode":
+        execution_timeout = args.agent_queue_timeout + args.agent_timeout + 60
+    elif decision.command_kind == "conclave":
+        synthesis_wave = 0 if args.no_synthesis or len(decision.roles) == 1 else 1
+        execution_timeout = (max(1, len(decision.roles)) + synthesis_wave) * args.timeout + 90
     started = time.monotonic()
     completed = subprocess.run(
         command,
@@ -470,7 +512,7 @@ def execute_route(args: argparse.Namespace, prompt: str, decision: RouteDecision
         text=True,
         encoding="utf-8",
         errors="replace",
-        timeout=args.timeout + 30,
+        timeout=execution_timeout,
     )
     elapsed = time.monotonic() - started
     print(f"\nRouter execution finished in {elapsed:.1f}s with exit code {completed.returncode}.")
@@ -491,7 +533,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--high-impact", action="store_true", help="Signal that a wrong answer has meaningful cost.")
     parser.add_argument("--before-final", action="store_true", help="Route to critic-only before final answer.")
     parser.add_argument("--machine-verify", action="store_true", help="Route to machine-json verifier.")
-    parser.add_argument("--force-route", choices=["no-advisor", "agent-mode", "single-advisor", "conclave", "verifier", "machine-json-verifier"])
+    parser.add_argument(
+        "--force-route",
+        choices=[
+            "no-advisor",
+            "agent-mode",
+            "agent-conclave",
+            "single-advisor",
+            "conclave",
+            "verifier",
+            "machine-json-verifier",
+        ],
+    )
     parser.add_argument("--execute", action="store_true", help="Execute the selected advisor route.")
     parser.add_argument("--json", action="store_true", help="Print only JSON route decision.")
     parser.add_argument("--provider", choices=["openai", "openai-compatible"], default=os.environ.get("ADVISOR_PROVIDER", "openai-compatible"))
@@ -509,6 +562,19 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--max-output-tokens", type=int, default=int(os.environ.get("ADVISOR_MAX_OUTPUT_TOKENS", "1200")))
     parser.add_argument("--timeout", type=int, default=int(os.environ.get("ADVISOR_TIMEOUT", "300")))
+    parser.add_argument("--agent-timeout", type=int, default=int(os.environ.get("ADVISOR_AGENT_TIMEOUT", "900")))
+    parser.add_argument(
+        "--agent-queue-timeout",
+        type=float,
+        default=float(os.environ.get("ADVISOR_QUEUE_TIMEOUT", "3600")),
+        help="Maximum seconds repo-aware calls may wait for a shared advisor worker lease.",
+    )
+    parser.add_argument(
+        "--agent-max-workers",
+        type=int,
+        default=int(os.environ.get("ADVISOR_AGENT_MAX_WORKERS", "2")),
+        help="Maximum repo-aware specialist subprocesses launched together; the g4f pool still limits active calls.",
+    )
     parser.add_argument("--project-dir", type=Path, help="Project directory. Defaults to the nearest Git repo root or current directory.")
     parser.add_argument("--allow-sensitive-advisor", action="store_true", help="Allow advisor routing for security/privacy/auth/token tasks after caller redaction.")
     parser.add_argument("--allow-outside-project-context", action="store_true", help="Allow context/draft/error files outside the project directory.")
@@ -533,13 +599,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--agent-sanitized-workspace",
         choices=["auto", "always", "off"],
-        default=os.environ.get("ADVISOR_AGENT_SANITIZED_WORKSPACE", "auto"),
+        default=os.environ.get("ADVISOR_AGENT_SANITIZED_WORKSPACE", "always"),
         help="Use a generated sanitized review workspace automatically, always, or never.",
     )
     parser.add_argument("--agent-workspace-root", default=os.environ.get("ADVISOR_AGENT_WORKSPACE_ROOT"), help="Root for generated sanitized agent workspaces.")
     parser.add_argument("--agent-config-path", default=os.environ.get("ADVISOR_AGENT_CONFIG"), help="User-level advisor agent config path.")
     parser.add_argument("--agent-case-insensitive-paths", action="store_true", help="Use case-insensitive path checks for agent-mode root validation.")
     parser.add_argument("--agent-checkout", action="store_true", help="Generate an agent-mode checkout handoff instead of preferring worktree.")
+    parser.add_argument(
+        "--agent-allow-shell",
+        action="store_true",
+        help="Deprecated safety diagnostic; rejected because repo-aware connectors are mechanically read-only.",
+    )
+    parser.add_argument("--agent-dry-run", action="store_true", help="Build repo-aware agent artifacts without calling ChatGPT.")
     return parser.parse_args()
 
 
@@ -549,9 +621,20 @@ def main() -> int:
     args.thinking_effort = select_request_thinking_effort(args.thinking_effort)
     args.model = select_request_model(args.thinking_effort, args.model)
     args.project_dir = resolve_project_dir(args.project_dir)
+    if args.agent_max_workers < 1:
+        print("--agent-max-workers must be at least 1.", file=sys.stderr)
+        return 2
+    if args.agent_allow_shell:
+        print(
+            "--agent-allow-shell is disabled: the repo-aware advisor connector is mechanically read-only.",
+            file=sys.stderr,
+        )
+        return 2
     args.trace_id = args.trace_id or str(uuid.uuid4())
     args.task_id = args.task_id or str(uuid.uuid4())
-    prompt = sanitize_text(args.prompt if args.prompt is not None else sys.stdin.read())
+    prompt = safety.redact_sensitive_text(
+        sanitize_text(args.prompt if args.prompt is not None else sys.stdin.read())
+    )
     if args.draft_file:
         _, args.draft = safety.read_context_file(
             args.project_dir,
@@ -564,6 +647,10 @@ def main() -> int:
             args.error_file,
             allow_outside_project=args.allow_outside_project_context,
         )
+    if args.draft:
+        args.draft = safety.redact_sensitive_text(args.draft)
+    if args.error_output:
+        args.error_output = safety.redact_sensitive_text(args.error_output)
     if not prompt.strip():
         print("Provide --prompt or pipe text on stdin.", file=sys.stderr)
         return 2

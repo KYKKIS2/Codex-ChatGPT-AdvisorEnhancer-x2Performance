@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SCRIPTS="$ROOT/codex-skill/external-advisor/scripts"
 PROJECT="$(mktemp -d)"
 trap 'rm -rf "$PROJECT"' EXIT
@@ -32,9 +32,11 @@ printf 'RENAMED_TOKEN=renamed-secret-that-must-not-leak-2\n' > "$PROJECT/.env.re
 
 CONTEXT_JSON="$(python3 "$SCRIPTS/context_pack.py" \
   --project-dir "$PROJECT" \
-  --prompt "Check diff redaction." \
+  --prompt "Check diff redaction. api_key=prompt-secret-value-1234567890" \
+  --draft "password=draft-secret-value-1234567890" \
+  --failure "access_token=failure-secret-value-1234567890" \
   --json)"
-if grep -R "supersecret-value-that-must-not-leak\\|staged-secret-that-must-not-leak\\|renamed-secret-that-must-not-leak\\|deleted-secret-that-must-not-leak" "$PROJECT/.codex-advisor"; then
+if grep -R "supersecret-value-that-must-not-leak\\|staged-secret-that-must-not-leak\\|renamed-secret-that-must-not-leak\\|deleted-secret-that-must-not-leak\\|prompt-secret-value\\|draft-secret-value\\|failure-secret-value" "$PROJECT/.codex-advisor"; then
   echo "Sensitive .env diff content leaked into context pack artifacts." >&2
   exit 1
 fi
@@ -107,6 +109,37 @@ data = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
 statuses = [item.get("status") for item in data.get("command_results", [])]
 if statuses[:3] != ["skipped", "skipped", "skipped"] or statuses[-1:] != ["completed"]:
     raise SystemExit(f"Unexpected verifier command statuses: {statuses!r}")
+PY
+
+PYTHONPATH="$SCRIPTS" python3 - "$PROJECT" <<'PY'
+import subprocess
+import sys
+from pathlib import Path
+from types import SimpleNamespace
+
+import verifier_loop
+
+project = Path(sys.argv[1])
+args = SimpleNamespace(
+    allow_unsafe_commands=False,
+    project_dir=project,
+    command_timeout=5,
+    output_chars=2000,
+)
+old_run = subprocess.run
+try:
+    subprocess.run = lambda *_args, **_kwargs: SimpleNamespace(
+        returncode=0,
+        stdout="api_key=command-output-secret-value-1234567890\n",
+        stderr="Bearer command-error-secret-value-1234567890\n",
+    )
+    result = verifier_loop.run_command(args, "python3 --version")
+finally:
+    subprocess.run = old_run
+if "command-output-secret-value" in result.stdout or "command-error-secret-value" in result.stderr:
+    raise SystemExit("Verifier command output was not redacted.")
+if "[REDACTED]" not in result.stdout or "[REDACTED]" not in result.stderr:
+    raise SystemExit("Verifier command redaction markers were not preserved.")
 PY
 
 PYTHONPATH="$SCRIPTS" ADVISOR_PROJECT_DIR="$PROJECT" ADVISOR_AUTO_CREATE_PROJECT=false python3 - "$PROJECT" <<'PY'

@@ -1,5 +1,5 @@
 $ErrorActionPreference = "Stop"
-$Root = Split-Path -Parent $MyInvocation.MyCommand.Path
+$Root = Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path)
 $ContextPack = Join-Path $Root "codex-skill\external-advisor\scripts\context_pack.py"
 $Project = Join-Path $env:TEMP ("advisor-context-pack-test-" + [guid]::NewGuid())
 $Latest = Join-Path $Project ".codex-advisor\latest-context-pack.json"

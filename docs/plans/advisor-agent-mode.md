@@ -84,10 +84,10 @@ Relevant files:
 - `codex-skill/external-advisor/scripts/agent_mode.py`
 - `codex-skill/external-advisor/scripts/advisor_agent_setup.py`
 - `codex-skill/external-advisor/scripts/advisor_safety.py`
-- `test-advisor-transport-recovery.sh`
-- `test-router.sh`
-- `test-security-regressions.sh`
-- `test-agent-mode.sh`
+- `tests/test-advisor-transport-recovery.sh`
+- `tests/test-router.sh`
+- `tests/test-security-regressions.sh`
+- `tests/test-agent-mode.sh`
 
 Current friction:
 - The advisor has no implicit repository access and can only reason from context Codex sends.
@@ -153,8 +153,8 @@ Work:
 
 Validation:
 - `python3 -m py_compile codex-skill/external-advisor/scripts/agent_mode.py codex-skill/external-advisor/scripts/advisor_safety.py`
-- `./test-agent-mode.sh`
-- `./test-security-regressions.sh`
+- `./tests/test-agent-mode.sh`
+- `./tests/test-security-regressions.sh`
 
 ### Milestone 3: Add Dry-Run Doctor And Handoff Flow
 
@@ -167,7 +167,7 @@ Work:
 Validation:
 - `python3 codex-skill/external-advisor/scripts/agent_mode.py --doctor --project-dir . --allowed-root .`
 - `python3 codex-skill/external-advisor/scripts/agent_mode.py --print-handoff --project-dir . --allowed-root .`
-- `./test-agent-mode.sh`
+- `./tests/test-agent-mode.sh`
 
 ### Milestone 4: Add Default Route Selection
 
@@ -178,9 +178,9 @@ Work:
 - Add tests for configured agent-mode selection, unsafe fallback, unavailable bridge fallback, explicit prompt-only override, and route reporting.
 
 Validation:
-- `./test-agent-mode.sh`
-- `./test-router.sh`
-- `./test-security-regressions.sh`
+- `./tests/test-agent-mode.sh`
+- `./tests/test-router.sh`
+- `./tests/test-security-regressions.sh`
 
 ### Milestone 5: Update Skill And Setup Documentation
 
@@ -202,10 +202,10 @@ Work:
 - Update this plan's progress and outcomes.
 
 Validation:
-- `./test-advisor-transport-recovery.sh`
-- `./test-router.sh`
-- `./test-security-regressions.sh`
-- `./test-agent-mode.sh`
+- `./tests/test-advisor-transport-recovery.sh`
+- `./tests/test-router.sh`
+- `./tests/test-security-regressions.sh`
+- `./tests/test-agent-mode.sh`
 - `git status --short`
 - `git diff --check`
 

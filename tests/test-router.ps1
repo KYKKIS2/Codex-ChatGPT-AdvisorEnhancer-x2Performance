@@ -1,5 +1,5 @@
 $ErrorActionPreference = "Stop"
-$Root = Split-Path -Parent $MyInvocation.MyCommand.Path
+$Root = Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path)
 $Router = Join-Path $Root "codex-skill\external-advisor\scripts\router.py"
 $Project = Join-Path $env:TEMP ("advisor-router-test-" + [guid]::NewGuid())
 New-Item -ItemType Directory -Force -Path $Project | Out-Null

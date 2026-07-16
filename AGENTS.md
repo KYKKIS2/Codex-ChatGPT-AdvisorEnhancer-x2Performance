@@ -6,7 +6,7 @@ This repository bundles Codex skills under `codex-skill/`. The setup scripts ins
 
 Use bundled skills when the user request matches their domain. Prefer the most specific skill first, and combine skills when a web task crosses design, implementation, database, security, and deployment.
 
-- Use `external-advisor` for architecture, strategy, planning, tradeoff analysis, critique, verification, and important judgment-heavy decisions.
+- Use `external-advisor` for architecture, strategy, planning, tradeoff analysis, critique, verification, and important judgment-heavy decisions. Prefer `router.py --execute`; when the registered DevSpace connector is ready it runs a repo-aware single agent or agent conclave, otherwise it falls back to prompt-only advisor paths.
 - Use `prepare-goal` when the user wants durable planning files or a ready `/goal` prompt before long autonomous work.
 - Use `frontend-design` for distinctive, production-grade visual UI, page design, layout direction, polished HTML/CSS/React interfaces, and avoiding generic AI-looking web output.
 - Use `web-design-guidelines` when reviewing UI/UX/accessibility or auditing a site against web interface best practices.
@@ -18,6 +18,14 @@ Use bundled skills when the user request matches their domain. Prefer the most s
 - Use `security-best-practices` and `security-threat-model` when web/backend/database changes touch auth, sessions, user data, payments, secrets, permissions, public APIs, file uploads, or deployment exposure.
 - Use `vercel-deploy`, `netlify-deploy`, `cloudflare-deploy`, or `render-deploy` when preparing or performing deployment on those platforms.
 - Use `sentry` when adding, debugging, or improving production error monitoring and observability.
+
+## Advisor Repository Maintenance
+
+- Keep advisor implementation changes under `codex-skill/external-advisor/`, runtime patches under `patches/`, and executable regression entrypoints under `tests/`.
+- Use the skill wrappers and the managed worker pool for live checks. Do not post directly to a worker port or bypass conversation serialization.
+- Repo-aware reviews must remain mechanically read-only and operate on generated sanitized workspaces. Do not weaken denied-path, workspace-identity, current-turn evidence, redaction, or mutation checks to make a failing test pass.
+- Treat `.codex-advisor/`, HAR files, cookies, auth state, local connector state, worker manifests, generated workspaces, logs, and environment files as private local runtime data. Keep them ignored and uncommitted.
+- Before a release, inspect the exact staged diff, probe ignore rules, and scan the staged export for secrets. Test fixtures may use explicit fake values, but real credentials or captured session material must never enter Git.
 
 ## Web Build Workflow
 

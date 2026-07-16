@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 EVAL_HARNESS="$ROOT/codex-skill/external-advisor/scripts/eval_harness.py"
 PROJECT="$(mktemp -d)"
 trap 'rm -rf "$PROJECT"' EXIT

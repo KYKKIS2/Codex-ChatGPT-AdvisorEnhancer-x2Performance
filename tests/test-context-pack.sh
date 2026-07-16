@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 CONTEXT_PACK="$ROOT/codex-skill/external-advisor/scripts/context_pack.py"
 PROJECT="$(mktemp -d)"
 trap 'rm -rf "$PROJECT"' EXIT

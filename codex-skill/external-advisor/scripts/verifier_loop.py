@@ -321,11 +321,11 @@ def command_is_safe(command: str) -> tuple[bool, str, list[str]]:
 def run_command(args: argparse.Namespace, command: str) -> CommandResult:
     safe, reason, argv = command_is_safe(command)
     if not safe and not args.allow_unsafe_commands:
-        return CommandResult(command, "skipped", None, 0.0, "", "", reason)
+        return CommandResult(safety.redact_sensitive_text(command), "skipped", None, 0.0, "", "", reason)
     if not argv:
         argv, parse_error = parse_command(command)
         if parse_error:
-            return CommandResult(command, "skipped", None, 0.0, "", "", parse_error)
+            return CommandResult(safety.redact_sensitive_text(command), "skipped", None, 0.0, "", "", parse_error)
     started = time.monotonic()
     try:
         completed = subprocess.run(
@@ -338,26 +338,34 @@ def run_command(args: argparse.Namespace, command: str) -> CommandResult:
             timeout=args.command_timeout,
         )
         return CommandResult(
-            command,
+            safety.redact_sensitive_text(command),
             "completed",
             completed.returncode,
             time.monotonic() - started,
-            truncate(completed.stdout, args.output_chars),
-            truncate(completed.stderr, args.output_chars),
+            truncate(safety.redact_sensitive_text(completed.stdout), args.output_chars),
+            truncate(safety.redact_sensitive_text(completed.stderr), args.output_chars),
             reason,
         )
     except subprocess.TimeoutExpired as exc:
         return CommandResult(
-            command,
+            safety.redact_sensitive_text(command),
             "timeout",
             None,
             time.monotonic() - started,
-            truncate(exc.stdout, args.output_chars),
-            truncate(exc.stderr, args.output_chars),
+            truncate(safety.redact_sensitive_text(exc.stdout), args.output_chars),
+            truncate(safety.redact_sensitive_text(exc.stderr), args.output_chars),
             f"Timed out after {args.command_timeout}s.",
         )
     except Exception as exc:
-        return CommandResult(command, "error", None, time.monotonic() - started, "", str(exc), reason)
+        return CommandResult(
+            safety.redact_sensitive_text(command),
+            "error",
+            None,
+            time.monotonic() - started,
+            "",
+            safety.redact_sensitive_text(str(exc)),
+            reason,
+        )
 
 
 def write_loop_run(
@@ -503,8 +511,10 @@ def main() -> int:
             allow_outside_project=args.allow_outside_project,
         )
     elif args.draft:
-        args.draft = sanitize_text(args.draft)
-    prompt = sanitize_text(args.prompt if args.prompt is not None else sys.stdin.read())
+        args.draft = safety.redact_sensitive_text(sanitize_text(args.draft))
+    prompt = safety.redact_sensitive_text(
+        sanitize_text(args.prompt if args.prompt is not None else sys.stdin.read())
+    )
     if not prompt.strip():
         print("Provide --prompt or pipe text on stdin.", file=sys.stderr)
         return 2

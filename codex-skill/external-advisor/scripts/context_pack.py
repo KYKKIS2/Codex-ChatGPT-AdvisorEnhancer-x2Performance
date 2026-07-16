@@ -256,7 +256,7 @@ def build_pack(args: argparse.Namespace, prompt: str) -> dict[str, Any]:
         "task_id": args.task_id,
         "task": prompt.strip(),
         "draft_or_plan": args.draft.strip() if args.draft else "",
-        "constraints": args.constraint,
+        "constraints": [safety.redact_sensitive_text(item) for item in args.constraint],
         "test_failures": args.failure.strip() if args.failure else "",
         "relevant_files": file_context(args.project_dir, args.file, args.max_file_chars, args.allow_outside_project),
         "extra_context_files": file_context(args.project_dir, args.context_file, args.max_file_chars, args.allow_outside_project),
@@ -376,10 +376,12 @@ def main() -> int:
     if args.failure_file:
         args.failure = read_text(resolve_input_file(args.project_dir, args.failure_file, args.allow_outside_project), args.max_file_chars)
     if args.draft:
-        args.draft = sanitize_text(args.draft)
+        args.draft = safety.redact_sensitive_text(sanitize_text(args.draft))
     if args.failure:
-        args.failure = sanitize_text(args.failure)
-    prompt = sanitize_text(args.prompt if args.prompt is not None else sys.stdin.read())
+        args.failure = safety.redact_sensitive_text(sanitize_text(args.failure))
+    prompt = safety.redact_sensitive_text(
+        sanitize_text(args.prompt if args.prompt is not None else sys.stdin.read())
+    )
     if not prompt.strip():
         print("Provide --prompt or pipe text on stdin.", file=sys.stderr)
         return 2

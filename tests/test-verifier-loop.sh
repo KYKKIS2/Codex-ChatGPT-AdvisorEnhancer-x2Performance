@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 VERIFIER_LOOP="$ROOT/codex-skill/external-advisor/scripts/verifier_loop.py"
 PROJECT="$(mktemp -d)"
 trap 'rm -rf "$PROJECT"' EXIT

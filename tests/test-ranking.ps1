@@ -1,5 +1,5 @@
 $ErrorActionPreference = "Stop"
-$Root = Split-Path -Parent $MyInvocation.MyCommand.Path
+$Root = Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path)
 $Conclave = Join-Path $Root "codex-skill\external-advisor\scripts\conclave.py"
 $Project = Join-Path $env:TEMP ("advisor-ranking-test-" + [guid]::NewGuid())
 $Runs = Join-Path $Project ".codex-advisor\conclave-runs"

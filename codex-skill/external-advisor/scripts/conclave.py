@@ -749,7 +749,9 @@ def main() -> int:
         args.output_format = "json"
     args.trace_id = args.trace_id or str(uuid.uuid4())
     args.task_id = args.task_id or str(uuid.uuid4())
-    prompt = sanitize_text(args.prompt if args.prompt is not None else sys.stdin.read())
+    prompt = safety.redact_sensitive_text(
+        sanitize_text(args.prompt if args.prompt is not None else sys.stdin.read())
+    )
     if not prompt.strip():
         print("Provide --prompt or pipe text on stdin.", file=sys.stderr)
         return 2

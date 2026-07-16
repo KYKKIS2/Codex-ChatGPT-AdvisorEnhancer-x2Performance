@@ -2,991 +2,732 @@
 
 ![Codex Advisor Enhancer banner](assets/codex-advisor-banner.png)
 
-Give Codex a project-scoped reasoning advisor for the moments where raw coding ability is not enough.
+Codex executes the work. ChatGPT supplies a bounded second reasoning pass.
 
-Codex is excellent at reading files, editing code, running tests, and debugging. But many real engineering decisions are not just code edits. They are architecture calls, tradeoffs, planning decisions, model choices, deployment strategy, and "what should I do next?" questions.
+This repository installs a Codex skill that can consult a project-scoped ChatGPT
+advisor for architecture, strategy, planning, risk analysis, code review, and
+other decisions where a second model can improve the result. It keeps routine
+coding fast, preserves advisor conversations per project, supports independent
+specialist conclaves, and defaults repository analysis to verified read-only
+inspection of a sanitized DevSpace MCP snapshot when that connector is ready.
 
-This repo prototypes a simple idea:
+This is an experimental, unofficial integration. It depends on ChatGPT web
+session data, private web behavior, `gpt4free`, and a sanitized HAR export.
+Those interfaces can change without notice.
 
-```text
-Codex handles execution.
-GPT-5.5 Thinking acts as a second-pass advisor.
-Each project keeps its own advisor memory.
-Hard tasks can escalate into a small advisor conclave.
-```
+## Project Aim
 
-The result is a Codex workflow that feels sharper on high-impact decisions without slowing down routine implementation work.
-
-## Why This Matters
-
-Most coding-agent failures do not happen because the agent cannot type code. They happen because the agent confidently chooses the wrong direction, misses a constraint, overbuilds, underplans, or fails to compare tradeoffs.
-
-The `external-advisor` skill helps with that layer.
-
-Prompt-only advisor calls are not repo-reading agents. They have no implicit access to Codex's local filesystem, terminal, git state, tests, logs, screenshots, or prior observations. They only see the prompt, explicit context files, context packs, and synced advisor-chat transcript content that Codex sends. File names, modules, commands, metrics, or root causes suggested by prompt-only advisor calls are hypotheses until Codex verifies them locally.
-
-For broad repo-analysis and architecture critique, this repo also supports a repo-aware advisor agent mode. When a narrow allowed root and a DevSpace-compatible MCP bridge are configured safely, the router prefers agent mode and generates a review-first ChatGPT handoff. Prompt-only critique remains the fallback when agent mode is unavailable, unsafe, or explicitly disabled.
-
-It is designed for questions like:
-
-- Which architecture should I choose?
-- What should I build next?
-- Is this model/tool/strategy a good direction?
-- What are the risks before I deploy or demo this?
-- What am I missing in this plan?
-- Should I simplify, scale, refactor, or wait?
-
-It is intentionally not meant for every small bug fix. Codex should still handle normal coding/debugging directly.
-
-## What It Does
-
-- Installs a bundled Codex skill pack for advisor reasoning, goal preparation, professional web design, Figma workflows, browser QA, React/Next.js performance, databases, security, monitoring, and deployment.
-- Starts a local OpenAI-compatible `g4f` API.
-- Uses `gpt-5-6-thinking` by default with ChatGPT `thinking_effort=max`.
-- Persists one advisor conversation per working directory.
-- Syncs the online ChatGPT advisor chat before and after each persistent advisor call.
-- Writes local transcript files Codex can inspect later.
-- Adds optional conclave mode with role-specific planner, critic, security, verifier, and synthesis advisors.
-- Adds a repo-aware advisor agent-mode handoff for DevSpace-compatible MCP bridges.
-- Adds an advisor router for no-advisor, agent-mode, single-advisor, conclave, verifier, and machine-json verifier paths.
-- Adds critique-before-final mode for important answers.
-- Adds a verifier loop that asks what evidence to gather, runs safe local commands, then asks the verifier to interpret the actual output.
-- Lets you explicitly say `Use the external advisor` when you want a second opinion.
-
-Project-local memory looks like this:
+The project is built around a clear separation of responsibilities:
 
 ```text
-your-project/
-  .codex-advisor/
-    project.json        # ChatGPT Project binding
-    projects/<g-p-id>/  # continuation state, transcripts, keyed chats, and role memories
-    conclave-runs/      # saved multi-advisor runs
-    verifier-runs/      # saved evidence-backed verifier loops
-    latest-conclave.md  # latest conclave synthesis
-    latest-verifier-loop.md
+Codex:
+  inspect the real checkout
+  edit files
+  run commands and tests
+  verify facts
+  make the final decision
+
+ChatGPT advisor:
+  challenge plans
+  compare alternatives
+  identify risks
+  perform deeper review
+  suggest evidence and next actions
 ```
 
-That means:
+Advisor output is guidance, not proof. Codex must verify repository facts,
+runtime behavior, commands, metrics, and file references locally.
+
+## Four Advisor Lanes
+
+| Lane | Script | Repository access | Best use |
+| --- | --- | --- | --- |
+| Prompt-only advisor | `advisor.py` | Only supplied text/files | One focused critique or judgment pass |
+| Prompt-only conclave | `conclave.py` | Only supplied text/files | Independent planner, critic, security, verifier, and synthesis passes |
+| Repo-aware advisor | `advisor_agent.py` | Read-only sanitized DevSpace snapshot | One evidence-backed repository review |
+| Repo-aware conclave | `agent_conclave.py` | Separate read-only agent conversations | Hard architecture, security, and broad code audits |
+
+`router.py` chooses among these lanes, no-advisor, and verifier workflows.
+When a verified repo-aware connector is ready, repository analysis prefers an
+agent lane. `--prompt-only` forces the original context-only behavior.
+
+## Main Capabilities
+
+- Installs the `external-advisor` Codex skill and the other bundled skills in
+  `codex-skill/`.
+- Runs a local OpenAI-compatible `g4f` worker pool.
+- Defaults normal calls to `gpt-5-6-thinking` with
+  `thinking_effort=max`.
+- Supports the current Pro route through
+  `ADVISOR_THINKING_EFFORT=pro-extended`.
+- Persists ChatGPT conversation state and transcript files per local project.
+- Binds local directories to existing ChatGPT Projects.
+- Recovers complete answers from the synchronized ChatGPT conversation when
+  the compatible response contains an empty body, duplicate text, or a tail
+  fragment.
+- Serializes calls to the same saved conversation.
+- Runs independent conversations on separate workers and queues excess calls
+  in FIFO order.
+- Builds redacted context packs and evidence-backed verifier loops.
+- Creates content-hashed, read-only sanitized snapshots for repo-aware review.
+- Verifies the exact ChatGPT conversation used one expected workspace and made
+  successful read/search calls before accepting an agent answer.
+- Shows sanitized live tool activity without exposing arguments, paths,
+  contents, raw errors, credentials, conversation IDs, or private reasoning.
+
+## Repository Layout
 
 ```text
-Codex session for project A <-> ChatGPT advisor chat for project A
-Codex session for project B <-> ChatGPT advisor chat for project B
+.
+|-- codex-skill/
+|   `-- external-advisor/
+|       |-- SKILL.md
+|       `-- scripts/
+|-- patches/
+|-- tests/
+|-- setup.sh
+|-- setup.ps1
+|-- start-g4f.sh
+|-- start-g4f.ps1
+|-- AGENTS.md
+`-- BUNDLED_SKILLS.md
 ```
 
-You can even write in the same ChatGPT advisor chat online, and the next Codex advisor call will sync that conversation back into the local transcript.
-
-## The Big Idea For Codex
-
-This repository is a prototype, not the ideal production design.
-
-The valuable part is not `g4f` or HAR files. The valuable part is the workflow:
+Runtime and authentication state is local and ignored:
 
 ```text
-Project-scoped Codex advisor memory
-+ stronger reasoning for judgment-heavy questions
-+ automatic use only when it matters
+vendor/gpt4free/
+.codex-advisor/
+~/.codex/advisor-runtime/
+~/.codex/advisor-agent/
 ```
 
-An official Codex version could replace the local `g4f`/HAR layer with OpenAI-managed model access, authentication, privacy controls, and project memory. That would make this workflow cleaner, safer, and much more reliable.
+## Requirements
 
-## Current Prototype Stack
+Required:
 
-This repo currently uses:
+- Git
+- Python 3 and `venv`
+- Node.js and npm
+- A ChatGPT account and a fresh sanitized HAR export
 
-- Codex skill bundle: `codex-skill/`
-- Local API: `http://127.0.0.1:8080/v1`
-- Provider: `OpenaiAccount`
-- Default model: `gpt-5-6-thinking`
-- ChatGPT thinking effort: `max`
-- Backend bridge: `gpt4free`
-- Local transcript sync: `.codex-advisor/transcript.md`
-- Conclave runner: `codex-skill/external-advisor/scripts/conclave.py`
-- Router: `codex-skill/external-advisor/scripts/router.py`
-- Context pack builder: `codex-skill/external-advisor/scripts/context_pack.py`
-- Agent-mode doctor and handoff: `codex-skill/external-advisor/scripts/agent_mode.py`
-- Agent-mode setup helper: `codex-skill/external-advisor/scripts/advisor_agent_setup.py`
-- Agent-mode local connector launcher: `codex-skill/external-advisor/scripts/advisor_agent_connect.py`
-- Critique-before-final: `codex-skill/external-advisor/scripts/critique_final.py`
-- Evidence-backed verifier loop: `codex-skill/external-advisor/scripts/verifier_loop.py`
-- Searchable memory manager: `codex-skill/external-advisor/scripts/memory_manager.py`
-- Deterministic advisor ranking inside `conclave.py`
-- Local evaluation harness: `codex-skill/external-advisor/scripts/eval_harness.py`
-- Goal-prep helper: `codex-skill/prepare-goal`
-- Web/app skill inventory: `BUNDLED_SKILLS.md`
+Repo-aware agent mode also needs:
 
-`gpt4free` is not committed into this repository. The setup scripts download it into:
+- `cloudflared` for the default managed quick tunnel, or another public HTTPS
+  tunnel URL
+- ChatGPT Developer Mode / custom MCP app support on the account
 
-```text
-vendor/gpt4free
-```
+The setup scripts install the pinned DevSpace package when `devspace` is not
+already available. They do not modify ChatGPT account settings.
 
-The HAR file is never included. It is sensitive authentication material and must stay local.
+## Install
 
-## Bundled Codex Skills
-
-Setup installs every folder under `codex-skill/`, including:
-
-- Advisor and planning: `external-advisor`, `prepare-goal`
-- Professional visual/frontend work: `frontend-design`, `web-design-guidelines`
-- Figma workflows: `figma`, `figma-use`, `figma-implement-design`, `figma-generate-design`, `figma-generate-library`, `figma-create-new-file`, `figma-create-design-system-rules`, `figma-code-connect-components`
-- Browser QA: `playwright`, `playwright-interactive`, `screenshot`
-- React/Next.js performance: `vercel-react-best-practices`
-- Backend/database: `supabase`, `supabase-postgres-best-practices`
-- Security and release readiness: `security-best-practices`, `security-threat-model`, `sentry`
-- Deployment: `vercel-deploy`, `netlify-deploy`, `cloudflare-deploy`, `render-deploy`
-
-See `AGENTS.md` for when future Codex sessions should use each skill, and `BUNDLED_SKILLS.md` for source/attribution details.
-
-## Quick Start
-
-Clone the repo, then run setup.
-
-### Windows
-
-PowerShell:
-
-```powershell
-.\setup.ps1
-```
-
-### Ubuntu/Linux
-
-Install prerequisites:
+### Ubuntu / Linux
 
 ```bash
-sudo apt update
-sudo apt install -y git python3 python3-pip python3-venv
-```
-
-Run setup:
-
-```bash
-chmod +x setup.sh start-g4f.sh test-advisor.sh test-conclave.sh test-router.sh test-context-pack.sh test-verifier-loop.sh test-memory.sh test-ranking.sh test-eval-harness.sh test-advisor-transport-recovery.sh test-advisor-live-activity.sh test-advisor-concurrency.sh test-security-regressions.sh test-agent-mode.sh codex-skill/external-advisor/scripts/advisor_agent_connect.py
+git clone https://github.com/KYKKIS2/Codex-ChatGPT-AdvisorEnhancer-x2Performance.git
+cd Codex-ChatGPT-AdvisorEnhancer-x2Performance
+chmod +x setup.sh start-g4f.sh tests/*.sh
 ./setup.sh
 ```
 
-Setup will:
+Install `cloudflared` before using the automatic repo-aware tunnel.
 
-- clone `https://github.com/xtekky/gpt4free` into `vendor/gpt4free` at the pinned default ref used by this repo
-- create `vendor/gpt4free/.venv` and install Python dependencies there
-- apply `patches/gpt4free-advisor.patch`
-- apply and verify the shared runtime patch for Project binding, `thinking_effort`, and Pro Extended WebSocket handoff
-- install the bundled Codex skills from `codex-skill/` into your Codex skills folder
-- write `advisor-config.json` so Codex knows the exact local start script path
-- create `vendor/gpt4free/har_and_cookies`
+### Windows
 
-Override the pinned g4f ref only when you are deliberately testing a new upstream version:
-
-```bash
-GPT4FREE_REF=<commit-or-tag> ./setup.sh
+```powershell
+git clone https://github.com/KYKKIS2/Codex-ChatGPT-AdvisorEnhancer-x2Performance.git
+Set-Location Codex-ChatGPT-AdvisorEnhancer-x2Performance
+.\setup.ps1
 ```
 
-## Add Your HAR
+Setup:
 
-Put your ChatGPT HAR file here:
+1. Clones the pinned `gpt4free` revision into `vendor/gpt4free`.
+2. Creates its local virtual environment and installs dependencies.
+3. Applies and verifies the ChatGPT Project, model-routing, WebSocket, recovery,
+   and runtime patches.
+4. Installs or verifies pinned DevSpace `1.0.4` and applies the read-only tool
+   mode patch.
+5. Installs each folder under `codex-skill/` into
+   `${CODEX_HOME:-~/.codex}/skills`.
+6. Preserves the previous installed skill in
+   `~/.codex/skill-backups/<timestamp>/` before replacement.
+7. Creates the private HAR directory with owner-only permissions where the
+   platform supports them.
 
-```text
-vendor\gpt4free\har_and_cookies\
-```
+The setup refuses an unverified or unexpectedly modified `vendor/gpt4free`
+checkout. `ADVISOR_ALLOW_UNVERIFIED_VENDOR=true` is a diagnostic escape hatch,
+not a normal installation setting.
 
-On Ubuntu/Linux:
+Restart Codex after installation so new sessions discover the installed skills.
+Already-running sessions may continue using their previously loaded skill text.
+
+## Add The HAR
+
+In ChatGPT:
+
+1. Open browser developer tools.
+2. Select **Network**.
+3. Enable recording and **Preserve log**.
+4. Make a small normal ChatGPT request. For model/agent transport diagnostics,
+   capture the exact model or MCP tool flow being diagnosed.
+5. Select the requests and choose **Export HAR (sanitized)**.
+
+Put the exported file in:
 
 ```text
 vendor/gpt4free/har_and_cookies/
 ```
 
-Do not commit it. Do not share it. Do not paste it into chats.
+The filename is not important. The HAR is authentication material:
 
-## Start The Local API
+- never commit it
+- never paste it into a prompt
+- never print its contents
+- refresh it when ChatGPT authentication or model metadata becomes stale
 
-PowerShell:
+A HAR refresh does not attach an MCP connector to an existing ChatGPT
+conversation. App attachment is conversation state in ChatGPT.
 
-```powershell
-.\start-g4f.ps1
-```
+## Start The Local Advisor Pool
 
-PowerShell requires the `.\` prefix. Running `start-g4f.ps1` without it may fail or open the file as text.
-
-Ubuntu/Linux:
+Linux:
 
 ```bash
 ./start-g4f.sh
 ```
 
-If `vendor/gpt4free` is missing, the start script will run setup automatically before starting the API.
-The starter supervises two isolated g4f worker processes by default, on ports `8080` and `8081`. Set `G4F_WORKERS=1` for a single-worker diagnostic, or change the base port with `.\start-g4f.ps1 -Port 8180` or `G4F_PORT=8180 ./start-g4f.sh`. All required worker ports must be available. A second starter invocation reuses the healthy machine-wide pool instead of launching competing processes.
-Debug logging is off by default. Use `.\start-g4f.ps1 -DebugLog` or `G4F_DEBUG=true ./start-g4f.sh` only when troubleshooting.
+Windows:
 
-### Concurrent Advisor Calls
+```powershell
+.\start-g4f.ps1
+```
 
-Every local `advisor.py` invocation automatically uses the machine-wide coordinator under `~/.codex/advisor-runtime/`. Callers should keep `ADVISOR_BASE_URL=http://127.0.0.1:8080/v1`; the coordinator reads the private pool manifest and leases an available worker itself.
+The default pool runs two isolated workers on ports `8080` and `8081`. Advisor
+callers still use:
 
-- Different saved conversations can run concurrently, up to the worker count.
-- Calls targeting the same conversation state are serialized, even across repos or Codex sessions when they share a conversation id.
-- Excess calls wait in a cross-process FIFO queue instead of hitting one g4f process simultaneously.
-- Repeated transport failures across workers temporarily reduce capacity to one worker. This limits pressure on a fragile ChatGPT web session while preserving the normal route.
-- Ambiguous `401`, `403`, `422`, stream, or connection failures are not blindly replayed. Only an explicit missing-conversation response can clear stale state and retry once.
+```text
+http://127.0.0.1:8080/v1
+```
 
-Use the normal advisor wrapper rather than posting directly to `/v1/chat/completions`; direct calls bypass conversation locks, worker leasing, transcript recovery, and route validation. Inspect the pool without exposing HAR or auth data:
+The wrapper leases workers through a private machine-wide coordinator. Do not
+post directly to `/v1/chat/completions` and do not select port `8081` manually;
+direct calls bypass conversation locks, FIFO queueing, model checks, and
+transcript recovery.
+
+Pool management:
 
 ```bash
 python3 ~/.codex/skills/external-advisor/scripts/g4f_pool.py status
 python3 ~/.codex/skills/external-advisor/scripts/g4f_pool.py stop
 ```
 
-For a bounded conclave that should use both workers, pass `--parallel`. The coordinator still serializes roles that intentionally share one state file. Environment controls for diagnostics are `G4F_WORKERS`, `G4F_WORKER_PORT_STEP`, `ADVISOR_QUEUE_TIMEOUT`, `ADVISOR_POOL_ENABLED`, and `ADVISOR_COORDINATION`; disabling coordination is unsafe for normal browser-backed calls.
-
-## Default Repo-Aware Agent Mode
-
-Agent mode is the preferred advisor route for non-trivial critique, planning, architecture, and broad repo-analysis requests when it is safely configured. It uses a DevSpace-compatible MCP bridge so ChatGPT can inspect an approved local project instead of relying only on snippets Codex sends.
-
-This repo does not install DevSpace, open ChatGPT account settings, run `npx @waishnav/devspace`, or contact ChatGPT from setup, doctor, setup-helper, or router dry runs. The explicit connector helper can start a trusted local DevSpace executable when you run it, but it never modifies ChatGPT settings for you. Keep allowed roots narrow and keep the Owner password private.
-
-DevSpace-style bridges protect by allowed root and tool authorization, not by a built-in `.env`/HAR/key denylist. The advisor therefore runs its own secret preflight before agent mode is considered available. By default, if the real project contains obvious sensitive paths such as `.env*`, HAR/cookie/auth files, key material, wallet/seed files, browser profiles, symlink escapes, or advisor transcript/conversation state under `.codex-advisor`, agent mode automatically creates a sanitized review workspace under `~/.codex/advisor-agent/workspaces/` and gives ChatGPT that copy instead of the real checkout. If sanitization is disabled or cannot produce a clean copy, prompt-only advisor mode remains the fallback.
-
-Recommended setup shape:
+Useful diagnostics:
 
 ```bash
-npm install -g @waishnav/devspace
-devspace init
+G4F_WORKERS=1 ./start-g4f.sh
+G4F_PORT=8180 ./start-g4f.sh
+G4F_DEBUG=true ./start-g4f.sh
 ```
 
-During DevSpace setup, choose a narrow project root, not `~`, `/`, a drive root, browser profile, `.ssh`, wallet folder, HAR/cookie directory, or other secret store. DevSpace uses a public HTTPS `/mcp` endpoint through a tunnel you control; the tunnel URL is not a secret, but the Owner password is.
+## Basic Advisor Usage
 
-Tell the advisor router which local roots are allowed:
+Normal prompt-only call:
 
 ```bash
-export ADVISOR_AGENT_ALLOWED_ROOTS="/absolute/path/to/one/project-or-parent"
+python3 ~/.codex/skills/external-advisor/scripts/advisor.py \
+  --prompt "Review this architecture decision and identify the main risks."
 ```
 
-Or write a durable user-level config for the current project:
+Prompt-only conclave:
 
 ```bash
-python3 ./codex-skill/external-advisor/scripts/advisor_agent_setup.py \
-  --auto \
-  --project-dir .
+python3 ~/.codex/skills/external-advisor/scripts/conclave.py \
+  --mode architecture \
+  --parallel \
+  --prompt "Compare the architecture options and challenge the current plan."
 ```
 
-That writes the exact validated root to `~/.codex/advisor-agent/config.json` by default. The config file must live outside the project, so a repository cannot self-authorize its own root. If the secret preflight finds sensitive files, the helper generates a sanitized workspace and records that generated root too. `--allow-sensitive-project` exists only for deliberate diagnostics and should not be used as a normal setup path.
-
-Sanitized workspaces are rebuilt when selected. They skip `.git`, dependency/cache/build directories, `.env*`, HAR/cookie/auth files, key material, wallet/seed files, browser profiles, advisor transcript state, symlinks, secret-looking file contents, archives, databases, and large model/data artifacts. Each sanitized copy includes `ADVISOR_SANITIZED_WORKSPACE.md` and `SANITIZED_WORKSPACE_MANIFEST.json`. It is intentionally incomplete; Codex must verify final facts and apply edits in the original checkout.
-
-Then validate without starting network exposure:
+Automatic router:
 
 ```bash
-python3 ./codex-skill/external-advisor/scripts/agent_mode.py \
-  --doctor \
-  --project-dir .
-```
-
-To automate the local side and print the URL you paste into ChatGPT.com:
-
-```bash
-python3 ./codex-skill/external-advisor/scripts/advisor_agent_connect.py \
-  serve \
-  --project-dir . \
-  --public-base-url "https://your-tunnel.example.com"
-```
-
-The helper validates/writes the user-level allowed-root config, rebuilds a sanitized review workspace when needed, starts `devspace serve` in the background, and prints `chatgpt_connector_url: https://.../mcp` plus the review-first handoff. If DevSpace already has `publicBaseUrl` configured or `DEVSPACE_PUBLIC_BASE_URL` is set, you can omit `--public-base-url`. If no public URL is configured and DevSpace does not print one, the helper stops the background process and tells you to provide a URL.
-
-Useful lifecycle commands:
-
-```bash
-python3 ./codex-skill/external-advisor/scripts/advisor_agent_connect.py prepare --project-dir .
-python3 ./codex-skill/external-advisor/scripts/advisor_agent_connect.py status --project-dir .
-python3 ./codex-skill/external-advisor/scripts/advisor_agent_connect.py stop --project-dir .
-```
-
-After `serve` prints the connector URL, add it manually in ChatGPT: Settings -> Apps & Connectors -> Advanced settings -> Developer Mode -> Create app/connector. Paste the printed `/mcp` URL, then open a new chat, choose Developer Mode, enable that connector, and paste the generated handoff.
-
-Generate the review-first handoff:
-
-```bash
-python3 ./codex-skill/external-advisor/scripts/agent_mode.py \
-  --print-handoff \
-  --project-dir . \
-  --allowed-root "$PWD" \
-  --task "Review this architecture decision."
-```
-
-Force a sanitized copy even when the project currently looks clean:
-
-```bash
-python3 ./codex-skill/external-advisor/scripts/router.py \
+python3 ~/.codex/skills/external-advisor/scripts/router.py \
   --execute \
-  --agent-sanitized-workspace always \
-  --prompt "Review this architecture decision."
+  --prompt "What is the safest architecture for this change?"
 ```
 
-Or let the router choose agent mode when configured:
+Force prompt-only behavior:
 
 ```bash
-python3 ./codex-skill/external-advisor/scripts/router.py \
+python3 ~/.codex/skills/external-advisor/scripts/router.py \
   --execute \
-  --prompt "Decide the architecture for advisor memory."
-```
-
-Agent mode v1 is review-first. The generated handoff tells ChatGPT to inspect, plan, and review only. Codex remains the default implementer unless the user explicitly grants ChatGPT edit or shell authority in that ChatGPT session. DevSpace tool surfaces can expose edit and shell tools, so treat connected ChatGPT as a trusted coding partner with local-machine access.
-
-Foreground repo-aware advisor calls show safe live activity automatically. `advisor.py` tails only the matching private DevSpace project log from its current end and writes fixed status lines to stderr for whitelisted tool completions, failures, bounded durations, and a 30-second local heartbeat. It never displays arguments, paths, command text, file contents, raw errors, credentials, conversation ids, or private reasoning, and it does not alter the stable final-response transport. Use `--no-live-activity` or `ADVISOR_LIVE_ACTIVITY=false` to disable it. Keep stderr visible when you want to watch the agent work. Activity is project-scoped, so simultaneous connector calls for the same project can appear in the same status stream.
-
-Force prompt-only critique when needed:
-
-```bash
-python3 ./codex-skill/external-advisor/scripts/router.py \
   --prompt-only \
-  --prompt "Review this plan without repo-aware agent mode."
+  --prompt "Critique this summary without repository access."
 ```
 
-Default model:
+Codex sessions can also be told directly:
 
 ```text
-gpt-5-6-thinking
+Use the external advisor for this decision.
 ```
 
-Optional Pro test:
+## Model Routing
 
-```powershell
-.\start-g4f.ps1 -Model gpt-5-6-pro
+Normal calls are policy-clamped to:
+
+```text
+model: gpt-5-6-thinking
+thinking_effort: max
 ```
 
-```bash
-./start-g4f.sh gpt-5-6-pro
-```
+Legacy or weak overrides such as `default`, `gpt-4o`, `gpt-5-5`,
+`gpt-5-5-thinking`, or `thinking_effort=none` are ignored for normal calls.
+Use `ADVISOR_ALLOW_NON_DEFAULT_ROUTE=true` only for a deliberate transport
+diagnostic.
 
-`gpt-5-6-thinking` is the normal advisor default, and the wrapper sends `thinking_effort=max` by default. The official API id is `gpt-5.6-sol`; the local ChatGPT/g4f route uses the ChatGPT web slug `gpt-5-6-thinking`, and dotted aliases such as `gpt-5.6` or `gpt-5.6-sol` map back to that web slug. Weak/no-thinking legacy routes such as `gpt-5-5` with no private effort, `min`, or `standard` can resolve to weaker ChatGPT models, so normal non-Pro advisor calls are policy-clamped to `gpt-5-6-thinking` plus `thinking_effort=max`. Explicit non-Pro model overrides such as `gpt-4o`, `gpt-5-5`, or `ADVISOR_THINKING_EFFORT=none` are ignored unless `ADVISOR_ALLOW_NON_DEFAULT_ROUTE=true` is set for deliberate diagnostics. Pro Extended requests the detected `gpt-5-6-pro` ChatGPT web slug and sends `thinking_effort=standard`, because the current ChatGPT web metadata advertises Pro with that private effort value.
-
-Do not intentionally set `ADVISOR_MODEL=default`. If an older Codex session or inherited shell environment does pass `default`, the wrapper ignores that alias and selects the safe configured model for the requested thinking mode.
-
-ChatGPT web also sends a separate private `thinking_effort` field for some Intelligence choices. The advisor supports passing that field explicitly:
-
-```powershell
-$env:ADVISOR_THINKING_EFFORT = "max"
-python $HOME\.codex\skills\external-advisor\scripts\advisor.py --prompt "Review this carefully: ..."
-```
-
-```bash
-ADVISOR_THINKING_EFFORT=max \
-python3 ~/.codex/skills/external-advisor/scripts/advisor.py --prompt "Review this carefully: ..."
-```
-
-Aliases use the current ChatGPT private values: `low`/`light` -> `min`, `medium` -> `standard`, `high` -> `extended`, and `extra-high`/`xhigh`/`heavy` -> `max`. Older raw values such as `high` or `xhigh` are not sent directly because ChatGPT can reject them with `Invalid conversation body`; unknown values fail locally unless `ADVISOR_ALLOW_UNKNOWN_THINKING_EFFORT=true` is set for diagnostics. Normal non-Pro advisor calls are clamped to `max`, because that is the currently safe Thinking-lane advisor route. The setup patch adds g4f/OpenaiChat support for ChatGPT's conversation-turn WebSocket handoff, so extended/max turns can continue after ChatGPT moves the response stream from the initial SSE request to a per-turn WebSocket topic.
-
-For Pro Extended, use the Pro Extended request alias, not just bare `extended`:
+Hard questions can request the Pro route:
 
 ```bash
 ADVISOR_THINKING_EFFORT=pro-extended \
-python3 ~/.codex/skills/external-advisor/scripts/advisor.py --prompt "Review this carefully: ..."
+python3 ~/.codex/skills/external-advisor/scripts/advisor.py \
+  --timeout 900 \
+  --prompt "Perform a deep architecture and failure-mode review."
 ```
 
-`pro-extended` automatically selects the detected `gpt-5-6-pro` ChatGPT web slug and sends `thinking_effort=standard`, matching the current ChatGPT web metadata for Pro. If a normal default model such as `gpt-5-6-thinking` or `gpt-5-5-thinking` is also set, the scripts override it to `gpt-5-6-pro` to avoid silent downgrades. If ChatGPT exposes a newer private Pro request slug, set `ADVISOR_PRO_EXTENDED_MODEL` after verifying it. Use `ADVISOR_ALLOW_PRO_MODEL_OVERRIDE=true` only for deliberate diagnostics.
+The current wrapper maps that request to the detected ChatGPT web Pro model
+slug and its required private effort metadata. Pro calls can take several
+minutes. Keep the command open and let the WebSocket/HTTP request wait; frequent
+Codex-side polling does not make the answer arrive sooner.
 
-Pro Extended is for hard advisor questions: architecture reviews, high-risk debugging, security/privacy decisions, and important strategy. It is expected to take time. Long Pro Extended prompts can run silently for several minutes before producing a clean answer. If a detached/background run exits with no response file and an empty log, verify the exact same command in the foreground before blaming Pro Extended or prompt size.
+## Conversation And Project State
 
-The ChatGPT WebSocket can carry visible live progress such as reasoning status, summaries, recaps, and metadata, but not private hidden chain-of-thought. Repo-aware agent turns can outlive g4f's initial response stream while ChatGPT continues calling MCP tools. Progress messages are not accepted as final unless the remote message has `end_turn=true`. While the remote conversation reports that it is still streaming, `advisor.py` keeps the same process blocked and performs a bounded final fetch from `backend-api/conversation/<id>` without making another model call. `ADVISOR_FINAL_FETCH_TIMEOUT` bounds that wait and defaults to the advisor command timeout; `ADVISOR_FINAL_FETCH_POLL_SECONDS` controls the delay between remote status checks. After streaming stops, `ADVISOR_FINAL_FETCH_MAX_POLLS` limits the remaining non-streaming checks.
-
-`advisor.py` verifies Pro Extended by reading synced ChatGPT metadata. Current browser Pro captures report `model_slug`/`default_model_slug: gpt-5-6-pro` with `thinking_effort: standard`; do not treat a `resolved_model_slug` field alone as a downgrade for Pro. A HAR containing only `model: gpt-5-6-thinking` with `thinking_effort: max` is a Thinking-lane capture, not a Pro capture; capture a browser HAR while selecting Pro and sending a real prompt if the Pro request fields are missing.
-
-For non-Pro persistent ChatGPT-backed advisor calls, `advisor.py` also rejects known downgraded resolved models by default. Currently `ADVISOR_REJECT_RESOLVED_MODEL_SLUGS` defaults to `gpt-5-3-mini`. Set `ADVISOR_ALLOW_RESOLVED_MODEL_DOWNGRADE=true` only for deliberate transport diagnostics.
-
-For foreground Pro Extended calls, Codex should start the command with a long timeout and wait quietly for it to finish. Do not send periodic "still running" updates or repeatedly poll the active shell session unless the user asks for status. If polling is unavoidable in the execution environment, use long waits of several minutes and report only completion, an actual error, or a meaningful timeout.
-
-For long advisor calls, use `--save` and read the saved response, the automatic latest-response file, or synced `transcript.md` before assuming the answer was truncated. By default `advisor.py` writes `.codex-advisor/latest-response.md`; when a ChatGPT Project binding moves state under `.codex-advisor/projects/<g-p-id>/`, it also writes the project-scoped `latest-response.md` there. If `ADVISOR_STATE_PATH` is set it writes `latest-response.md` beside that state file; if `ADVISOR_RESPONSE_PATH` is set it writes exactly there. The CLI reports saved latest-response path(s) on stderr. If the OpenAI-compatible response body is duplicated, empty, or only a tail fragment but the synced ChatGPT transcript contains the latest finished answer for the same prompt, `advisor.py` recovers the clean text from the transcript and reports that on stderr. Empty, suspiciously corrupted, or unfinished agent turns also perform the bounded final transcript fetch described above. If recovery does not produce a final answer before the deadline, the script fails closed instead of saving progress or a fragment as advice. Do not use `ADVISOR_TEMPORARY=true`, `ADVISOR_PERSIST_CONVERSATION=false`, or `ADVISOR_SYNC_REMOTE=false` for normal advisor calls; those flags disable transcript recovery. If a substantial prompt returns a suspicious tail fragment while recovery is disabled, `advisor.py` retries once with persistent remote sync unless `ADVISOR_AUTO_RETRY_TAIL_FRAGMENT=false` is set. This latest-response file is a convenience artifact and can be overwritten by concurrent advisor runs, so use `--save` for task-specific evidence. Codex terminal output can be display-truncated to the tail of a long answer, so seeing only final punctuation in the terminal does not prove the advisor returned only punctuation.
-
-For detached advisor jobs, prefer the audited launcher over ad hoc `nohup` snippets:
-
-```bash
-ADVISOR_THINKING_EFFORT=pro-extended \
-ADVISOR_MAX_OUTPUT_TOKENS=1800 \
-python3 ~/.codex/skills/external-advisor/scripts/advisor_background.py -- \
-  --context-file docs/experiment_reports/review_prompt.md \
-  --prompt "Review the attached prompt and produce the requested critique." \
-  --thinking-effort pro-extended \
-  --timeout 600
-```
-
-The launcher writes `meta.json`, `status.json`, `heartbeat.json`, `response.md`, `stderr.log`, and `monitor.log` under `.codex-advisor/background-runs/<timestamp-id>/`. Treat missing/inconsistent metadata as a wrapper failure or inconclusive run, not a model failure.
-
-## Context And Safety Boundaries
-
-Advisor prompts, selected files, generated context packs, diffs, command output, transcripts, and saved advisor artifacts may be sent to or synced with ChatGPT. Keep prompts focused and do not include secrets, credentials, private keys, wallet keys, tokens, HAR contents, `.env` values, customer data, or unrelated private files.
-
-The advisor only knows the context Codex sends. Do not write final answers as if the advisor independently inspected the repository. Use advisor output as critique and deeper reasoning, then verify repo facts locally with file reads, commands, tests, or artifacts.
-
-The context pack blocks obvious sensitive paths such as `.env`, `.codex-advisor`, HAR/cookie/auth files, and key material. Full git diffs are now built only from non-sensitive changed paths and are redacted before being written. Explicit `--context-file`, `--draft-file`, and `--error-file` reads use the same sensitive-file guard. If you truly need to include a file outside the project, pass `--allow-outside-project`; do not use that flag for secrets.
-
-For `ADVISOR_PROVIDER=openai-compatible`, `OPENAI_API_KEY` is not forwarded to arbitrary compatible endpoints. Use `ADVISOR_API_KEY` for a compatible server that requires a token. To intentionally reuse `OPENAI_API_KEY` with an OpenAI host through compatible mode, set `ADVISOR_COMPATIBLE_USE_OPENAI_KEY=true`.
-
-The verifier loop runs commands with `shell=False` and a constrained argv allowlist. It is intended for fast local evidence such as `python3 --version`, `python3 -m py_compile ...`, `git diff --check`, and common test commands. `--run-suggested` still means Codex should review advisor-suggested commands before running them; `--allow-unsafe-commands` is an explicit escape hatch.
-
-## Test The Advisor
-
-Keep the local API running, then run:
-
-```powershell
-.\test-advisor.ps1
-```
-
-```bash
-./test-advisor.sh
-```
-
-Expected behavior: the advisor returns a short `ADVISOR_SETUP_OK` response.
-
-## Test The Conclave
-
-Conclave mode is for harder judgment tasks. It asks several bounded advisor roles instead of one generic advisor.
-
-Keep the local API running, then run:
-
-```powershell
-.\test-conclave.ps1
-```
-
-```bash
-./test-conclave.sh
-```
-
-Expected behavior: the planner and critic roles answer, and a run is saved under:
-
-```text
-.codex-advisor/conclave-runs/
-```
-
-By default, conclave roles return readable Markdown/prose so the online ChatGPT advisor chats stay useful to read. Use machine JSON only when Codex needs strict parsing or validation.
-
-## Test The Router And Verifier Loop
-
-These tests do not require a live advisor endpoint:
-
-```powershell
-.\test-router.ps1
-.\test-context-pack.ps1
-.\test-verifier-loop.ps1
-.\test-advisor-concurrency.ps1
-.\test-memory.ps1
-.\test-ranking.ps1
-.\test-eval-harness.ps1
-```
-
-```bash
-./test-router.sh
-./test-context-pack.sh
-./test-verifier-loop.sh
-./test-advisor-transport-recovery.sh
-./test-advisor-live-activity.sh
-./test-advisor-concurrency.sh
-./test-agent-mode.sh
-./test-memory.sh
-./test-ranking.sh
-./test-eval-harness.sh
-```
-
-The router test confirms task types map to the intended advisor path. The context-pack test creates `.codex-advisor/latest-context-pack.json`. The verifier-loop dry run creates `.codex-advisor/latest-verifier-loop.json` and runs a harmless local command as evidence. The advisor transport recovery test covers empty Pro/extended bodies, stale transcript refusal, embedded conversation recovery, and fail-closed ambiguous errors. The live-activity test covers EOF-only tailing, safe event projection, heartbeat output, fail-closed log discovery, explicit disablement, and unchanged final-response transport. The concurrency test covers FIFO worker leases, same-conversation serialization, first-turn state transitions, pool degradation, duplicate startup suppression, supervisor cleanup, and the `advisor.py` coordination boundary. The agent-mode test covers root validation, config-driven setup, automatic sanitized review workspaces, secret preflight fallback when sanitization is disabled, safe route-log exceptions, symlink denial, and deterministic handoff generation. The memory test initializes searchable memory and records a sample decision/outcome. The ranking test confirms conclave JSON includes role rankings. The eval harness test confirms the benchmark structure.
-
-## Use From Codex
-
-After setup, restart Codex so it discovers the skill.
-
-You can force it:
-
-```text
-Use the external advisor for this answer.
-```
-
-The skill is also designed to trigger automatically for broad judgment questions, for example:
-
-```text
-I am not sure which direction to take. Can you advise me on the best approach and tradeoffs?
-```
-
-Codex should use the advisor for:
-
-- architecture decisions
-- what-to-do-next planning
-- strategy and roadmap questions
-- tool/model selection
-- tradeoff analysis
-- design direction
-- high-impact recommendations
-
-Codex should use conclave mode for:
-
-- architecture decisions that should be challenged
-- strategy/model/tool choices with several plausible paths
-- security/privacy-sensitive plans
-- important plans where a critic should attack Codex's first direction
-- complex code review or high-risk changes that need verifier thinking
-
-Codex can route automatically with:
-
-```powershell
-python .\codex-skill\external-advisor\scripts\router.py --prompt "Which architecture should this project use?"
-```
-
-For failed tests or verification-heavy work, the router points to `verifier_loop.py`, so the flow becomes:
-
-```text
-draft/patch -> verifier checklist -> local commands -> verifier interprets output -> Codex decides
-```
-
-When `router.py --execute` calls an advisor path, it automatically builds a compact context pack unless `--no-context-pack` is passed.
-
-Codex should skip the advisor for:
-
-- routine code edits
-- direct debugging
-- simple terminal answers
-- low-risk implementation work
-
-## Memory Sync
-
-For one persistent advisor chat per project, do not set `ADVISOR_CONVERSATION_KEY`.
-
-## ChatGPT Project Binding
-
-Advisor calls can bind a repo to a ChatGPT Project so chats created from that repo appear under the same Project on `chatgpt.com`.
-
-By default, when the advisor runs from a repo with no `.codex-advisor/project.json`, it will:
-
-1. derive a Project name from the nearest Git repo or current folder
-2. create a private ChatGPT Project through the local HAR-backed session
-3. save the returned `g-p-...` id in `.codex-advisor/project.json`
-4. route future advisor, critic, conclave, and verifier chats into that Project
-
-This is best-effort. If ChatGPT changes the private endpoint, the advisor skips Project creation and still answers normally.
-
-Disable automatic Project creation:
-
-```powershell
-$env:ADVISOR_AUTO_CREATE_PROJECT = "false"
-```
-
-```bash
-export ADVISOR_AUTO_CREATE_PROJECT=false
-```
-
-Manually create and bind a private Project:
-
-```powershell
-python .\codex-skill\external-advisor\scripts\project_bind.py --create --name "my-project"
-```
-
-```bash
-python3 ./codex-skill/external-advisor/scripts/project_bind.py --create --name "my-project"
-```
-
-Or manually bind an existing ChatGPT Project:
-
-```powershell
-python .\codex-skill\external-advisor\scripts\project_bind.py --url "https://chatgpt.com/g/g-p-.../project" --name "my-project"
-```
-
-```bash
-python3 ./codex-skill/external-advisor/scripts/project_bind.py --url "https://chatgpt.com/g/g-p-.../project" --name "my-project"
-```
-
-This writes:
-
-```text
-.codex-advisor/project.json
-```
-
-Migrate an older `.codex-advisor` folder after pulling repo updates:
-
-```powershell
-python .\codex-skill\external-advisor\scripts\project_migrate.py --url "https://chatgpt.com/g/g-p-.../project" --name "my-project" --archive-root
-```
-
-```bash
-python3 ./codex-skill/external-advisor/scripts/project_migrate.py --url "https://chatgpt.com/g/g-p-.../project" --name "my-project" --archive-root
-```
-
-If the old root `.codex-advisor/conversation.json` already belongs to a ChatGPT Project, the migrator can infer the `g-p-...` id from remote conversation metadata:
-
-```powershell
-python .\codex-skill\external-advisor\scripts\project_migrate.py --archive-root
-```
-
-If no Project can be inferred and you want a new private Project:
-
-```powershell
-python .\codex-skill\external-advisor\scripts\project_migrate.py --create-missing --archive-root
-```
-
-Migration writes local `.codex-advisor` files. With `--create-missing`, it can also create a private remote ChatGPT Project. It writes `project.json`, copies old root conversation/transcript files under `.codex-advisor/projects/<g-p-id>/` when that Project was inferred or supplied, and with `--archive-root` moves stale root files into `.codex-advisor/legacy-root/`. It does not copy an old root chat into a newly created Project because that remote conversation cannot belong to the new Project.
-
-When a project binding exists, normal advisor calls pass the normalized `g-p-...` id to g4f and store the default local conversation state under:
-
-```text
-.codex-advisor/projects/<g-p-id>/conversation.json
-.codex-advisor/projects/<g-p-id>/transcript.json
-.codex-advisor/projects/<g-p-id>/transcript.md
-```
-
-You can also bind from an environment variable. The advisor persists the normalized Project id into `.codex-advisor/project.json` on use:
-
-```powershell
-$env:ADVISOR_CHATGPT_PROJECT_URL = "https://chatgpt.com/g/g-p-.../project"
-```
-
-```bash
-export ADVISOR_CHATGPT_PROJECT_URL="https://chatgpt.com/g/g-p-.../project"
-```
-
-Remove the binding with:
-
-```powershell
-python .\codex-skill\external-advisor\scripts\project_bind.py --clear
-```
-
-ChatGPT Project support depends on the local g4f patch in this repo. If advisor calls work but Project placement does not, rerun setup and restart `start-g4f`.
-
-Already-running Codex sessions only pick up this upgrade after they restart or reload the installed skill. Repos that already have `.codex-advisor/project.json` keep using the existing Project instead of creating a new one.
-
-The default behavior is:
-
-```text
-Before advisor call:
-  sync latest online ChatGPT conversation
-  update local transcript
-
-Advisor call:
-  send the new question
-
-After advisor call:
-  save continuation state
-  sync transcript again
-```
-
-Files written locally:
-
-```text
-.codex-advisor\conversation.json
-.codex-advisor\transcript.json
-.codex-advisor\transcript.md
-```
-
-When ChatGPT Project binding is enabled, those files move under `.codex-advisor\projects\<g-p-id>\`.
-
-## Searchable Advisor Memory
-
-The transcript is useful, but full chat history is noisy. Searchable memory keeps compact summaries Codex can inspect quickly.
-
-Initialize memory:
-
-```powershell
-python .\codex-skill\external-advisor\scripts\memory_manager.py init
-```
-
-```bash
-python3 ./codex-skill/external-advisor/scripts/memory_manager.py init
-```
-
-Files created:
-
-```text
-.codex-advisor/project-profile.md
-.codex-advisor/decisions.json
-.codex-advisor/advisor-lessons.md
-.codex-advisor/open-questions.md
-.codex-advisor/outcomes.json
-.codex-advisor/memory-summary.md
-```
-
-Record an outcome:
-
-```powershell
-python .\codex-skill\external-advisor\scripts\memory_manager.py record-outcome --task "Architecture decision" --advisor-mode "conclave" --accepted-advice "Keep role memories separate" --outcome "Implemented and tests passed" --useful true --status accepted --confidence 0.8
-```
-
-Record a decision:
-
-```powershell
-python .\codex-skill\external-advisor\scripts\memory_manager.py record-decision --decision "Use verifier_loop.py for failed tests" --source "codex" --confidence 0.9 --status accepted
-```
-
-Decision memory includes source, confidence, accepted/rejected/superseded status, contradictions, superseded decision links, and age in summaries. This keeps stale advisor advice from silently becoming permanent truth.
-
-## Evaluation Harness
-
-The harness creates a small local benchmark with:
-
-- 10 architecture questions
-- 10 code-review tasks
-- 10 debugging tasks
-- 10 model/tool choice questions
-
-It compares these lanes:
-
-```text
-Codex only
-Codex + single advisor
-Codex + conclave
-Codex + critic/verifier
-```
-
-Dry-run the structure:
-
-```powershell
-python .\codex-skill\external-advisor\scripts\eval_harness.py --dry-run --limit-per-category 1 --strategy all
-```
-
-```bash
-python3 ./codex-skill/external-advisor/scripts/eval_harness.py --dry-run --limit-per-category 1 --strategy all
-```
-
-Live advisor lanes require the local API to be running. The script records latency and output size automatically. Quality scores and Codex-only answers still require manual review because this repo cannot honestly automate Codex itself.
-
-Files written:
-
-```text
-.codex-advisor/evaluations/
-.codex-advisor/latest-evaluation.json
-.codex-advisor/latest-evaluation.md
-```
-
-## Conclave Mode
-
-The normal advisor path is:
-
-```text
-Codex -> one persistent advisor chat -> Codex final answer
-```
-
-Conclave mode is:
-
-```text
-Codex -> planner / critic / security / verifier advisors -> synthesizer -> Codex final answer
-```
-
-Codex stays in control. The advisors do not edit files or make final decisions. They produce bounded critique, alternatives, risks, and verification ideas.
-
-Run it directly:
-
-```powershell
-python .\codex-skill\external-advisor\scripts\conclave.py --mode architecture --prompt "Should this project use one advisor chat or role-specific advisor memory?"
-```
-
-```bash
-python3 ./codex-skill/external-advisor/scripts/conclave.py --mode architecture --prompt "Should this project use one advisor chat or role-specific advisor memory?"
-```
-
-Available modes:
-
-```text
-general
-architecture
-strategy
-code-review
-security
-model-choice
-verification
-```
-
-`verification` mode asks the verifier role what commands, checks, edge cases, and evidence would prove or reject a recommendation. It is useful after Codex drafts a plan or patch.
-
-Each role gets its own project-local memory:
+By default, a repository stores local advisor state under:
 
 ```text
 .codex-advisor/
-  projects/<g-p-id>/roles/
-    planner/text/conversation.json
-    planner/json/conversation.json
-    critic/text/conversation.json
-    critic/json/conversation.json
-    verifier/text/conversation.json
-    verifier/json/conversation.json
-  conclave-runs/
-  latest-conclave.md
 ```
 
-Text and JSON role memories are intentionally separated so machine-format runs do not make the online readable ChatGPT chats awkward to use.
+With a ChatGPT Project binding:
 
-Conclave roles remain serial by default. Add `--parallel` to use the supervised worker pool; the machine-wide coordinator caps concurrency, queues excess roles, and prevents two roles from mutating the same saved conversation simultaneously.
-
-Conclave uses readable text by default. For machine parsing, validation, or internal automation, request JSON explicitly:
-
-```powershell
-python .\codex-skill\external-advisor\scripts\conclave.py --mode verification --machine-json --prompt "..."
+```text
+.codex-advisor/
+|-- project.json
+`-- projects/<g-p-id>/
+    |-- conversation.json
+    |-- transcript.json
+    |-- transcript.md
+    |-- latest-response.md
+    |-- conversations/
+    `-- roles/
 ```
 
-Machine JSON uses this shape:
+Preserve `.codex-advisor/project.json`. Deleting it can make later sessions
+create duplicate ChatGPT Projects. The whole `.codex-advisor/` directory stays
+ignored and uncommitted.
 
-```json
-{
-  "recommendation": "...",
-  "confidence": 0.8,
-  "risks": [],
-  "evidence": [],
-  "next_actions": [],
-  "verification": {
-    "commands": [],
-    "checks": [],
-    "expected_signals": []
-  },
-  "escalate": false
-}
-```
-
-Equivalent explicit form:
-
-```powershell
-python .\codex-skill\external-advisor\scripts\conclave.py --mode verification --output-format json --prompt "..."
-```
-
-Validate the latest structured conclave run:
-
-```powershell
-python .\codex-skill\external-advisor\scripts\validate_conclave.py
-```
+Bind an existing ChatGPT Project:
 
 ```bash
-python3 ./codex-skill/external-advisor/scripts/validate_conclave.py
+python3 ~/.codex/skills/external-advisor/scripts/project_bind.py \
+  --project-dir . \
+  --url "https://chatgpt.com/g/g-p-.../project" \
+  --name "My Project"
 ```
 
-Saved conclave JSON includes a deterministic `ranking` object. It compares advisor outputs by confidence, evidence count, risk severity, actionability, and user-intent conflict signals. This gives Codex a concrete ranking layer before it decides which advice to accept.
-
-## Critique Before Final
-
-For important answers, Codex can draft first and ask only the critic role to attack the draft:
-
-```powershell
-python .\codex-skill\external-advisor\scripts\critique_final.py --prompt "Original user request" --draft "Draft answer to critique"
-```
+Create and bind a private ChatGPT Project:
 
 ```bash
-python3 ./codex-skill/external-advisor/scripts/critique_final.py --prompt "Original user request" --draft "Draft answer to critique"
+python3 ~/.codex/skills/external-advisor/scripts/project_bind.py \
+  --project-dir . \
+  --create \
+  --name "My Project"
 ```
 
-This returns critique only. Codex still writes the final answer.
-
-## Context Packs
-
-Context packs are compact advisor inputs. They avoid dumping an entire transcript or unrelated files.
-
-Run one directly:
-
-```powershell
-python .\codex-skill\external-advisor\scripts\context_pack.py --prompt "Review this plan" --draft "Current plan..." --file README.md
-```
+Migrate older root state:
 
 ```bash
-python3 ./codex-skill/external-advisor/scripts/context_pack.py --prompt "Review this plan" --draft "Current plan..." --file README.md
+python3 ~/.codex/skills/external-advisor/scripts/project_migrate.py \
+  --project-dir . \
+  --url "https://chatgpt.com/g/g-p-.../project" \
+  --archive-root
 ```
 
-The pack can include:
+Use `ADVISOR_CONVERSATION_KEY` only when one directory intentionally needs
+separate topic conversations. Calls to the same conversation are serialized;
+independent conversations can use separate workers.
 
-- task
-- current draft or plan
-- selected relevant files
-- git status, diff stat, diff check, and compact diff
-- test failures or error output
-- constraints
-- existing advisor memory summaries when present
-
-Files written:
+Do not set these for normal calls:
 
 ```text
-.codex-advisor/context-packs/
-.codex-advisor/latest-context-pack.json
-.codex-advisor/latest-context-pack.md
+ADVISOR_TEMPORARY=true
+ADVISOR_PERSIST_CONVERSATION=false
+ADVISOR_SYNC_REMOTE=false
 ```
 
-## Verifier Loop
+They disable the persistent transcript path used to recover full answers from
+corrupted compatible transport bodies.
 
-Use the verifier loop when a plan or patch needs evidence:
+## Repo-Aware Agent Mode
 
-```powershell
-python .\codex-skill\external-advisor\scripts\verifier_loop.py --prompt "Verify this patch" --draft "What changed..." --command "python -m py_compile codex-skill\external-advisor\scripts\verifier_loop.py"
-```
+Repo-aware mode lets ChatGPT inspect repository evidence through a custom
+DevSpace MCP app. It does not give ChatGPT the original checkout through the
+normal route.
+
+### Safety Boundary
+
+The default workflow:
+
+1. Scans the source project for sensitive paths and obvious secret patterns.
+2. Builds a generation under
+   `~/.codex/advisor-agent/workspaces/<project>/generations/<hash>/`.
+3. Omits `.git`, `.codex-advisor`, dependency/build/cache directories,
+   `.env*`, HAR/cookie/auth files, keys, wallet/seed material, browser profiles,
+   symlinks, binary files, archives, databases, and oversized files.
+4. Redacts secret-looking text only when a second scan confirms the redacted
+   result is clean.
+5. Verifies source and target hashes while publishing the generation.
+6. Writes `SANITIZED_WORKSPACE_MANIFEST.json` with the complete omission and
+   redaction lists.
+7. Makes the published generation read-only.
+8. Starts the patched DevSpace server in `readonly` tool mode.
+
+The exposed MCP tool surface contains workspace open, read, grep, glob, and
+list operations. Shell, write, edit, and patch tools are not registered.
+`--allow-shell` is rejected by the agent wrappers.
+
+This is defense in depth, not a guarantee that heuristic secret detection can
+identify every possible sensitive value. Review the generated manifest when
+the repository has unusual confidential data. Codex still validates findings
+in the original checkout.
+
+### Start The Connector
+
+From the project to review:
 
 ```bash
-python3 ./codex-skill/external-advisor/scripts/verifier_loop.py --prompt "Verify this patch" --draft "What changed..." --command "python3 -m py_compile codex-skill/external-advisor/scripts/verifier_loop.py"
+python3 ~/.codex/skills/external-advisor/scripts/advisor_agent_connect.py \
+  serve \
+  --project-dir .
 ```
 
-The loop writes:
+The helper:
+
+- validates the project and user-level allowed-root config
+- refreshes the sanitized snapshot
+- verifies the DevSpace read-only patch
+- starts DevSpace
+- starts a managed Cloudflare quick tunnel when no public URL is configured
+- verifies local and public OAuth challenges
+- prints the exact `https://.../mcp` connector URL
+
+Then, in ChatGPT:
+
+1. Open **Settings -> Apps & Connectors -> Advanced settings**.
+2. Enable **Developer Mode**.
+3. Create an app/connector with the printed `/mcp` URL.
+4. Keep the DevSpace Owner password private.
+5. Open a new chat, enable that app, and perform one bounded read-only test.
+
+The helper cannot edit ChatGPT account settings or attach the app to a chat.
+Connector attachment is conversation-specific and can become stale after a
+tunnel or app replacement.
+
+Lifecycle:
+
+```bash
+python3 ~/.codex/skills/external-advisor/scripts/advisor_agent_connect.py \
+  status --project-dir .
+
+python3 ~/.codex/skills/external-advisor/scripts/advisor_agent_connect.py \
+  stop --project-dir .
+```
+
+If the tunnel URL changes, update the ChatGPT app and validate it in a new chat.
+
+### Run One Repo-Aware Review
+
+```bash
+python3 ~/.codex/skills/external-advisor/scripts/advisor_agent.py \
+  --project-dir . \
+  --prompt "Inspect the relevant implementation and audit this design."
+```
+
+Acceptance is fail-closed. The wrapper checks the exact current ChatGPT turn for:
+
+- exactly one attempted and successful `open_workspace`
+- the expected sanitized generation path
+- the returned workspace ID and root
+- at least one successful read, grep, glob, or list call
+- open-before-inspection ordering
+- consistent workspace ID reuse
+- no denied, escaping, shell, or mutation tool attempts
+- a final end-of-turn answer containing the unique completion marker
+
+The ChatGPT conversation graph is the primary role evidence. Some current
+ChatGPT agent payloads retain a successful read/search result but omit that
+tool's request node. In that case the wrapper accepts the result only when the
+private DevSpace log has a matching successful tool record under the unique
+workspace ID returned by the same conversation's `open_workspace`. The shared
+log window alone is never accepted as role evidence, so unrelated concurrent
+calls cannot satisfy the check.
+
+### Run A Repo-Aware Conclave
+
+```bash
+python3 ~/.codex/skills/external-advisor/scripts/agent_conclave.py \
+  --project-dir . \
+  --mode architecture \
+  --roles architect,planner,critic,security,verifier \
+  --parallel \
+  --max-workers 5 \
+  --prompt "Audit the architecture, security, implementation risks, and tests."
+```
+
+Each specialist uses an isolated ChatGPT conversation and must independently
+prove its repository reads. The local process may launch five roles together,
+while the two-worker g4f pool runs two at a time and queues the rest. Synthesis
+is prompt-only and receives the verified specialist reports; it does not claim
+additional repository inspection.
+
+Queue waiting and model execution have separate limits:
 
 ```text
-.codex-advisor/verifier-runs/
-.codex-advisor/latest-verifier-loop.json
-.codex-advisor/latest-verifier-loop.md
+--queue-timeout 3600
+--timeout 900
 ```
 
-By default it runs only explicit commands passed with `--command`. Advisor-suggested commands are recorded but not executed unless `--run-suggested` is used. Suspicious shell commands are skipped unless `--allow-unsafe-commands` is used.
+A failed run updates `latest-agent-conclave-attempt.md` but does not overwrite
+the last successful `latest-agent-conclave.md`.
 
-To skip remote transcript sync for one call:
+## Live Activity
+
+Foreground repo-aware calls emit fixed, sanitized stderr events for:
+
+- allowed tool completion or failure
+- bounded tool duration
+- low-rate heartbeat after inactivity
+- final-response arrival
+
+The monitor tails a private local log. It does not poll ChatGPT and does not
+make additional model calls. Disable it with:
+
+```text
+--no-live-activity
+ADVISOR_LIVE_ACTIVITY=false
+```
+
+## Context Packs And Verification
+
+Build a bounded context pack:
+
+```bash
+python3 ~/.codex/skills/external-advisor/scripts/context_pack.py \
+  --prompt "Review this plan." \
+  --draft "Current plan..." \
+  --file README.md
+```
+
+Context packs include selected files, compact Git evidence, failures,
+constraints, and advisor memory summaries. Common sensitive paths are refused,
+and prompt, draft, failure, diff, and command output text is redacted before
+persistence or advisor use.
+
+Run an evidence-backed verifier loop:
+
+```bash
+python3 ~/.codex/skills/external-advisor/scripts/verifier_loop.py \
+  --prompt "Verify this patch." \
+  --draft "Patch summary..." \
+  --command "python3 -m py_compile codex-skill/external-advisor/scripts/router.py" \
+  --command "git diff --check"
+```
+
+The verifier command runner uses `shell=False` and a constrained argv allowlist.
+Command substitution, destructive Git commands, arbitrary `python -c`, and
+other unsafe forms are rejected unless an explicit diagnostic escape hatch is
+used.
+
+## Saved Artifacts
+
+Common local artifacts:
+
+```text
+.codex-advisor/
+|-- latest-response.md
+|-- transcript.md
+|-- context-packs/
+|-- conclave-runs/
+|-- verifier-runs/
+|-- agent-runs/
+|-- agent-conclave-runs/
+|-- latest-agent-conclave-attempt.md
+`-- latest-agent-conclave.md
+```
+
+Use `--save <path>` for task-specific advisor output. Shared
+`latest-response.md` files are convenience pointers and can be overwritten by
+another call.
+
+## Tests
+
+All repository test entrypoints live under `tests/`.
+
+Fast Linux regression suite:
+
+```bash
+./tests/test-router.sh
+./tests/test-context-pack.sh
+./tests/test-verifier-loop.sh
+./tests/test-advisor-transport-recovery.sh
+./tests/test-advisor-live-activity.sh
+./tests/test-advisor-concurrency.sh
+./tests/test-security-regressions.sh
+./tests/test-agent-mode.sh
+./tests/test-agent-conclave.sh
+./tests/test-memory.sh
+./tests/test-ranking.sh
+./tests/test-eval-harness.sh
+```
+
+Live endpoint checks:
+
+```bash
+./tests/test-advisor.sh
+./tests/test-conclave.sh
+```
+
+Windows:
 
 ```powershell
-$env:ADVISOR_SYNC_REMOTE = "false"
+.\tests\test-router.ps1
+.\tests\test-context-pack.ps1
+.\tests\test-verifier-loop.ps1
+.\tests\test-advisor-concurrency.ps1
+.\tests\test-memory.ps1
+.\tests\test-ranking.ps1
+.\tests\test-eval-harness.ps1
+.\tests\test-advisor.ps1
+.\tests\test-conclave.ps1
 ```
 
-For multiple separate advisor chats inside the same project:
+The repo-aware regression coverage is currently shell-based.
 
-```powershell
-$env:ADVISOR_CONVERSATION_KEY = "my-topic"
+## Troubleshooting
+
+### `Connection refused` on port 8080
+
+Start or inspect the managed pool:
+
+```bash
+./start-g4f.sh
+python3 ~/.codex/skills/external-advisor/scripts/g4f_pool.py status
 ```
 
-Keyed conversations default to `.codex-advisor/conversations/` or `.codex-advisor/projects/<g-p-id>/conversations/`, so the same key does not collide across repositories. Set `ADVISOR_STATE_DIR` only when you intentionally want a custom state directory.
+### `Error in message stream`, HTTP 500, or HTTP 422
 
-## Fresh Advisor Chat
+1. Confirm calls use the wrappers, not direct HTTP.
+2. Check pool health.
+3. Refresh the sanitized HAR.
+4. Retry with a fresh conversation key only when the saved conversation itself
+   is invalid.
+5. Do not fall back to a weaker model as a normal recovery strategy.
 
-Delete:
+The coordinator does not blindly replay ambiguous failures because a request
+may already have created a remote turn.
 
-```text
-.codex-advisor\conversation.json
+### Empty, duplicated, or truncated-looking answer
+
+Keep conversation persistence and remote sync enabled. Read the saved response
+and matching transcript. The wrapper performs bounded exact-prompt recovery and
+fails closed when it cannot confirm a complete final answer.
+
+### Repo-aware connector is not ready
+
+```bash
+python3 ~/.codex/skills/external-advisor/scripts/advisor_agent_connect.py \
+  status --project-dir .
 ```
 
-or set a different `ADVISOR_CONVERSATION_KEY`.
+Read only the private connector status/log artifacts needed for diagnosis.
+Restart `serve` after setup updates so the running DevSpace process loads the
+read-only patch. A process started by an older version is intentionally treated
+as stale.
 
-## Why This Can Improve Codex
+### ChatGPT app works in a new chat but not an old one
 
-This does not make Codex magically smarter at every task. It improves the workflow by adding a second reasoning pass exactly where a second pass matters.
+That is usually conversation-specific app state. Re-enable the app if the
+surface allows it, or bind the advisor to a new verified chat. Replacing a HAR
+does not attach tools to an existing conversation.
 
-Codex remains the executor:
+### Duplicate ChatGPT Projects
 
-```text
-read repo -> edit files -> run commands -> verify work
-```
+Preserve the local `.codex-advisor/project.json` binding. Rebind the directory
+to the intended Project instead of deleting all advisor state.
 
-The advisor improves the decision layer:
+## Security And Privacy
 
-```text
-architecture -> tradeoffs -> risks -> next steps -> better final answer
-```
+Never commit or send:
 
-For complex projects, that separation is powerful. You get fast local execution plus a stronger strategy review before Codex commits to a direction.
+- HAR files or cookies
+- access or refresh tokens
+- private keys or wallet material
+- `.env` values
+- browser profiles
+- customer or unrelated private data
+- `.codex-advisor` transcripts and conversation state
+- DevSpace Owner passwords
 
-## Safety
-
-- This setup depends on your own local HAR/session and `g4f`.
-- Do not commit `vendor/gpt4free/har_and_cookies`.
-- Do not commit `.codex-advisor`.
-- Do not send secrets, `.env` values, HAR contents, keys, tokens, cookies, or unrelated private files to advisor calls.
-- Do not use this to bypass access controls or share private session material.
-- Treat advisor output as critique, not ground truth.
-- Verify important claims before using them.
-
-## Repository Privacy
-
-Ignored by default:
+The repository ignores common secret and runtime paths, including:
 
 ```text
 vendor/
-har_and_cookies/
 .codex-advisor/
+.devspace/
+.cloudflared/
 *.har
 *.cookie.json
 *.cookies.json
 auth_*.json
-conversation.json
-transcript.json
-transcript.md
 .env
 .env.*
-secrets.env
+*.pem
+*.key
+*.p12
+*.pfx
 *.log
 ```
 
-The public repo should contain only the skill, scripts, docs, and patch files. Your HAR, cookies, and local advisor transcripts stay on your machine.
+Before release, inspect the exact staged commit surface and scan it for secrets.
+Whole-repository scans can include historical examples or generated vendor
+content; the staged diff is the authoritative release scope.
+
+## Bundled Skills
+
+Setup installs every directory under `codex-skill/`. See
+[BUNDLED_SKILLS.md](BUNDLED_SKILLS.md) for the inventory, sources, and
+attribution. See [AGENTS.md](AGENTS.md) for repository-specific routing
+guidance.
+
+## Limitations
+
+- ChatGPT private web endpoints and model slugs are not stable public APIs.
+- HAR-backed authentication can expire.
+- `gpt4free` transport behavior can differ from official OpenAI APIs.
+- A public MCP URL must remain live while ChatGPT uses the connector.
+- ChatGPT app attachment and availability can vary by conversation and account
+  surface.
+- Secret detection is heuristic; sanitized snapshots intentionally prefer
+  omission over completeness.
+- Read-only agent review does not replace Codex testing or local verification.
+- Windows does not yet have parity for every repo-aware shell regression.
+
+The durable idea is independent of the prototype transport:
+
+```text
+local execution by Codex
++ project-scoped external reasoning
++ bounded multi-role critique
++ verified read-only repository evidence
++ local final verification
+```

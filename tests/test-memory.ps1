@@ -1,5 +1,5 @@
 $ErrorActionPreference = "Stop"
-$Root = Split-Path -Parent $MyInvocation.MyCommand.Path
+$Root = Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path)
 $Memory = Join-Path $Root "codex-skill\external-advisor\scripts\memory_manager.py"
 $Project = Join-Path $env:TEMP ("advisor-memory-test-" + [guid]::NewGuid())
 $AdvisorDir = Join-Path $Project ".codex-advisor"

@@ -16,7 +16,7 @@ import urllib.request
 from pathlib import Path
 
 
-ROOT = Path(__file__).resolve().parent
+ROOT = Path(__file__).resolve().parent.parent
 SCRIPTS = ROOT / "codex-skill" / "external-advisor" / "scripts"
 sys.path.insert(0, str(SCRIPTS))
 
@@ -182,6 +182,31 @@ def test_same_conversation_serializes(root: Path) -> None:
         raise AssertionError("same-conversation calls overlapped")
 
 
+def test_same_conversation_across_state_files_serializes(root: Path) -> None:
+    runtime = root / "cross-state-conversation-runtime"
+    state_paths = [
+        root / "cross-state-first.conversation.json",
+        root / "cross-state-second.conversation.json",
+    ]
+    for state_path in state_paths:
+        state_path.write_text(
+            json.dumps({"conversation": {"conversation_id": "conversation-cross-state-test"}}),
+            encoding="utf-8",
+        )
+    outputs = [root / f"cross-state-conversation-{index}.json" for index in range(2)]
+    env = child_env(
+        runtime,
+        "http://127.0.0.1:8080/v1,http://127.0.0.1:8081/v1",
+    )
+    processes = [
+        spawn_child("conversation", str(index), 0.4, outputs[index], state_paths[index], env)
+        for index in range(2)
+    ]
+    wait_children(processes)
+    if max_overlap(read_results(outputs)) != 1:
+        raise AssertionError("same conversation id in separate state files overlapped")
+
+
 def test_first_turn_transition_serializes(root: Path) -> None:
     runtime = root / "first-turn-runtime"
     state_path = root / "first-turn.conversation.json"
@@ -200,6 +225,61 @@ def test_first_turn_transition_serializes(root: Path) -> None:
     wait_children([first, second])
     if max_overlap(read_results(outputs)) != 1:
         raise AssertionError("first-turn state-to-conversation transition overlapped")
+
+
+def test_stale_and_timed_out_queue_tickets_are_removed(root: Path) -> None:
+    runtime = root / "queue-cleanup-runtime"
+    url = "http://127.0.0.1:8080/v1"
+    previous = {
+        name: os.environ.get(name)
+        for name in (
+            "ADVISOR_RUNTIME_DIR",
+            "ADVISOR_POOL_WORKER_URLS",
+            "ADVISOR_QUEUE_POLL_SECONDS",
+        )
+    }
+    os.environ.update({
+        "ADVISOR_RUNTIME_DIR": str(runtime),
+        "ADVISOR_POOL_WORKER_URLS": url,
+        "ADVISOR_QUEUE_POLL_SECONDS": "0.02",
+    })
+    try:
+        queue_dir = runtime / "queues" / concurrency.pool_id([url])
+        queue_dir.mkdir(parents=True)
+        stale_ticket = queue_dir / "00000000000000000000-dead.json"
+        stale_ticket.write_text(
+            json.dumps({"pid": 999999999, "process_identity": "dead"}),
+            encoding="utf-8",
+        )
+        concurrency.cleanup_stale_tickets(queue_dir)
+        if stale_ticket.exists():
+            raise AssertionError("dead advisor queue ticket was not removed")
+
+        worker_lock = concurrency.InterProcessLock(
+            runtime
+            / "workers"
+            / f"{concurrency.pool_id([url])}-{concurrency.key_digest(url, 12)}.lock",
+            timeout=0.0,
+        )
+        if not worker_lock.try_acquire():
+            raise AssertionError("could not acquire the synthetic worker lock")
+        try:
+            try:
+                with concurrency.worker_lease(url, 0.15):
+                    raise AssertionError("worker lease unexpectedly bypassed the held lock")
+            except RuntimeError as exc:
+                if "queue timed out" not in str(exc).lower():
+                    raise
+        finally:
+            worker_lock.release()
+        if list(queue_dir.glob("*.json")):
+            raise AssertionError("timed-out advisor queue left a ticket behind")
+    finally:
+        for name, value in previous.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
 
 
 def test_pool_degrades_after_cross_worker_failures(root: Path) -> None:
@@ -503,7 +583,9 @@ def main() -> int:
         test_two_worker_capacity(root)
         test_fifo_single_worker(root)
         test_same_conversation_serializes(root)
+        test_same_conversation_across_state_files_serializes(root)
         test_first_turn_transition_serializes(root)
+        test_stale_and_timed_out_queue_tickets_are_removed(root)
         test_pool_degrades_after_cross_worker_failures(root)
         test_pool_helpers()
         test_pool_supervisor_lifecycle(root)
