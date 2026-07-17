@@ -241,6 +241,84 @@ saved_agent = advisor.load_conversation(agent_state)
 if saved_agent.get("parent_message_id") != "a2":
     raise SystemExit("Streaming agent recovery did not advance state to the final assistant message.")
 
+unbounded_state = project / ".codex-advisor" / "agent-unbounded.conversation.json"
+unbounded_fetches = {"count": 0, "status": 0}
+
+
+def unbounded_get_json(url, *_args, **_kwargs):
+    if url.endswith("/stream_status"):
+        unbounded_fetches["status"] += 1
+        return {"status": "IS_STREAMING"}
+    unbounded_fetches["count"] += 1
+    return agent_progress if unbounded_fetches["count"] == 1 else agent_final
+
+
+with patched_env(
+    ADVISOR_FINAL_FETCH_TIMEOUT=None,
+    ADVISOR_FINAL_FETCH_MAX_POLLS=None,
+    ADVISOR_FINAL_FETCH_POLL_SECONDS="0.5",
+):
+    with patched(
+        advisor,
+        get_json=unbounded_get_json,
+        load_chatgpt_auth=lambda: {"headers": {"Authorization": "Bearer fake"}, "user_id": "fake"},
+        time=type("FakeTime", (), {"monotonic": staticmethod(__import__("time").monotonic), "sleep": staticmethod(lambda _seconds: None)}),
+    ):
+        result = advisor.fetch_remote_final_text(unbounded_state, agent_conv.copy(), "agent prompt", 0)
+if result != "REVIEWER REPORT\nFinal findings.":
+    raise SystemExit(f"Unlimited agent final fetch failed: {result!r}")
+if unbounded_fetches["status"] != 0:
+    raise SystemExit("Unfinished conversation evidence should avoid a redundant stream-status request.")
+
+
+rate_limit_calls = {"count": 0, "recorded": 0}
+rate_limit_sleeps = []
+
+
+def rate_limited_get_json(*_args, **_kwargs):
+    rate_limit_calls["count"] += 1
+    if rate_limit_calls["count"] <= 2:
+        raise advisor.RateLimitError("HTTP 429 test throttle", retry_after=0.25)
+    return {"ok": True}
+
+
+with patched_env(ADVISOR_RATE_LIMIT_MAX_RETRIES="4"):
+    with patched(
+        advisor,
+        get_json=rate_limited_get_json,
+        rate_limit_backoff_seconds=lambda _attempt, _retry_after: 0.25,
+        time=type(
+            "FakeTime",
+            (),
+            {
+                "monotonic": staticmethod(__import__("time").monotonic),
+                "sleep": staticmethod(rate_limit_sleeps.append),
+            },
+        ),
+    ):
+        original_record = advisor.concurrency.record_remote_rate_limit
+        advisor.concurrency.record_remote_rate_limit = (
+            lambda _retry_after=None: rate_limit_calls.__setitem__(
+                "recorded", rate_limit_calls["recorded"] + 1
+            )
+        )
+        try:
+            recovered_json = advisor.get_remote_json_with_backoff(
+                "https://chatgpt.com/backend-api/conversation/test",
+                {"Authorization": "Bearer fake"},
+                0,
+                operation="test fetch",
+            )
+        finally:
+            advisor.concurrency.record_remote_rate_limit = original_record
+if recovered_json != {"ok": True}:
+    raise SystemExit(f"Rate-limit backoff did not recover: {recovered_json!r}")
+if rate_limit_calls["recorded"] != 2 or rate_limit_sleeps != [0.25, 0.25]:
+    raise SystemExit(
+        f"Rate-limit recovery did not back off and record throttling: "
+        f"calls={rate_limit_calls!r} sleeps={rate_limit_sleeps!r}"
+    )
+
 
 state = project / ".codex-advisor" / "conversation.json"
 state.parent.mkdir(parents=True, exist_ok=True)

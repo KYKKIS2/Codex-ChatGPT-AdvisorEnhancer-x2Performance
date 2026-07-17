@@ -52,6 +52,7 @@ PY
 
 PYTHONPATH="$SCRIPTS" python3 - "$PROJECT" <<'PY'
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -434,6 +435,27 @@ args = type(
 command = agent_conclave.role_command(args, "critic")
 if command[command.index("--queue-timeout") + 1] != "3600.0":
     raise SystemExit("agent_conclave did not propagate the worker queue timeout")
+if agent_conclave.combined_subprocess_timeout(0, 0, 60) is not None:
+    raise SystemExit("agent_conclave imposed an outer timeout on unlimited roles")
+if advisor_agent.combined_subprocess_timeout(0, 0, 30) is not None:
+    raise SystemExit("advisor_agent imposed an outer timeout on an unlimited remote turn")
+
+saved_argv = sys.argv[:]
+saved_env = {name: os.environ.pop(name, None) for name in ("ADVISOR_AGENT_TIMEOUT", "ADVISOR_QUEUE_TIMEOUT")}
+try:
+    sys.argv = ["agent_conclave.py", "--prompt", "test", "--dry-run"]
+    defaults = agent_conclave.parse_args()
+    if (defaults.timeout, defaults.queue_timeout, defaults.max_workers) != (0, 0.0, 5):
+        raise SystemExit("agent_conclave no longer defaults to unlimited five-role execution")
+    sys.argv = ["advisor_agent.py", "--prompt", "test", "--dry-run"]
+    agent_defaults = advisor_agent.parse_args()
+    if (agent_defaults.timeout, agent_defaults.queue_timeout) != (0, 0.0):
+        raise SystemExit("advisor_agent no longer defaults to unlimited completion waiting")
+finally:
+    sys.argv = saved_argv
+    for name, value in saved_env.items():
+        if value is not None:
+            os.environ[name] = value
 
 print("Agent-conclave helper tests passed.")
 PY

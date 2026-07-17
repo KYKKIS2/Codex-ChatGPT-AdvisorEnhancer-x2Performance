@@ -49,13 +49,15 @@ runtime behavior, commands, metrics, and file references locally.
 
 `router.py` chooses among these lanes, no-advisor, and verifier workflows.
 When a verified repo-aware connector is ready, repository analysis prefers an
-agent lane. `--prompt-only` forces the original context-only behavior.
+agent lane. Local tunnel health alone is insufficient: one direct repo-aware
+call must first prove the current ChatGPT attachment with exact MCP evidence.
+`--prompt-only` forces the original context-only behavior.
 
 ## Main Capabilities
 
 - Installs the `external-advisor` Codex skill and the other bundled skills in
   `codex-skill/`.
-- Runs a local OpenAI-compatible `g4f` worker pool.
+- Runs a local OpenAI-compatible `g4f` supervisor with disposable per-call workers.
 - Defaults normal calls to `gpt-5-6-thinking` with
   `thinking_effort=max`.
 - Supports the current Pro route through
@@ -66,8 +68,8 @@ agent lane. `--prompt-only` forces the original context-only behavior.
   the compatible response contains an empty body, duplicate text, or a tail
   fragment.
 - Serializes calls to the same saved conversation.
-- Runs independent conversations on separate workers and queues excess calls
-  in FIFO order.
+- Gives each admitted call its own isolated g4f process and closes it after the
+  call, while a separate FIFO remote-safety queue limits ChatGPT traffic.
 - Builds redacted context packs and evidence-backed verifier loops.
 - Creates content-hashed, read-only sanitized snapshots for repo-aware review.
 - Verifies the exact ChatGPT conversation used one expected workspace and made
@@ -190,7 +192,7 @@ The filename is not important. The HAR is authentication material:
 A HAR refresh does not attach an MCP connector to an existing ChatGPT
 conversation. App attachment is conversation state in ChatGPT.
 
-## Start The Local Advisor Pool
+## Start The Local Advisor Supervisor
 
 Linux:
 
@@ -204,17 +206,31 @@ Windows:
 .\start-g4f.ps1
 ```
 
-The default pool runs two isolated workers on ports `8080` and `8081`. Advisor
-callers still use:
+The default supervisor keeps one control/health endpoint on port `8080`.
+Each wrapped advisor call receives a new isolated g4f process on a private
+transient port; that process is terminated as soon as the call exits. Advisor
+callers always use:
 
 ```text
 http://127.0.0.1:8080/v1
 ```
 
-The wrapper leases workers through a private machine-wide coordinator. Do not
-post directly to `/v1/chat/completions` and do not select port `8081` manually;
-direct calls bypass conversation locks, FIFO queueing, model checks, and
-transcript recovery.
+The wrapper leases transient workers through a private machine-wide
+coordinator. Calls to the same saved conversation remain serialized. Separate
+from the local process ceiling, a machine-wide FIFO admits at most two remote
+ChatGPT turns by default and staggers their starts by two seconds. Excess calls
+wait without polling ChatGPT, then each admitted call receives its own disposable
+g4f process. The local emergency ceiling remains 32, but it is not a recommended
+remote concurrency target.
+
+If ChatGPT returns HTTP `429`, the wrapper honors a numeric `Retry-After` header
+when present, otherwise uses jittered exponential backoff capped at 60 seconds,
+and temporarily reduces new remote admission to one turn. This follows
+[OpenAI's rate-limit guidance](https://developers.openai.com/api/docs/guides/rate-limits),
+although the private ChatGPT web backend does not publish an exact concurrency
+limit. Do not post directly to `/v1/chat/completions` or select a transient port
+manually; direct calls bypass admission control, lifecycle cleanup, conversation
+locks, model checks, and transcript recovery.
 
 Pool management:
 
@@ -226,10 +242,16 @@ python3 ~/.codex/skills/external-advisor/scripts/g4f_pool.py stop
 Useful diagnostics:
 
 ```bash
-G4F_WORKERS=1 ./start-g4f.sh
+G4F_MAX_TRANSIENT_WORKERS=16 ./start-g4f.sh
+ADVISOR_REMOTE_MAX_CONCURRENCY=1 python3 ~/.codex/skills/external-advisor/scripts/router.py --execute --prompt "..."
+G4F_WORKER_MODE=fixed G4F_WORKERS=2 ./start-g4f.sh
 G4F_PORT=8180 ./start-g4f.sh
 G4F_DEBUG=true ./start-g4f.sh
 ```
+
+Keep `ADVISOR_REMOTE_MAX_CONCURRENCY=2` as the normal maximum. Lower it to `1`
+when the account is already being throttled. Raising it should be a deliberate
+diagnostic after stable low-rate operation, not the default for conclaves.
 
 ## Basic Advisor Usage
 
@@ -291,7 +313,6 @@ Hard questions can request the Pro route:
 ```bash
 ADVISOR_THINKING_EFFORT=pro-extended \
 python3 ~/.codex/skills/external-advisor/scripts/advisor.py \
-  --timeout 900 \
   --prompt "Perform a deep architecture and failure-mode review."
 ```
 
@@ -355,7 +376,7 @@ python3 ~/.codex/skills/external-advisor/scripts/project_migrate.py \
 
 Use `ADVISOR_CONVERSATION_KEY` only when one directory intentionally needs
 separate topic conversations. Calls to the same conversation are serialized;
-independent conversations can use separate workers.
+independent conversations receive separate disposable workers.
 
 Do not set these for normal calls:
 
@@ -419,6 +440,8 @@ The helper:
 - starts DevSpace
 - starts a managed Cloudflare quick tunnel when no public URL is configured
 - verifies local and public OAuth challenges
+- records each managed child before readiness so `status` and `stop` can recover
+  an interrupted startup without leaving an untracked process
 - prints the exact `https://.../mcp` connector URL
 
 Then, in ChatGPT:
@@ -433,6 +456,13 @@ The helper cannot edit ChatGPT account settings or attach the app to a chat.
 Connector attachment is conversation-specific and can become stale after a
 tunnel or app replacement.
 
+A fresh or rotated connector starts with `agent_mode_ready: no`. After adding
+the URL in ChatGPT, run one direct `advisor_agent.py` call as shown below. A
+successful fail-closed MCP turn records the attachment against that unchanged
+connector and changes `agent_mode_ready` to `yes`. Until then, `router.py`
+automatically stays on the prompt-only lanes. An explicit `--force-route
+agent-mode` remains available for the initial diagnostic call.
+
 Lifecycle:
 
 ```bash
@@ -444,6 +474,8 @@ python3 ~/.codex/skills/external-advisor/scripts/advisor_agent_connect.py \
 ```
 
 If the tunnel URL changes, update the ChatGPT app and validate it in a new chat.
+`status` distinguishes `starting`, `connector-ready`, `failed`, `stopped`, and
+stale runtime state; `stop` is safe to run after an interrupted `serve` attempt.
 
 ### Run One Repo-Aware Review
 
@@ -485,17 +517,24 @@ python3 ~/.codex/skills/external-advisor/scripts/agent_conclave.py \
 ```
 
 Each specialist uses an isolated ChatGPT conversation and must independently
-prove its repository reads. The local process may launch five roles together,
-while the two-worker g4f pool runs two at a time and queues the rest. Synthesis
-is prompt-only and receives the verified specialist reports; it does not claim
-additional repository inspection.
+prove its repository reads. The local process may launch up to five role
+subprocesses together, but the machine-wide remote FIFO admits only two ChatGPT
+turns at once by default. Waiting roles do not create remote traffic. Every
+admitted role gets its own disposable g4f process. Synthesis is prompt-only and
+receives the verified specialist reports; it does not claim additional
+repository inspection.
 
-Queue waiting and model execution have separate limits:
+Repo-aware calls wait for the real final ChatGPT turn by default:
 
 ```text
---queue-timeout 3600
---timeout 900
+--queue-timeout 0
+--timeout 0
 ```
+
+`0` means no arbitrary wall-clock deadline. Transport failures, invalid model
+routes, denied MCP activity, dead callers, and supervisor shutdown still fail
+closed. Set positive values only when an operator deliberately needs bounded
+execution.
 
 A failed run updates `latest-agent-conclave-attempt.md` but does not overwrite
 the last successful `latest-agent-conclave.md`.
@@ -617,7 +656,7 @@ The repo-aware regression coverage is currently shell-based.
 
 ### `Connection refused` on port 8080
 
-Start or inspect the managed pool:
+Start or inspect the managed supervisor:
 
 ```bash
 ./start-g4f.sh
@@ -627,7 +666,7 @@ python3 ~/.codex/skills/external-advisor/scripts/g4f_pool.py status
 ### `Error in message stream`, HTTP 500, or HTTP 422
 
 1. Confirm calls use the wrappers, not direct HTTP.
-2. Check pool health.
+2. Check supervisor health.
 3. Refresh the sanitized HAR.
 4. Retry with a fresh conversation key only when the saved conversation itself
    is invalid.
@@ -639,8 +678,9 @@ may already have created a remote turn.
 ### Empty, duplicated, or truncated-looking answer
 
 Keep conversation persistence and remote sync enabled. Read the saved response
-and matching transcript. The wrapper performs bounded exact-prompt recovery and
-fails closed when it cannot confirm a complete final answer.
+and matching transcript. The wrapper performs exact-prompt recovery until the
+configured deadline; repo-aware calls have no deadline by default. It fails
+closed when it cannot confirm a complete final answer.
 
 ### Repo-aware connector is not ready
 

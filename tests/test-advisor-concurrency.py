@@ -38,17 +38,29 @@ import advisor_concurrency as concurrency
 mode, label, hold, output, state_path = sys.argv[2:]
 started = time.time()
 if mode == "worker":
-    with concurrency.worker_lease("http://127.0.0.1:8080/v1", 10.0) as lease:
+    with concurrency.worker_lease(os.environ.get("TEST_BASE_URL", "http://127.0.0.1:8080/v1"), 10.0) as lease:
         acquired = time.time()
         time.sleep(float(hold))
         finished = time.time()
         worker = lease.index
+        worker_url = lease.url
+        transient = lease.transient
 elif mode == "conversation":
     with concurrency.conversation_lock(Path(state_path), 10.0):
         acquired = time.time()
         time.sleep(float(hold))
         finished = time.time()
         worker = -1
+        worker_url = ""
+        transient = False
+elif mode == "remote":
+    with concurrency.remote_call_slot(10.0):
+        acquired = time.time()
+        time.sleep(float(hold))
+        finished = time.time()
+        worker = -1
+        worker_url = ""
+        transient = False
 else:
     raise SystemExit("unknown mode")
 Path(output).write_text(json.dumps({
@@ -57,6 +69,8 @@ Path(output).write_text(json.dumps({
     "acquired": acquired,
     "finished": finished,
     "worker": worker,
+    "worker_url": worker_url,
+    "transient": transient,
 }), encoding="utf-8")
 """
 
@@ -67,6 +81,30 @@ def child_env(runtime: Path, worker_urls: str) -> dict[str, str]:
         "ADVISOR_RUNTIME_DIR": str(runtime),
         "ADVISOR_POOL_WORKER_URLS": worker_urls,
         "ADVISOR_QUEUE_POLL_SECONDS": "0.05",
+        "PYTHONPATH": str(SCRIPTS),
+    })
+    return env
+
+
+def transient_child_env(runtime: Path, base_url: str) -> dict[str, str]:
+    env = os.environ.copy()
+    env.update({
+        "ADVISOR_RUNTIME_DIR": str(runtime),
+        "ADVISOR_QUEUE_POLL_SECONDS": "0.02",
+        "TEST_BASE_URL": base_url,
+        "PYTHONPATH": str(SCRIPTS),
+    })
+    env.pop("ADVISOR_POOL_WORKER_URLS", None)
+    return env
+
+
+def remote_child_env(runtime: Path, capacity: int) -> dict[str, str]:
+    env = os.environ.copy()
+    env.update({
+        "ADVISOR_RUNTIME_DIR": str(runtime),
+        "ADVISOR_REMOTE_MAX_CONCURRENCY": str(capacity),
+        "ADVISOR_REMOTE_START_INTERVAL_SECONDS": "0",
+        "ADVISOR_QUEUE_POLL_SECONDS": "0.02",
         "PYTHONPATH": str(SCRIPTS),
     })
     return env
@@ -207,6 +245,87 @@ def test_same_conversation_across_state_files_serializes(root: Path) -> None:
         raise AssertionError("same conversation id in separate state files overlapped")
 
 
+def test_remote_admission_capacity(root: Path) -> None:
+    runtime = root / "remote-capacity-runtime"
+    outputs = [root / f"remote-capacity-{index}.json" for index in range(4)]
+    env = remote_child_env(runtime, 2)
+    processes = [
+        spawn_child("remote", str(index), 0.4, outputs[index], root / "unused.json", env)
+        for index in range(4)
+    ]
+    wait_children(processes)
+    results = read_results(outputs)
+    if max_overlap(results) != 2:
+        raise AssertionError(f"remote admission did not cap concurrency at two: {results!r}")
+
+
+def test_remote_admission_fifo(root: Path) -> None:
+    runtime = root / "remote-fifo-runtime"
+    outputs = [root / f"remote-fifo-{index}.json" for index in range(3)]
+    env = remote_child_env(runtime, 1)
+    processes: list[subprocess.Popen[str]] = []
+    for index in range(3):
+        processes.append(
+            spawn_child("remote", str(index), 0.2, outputs[index], root / "unused.json", env)
+        )
+        time.sleep(0.08)
+    wait_children(processes)
+    results = sorted(read_results(outputs), key=lambda item: float(item["acquired"]))
+    if [str(item["label"]) for item in results] != ["0", "1", "2"]:
+        raise AssertionError(f"remote safety queue was not FIFO: {results!r}")
+    if max_overlap(results) != 1:
+        raise AssertionError("single-slot remote safety queue allowed overlap")
+
+
+def test_remote_rate_limit_temporarily_serializes(root: Path) -> None:
+    runtime = root / "remote-rate-limit-runtime"
+    previous = {
+        name: os.environ.get(name)
+        for name in (
+            "ADVISOR_RUNTIME_DIR",
+            "ADVISOR_REMOTE_MAX_CONCURRENCY",
+            "ADVISOR_REMOTE_RATE_LIMIT_COOLDOWN_SECONDS",
+        )
+    }
+    os.environ.update({
+        "ADVISOR_RUNTIME_DIR": str(runtime),
+        "ADVISOR_REMOTE_MAX_CONCURRENCY": "4",
+        "ADVISOR_REMOTE_RATE_LIMIT_COOLDOWN_SECONDS": "20",
+    })
+    try:
+        if concurrency.remote_concurrency_limit(now=100.0) != (4, False):
+            raise AssertionError("clean remote admission unexpectedly started degraded")
+        concurrency.record_remote_rate_limit(retry_after=30.0, now=100.0)
+        if concurrency.remote_concurrency_limit(now=120.0) != (1, True):
+            raise AssertionError("429 did not temporarily serialize remote admission")
+        if concurrency.remote_concurrency_limit(now=131.0) != (4, False):
+            raise AssertionError("remote rate-limit cooldown did not expire")
+        concurrency.record_remote_rate_limit(retry_after=30.0)
+        held_slot = concurrency.InterProcessLock(
+            runtime / "remote-slots" / "slot-1.lock",
+            timeout=0.0,
+        )
+        if not held_slot.try_acquire():
+            raise AssertionError("could not acquire synthetic pre-degrade remote slot")
+        try:
+            try:
+                with concurrency.remote_call_slot(0.15):
+                    raise AssertionError(
+                        "degraded remote admission ignored an older call in another slot"
+                    )
+            except RuntimeError as exc:
+                if "queue timed out" not in str(exc).lower():
+                    raise
+        finally:
+            held_slot.release()
+    finally:
+        for name, value in previous.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+
+
 def test_first_turn_transition_serializes(root: Path) -> None:
     runtime = root / "first-turn-runtime"
     state_path = root / "first-turn.conversation.json"
@@ -331,31 +450,49 @@ def test_pool_helpers() -> None:
         raise AssertionError("known stream transport failure was not classified")
     if concurrency.transport_failure(RuntimeError("HTTP 422: invalid request")):
         raise AssertionError("validation failure was incorrectly classified as transport instability")
+    previous = os.environ.pop("ADVISOR_ALLOW_LEGACY_AGENT_TIMEOUT", None)
+    try:
+        if concurrency.effective_agent_timeout(900) != 0:
+            raise AssertionError("legacy 900-second agent cutoff was not neutralized")
+        if concurrency.effective_agent_timeout(120) != 120:
+            raise AssertionError("explicit non-legacy agent deadline was changed")
+        os.environ["ADVISOR_ALLOW_LEGACY_AGENT_TIMEOUT"] = "true"
+        if concurrency.effective_agent_timeout(900) != 900:
+            raise AssertionError("legacy timeout compatibility override was ignored")
+    finally:
+        if previous is None:
+            os.environ.pop("ADVISOR_ALLOW_LEGACY_AGENT_TIMEOUT", None)
+        else:
+            os.environ["ADVISOR_ALLOW_LEGACY_AGENT_TIMEOUT"] = previous
 
 
-def reserve_port_pair() -> int:
+def reserve_contiguous_ports(count: int) -> int:
     for _attempt in range(100):
-        first = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        second = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sockets = [socket.socket(socket.AF_INET, socket.SOCK_STREAM) for _ in range(count)]
         try:
-            first.bind(("127.0.0.1", 0))
-            port = int(first.getsockname()[1])
-            if port >= 65535:
+            sockets[0].bind(("127.0.0.1", 0))
+            port = int(sockets[0].getsockname()[1])
+            if port + count - 1 > 65535:
                 continue
-            second.bind(("127.0.0.1", port + 1))
+            for index, sock in enumerate(sockets[1:], start=1):
+                sock.bind(("127.0.0.1", port + index))
             return port
         except OSError:
             continue
         finally:
-            first.close()
-            second.close()
-    raise AssertionError("could not reserve a contiguous test port pair")
+            for sock in sockets:
+                sock.close()
+    raise AssertionError(f"could not reserve {count} contiguous test ports")
 
 
-def test_pool_supervisor_lifecycle(root: Path) -> None:
+def reserve_port_pair() -> int:
+    return reserve_contiguous_ports(2)
+
+
+def create_fake_g4f(root: Path) -> Path:
     fake_root = root / "fake-g4f"
     package = fake_root / "g4f"
-    package.mkdir(parents=True)
+    package.mkdir(parents=True, exist_ok=True)
     (package / "__init__.py").write_text("", encoding="utf-8")
     (package / "__main__.py").write_text(
         """import json
@@ -387,6 +524,11 @@ server.serve_forever()
 """,
         encoding="utf-8",
     )
+    return fake_root
+
+
+def test_pool_supervisor_lifecycle(root: Path) -> None:
+    fake_root = create_fake_g4f(root)
     runtime = root / "supervisor-runtime"
     env = os.environ.copy()
     env.update({"ADVISOR_RUNTIME_DIR": str(runtime), "PYTHONPATH": str(SCRIPTS)})
@@ -493,6 +635,177 @@ server.serve_forever()
         raise AssertionError("pool supervisor left a worker process running")
 
 
+def test_transient_supervisor_lifecycle(root: Path) -> None:
+    fake_root = create_fake_g4f(root)
+    runtime = root / "transient-supervisor-runtime"
+    env = os.environ.copy()
+    env.update({"ADVISOR_RUNTIME_DIR": str(runtime), "PYTHONPATH": str(SCRIPTS)})
+    base_port = reserve_contiguous_ports(4)
+    transient_base = base_port + 1
+    manager = subprocess.Popen(
+        [
+            sys.executable,
+            str(SCRIPTS / "g4f_pool.py"),
+            "serve",
+            "--python",
+            sys.executable,
+            "--g4f-dir",
+            str(fake_root),
+            "--mode",
+            "transient",
+            "--port",
+            str(base_port),
+            "--workers",
+            "1",
+            "--max-transient-workers",
+            "3",
+            "--transient-port-base",
+            str(transient_base),
+            "--startup-timeout",
+            "10",
+            "--transient-startup-timeout",
+            "10",
+            "--port-wait-seconds",
+            "0",
+        ],
+        env=env,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    manifest = runtime / "g4f-pool.json"
+    try:
+        deadline = time.monotonic() + 12
+        while not manifest.exists() and manager.poll() is None and time.monotonic() < deadline:
+            time.sleep(0.05)
+        if not manifest.exists():
+            stdout, stderr = manager.communicate(timeout=3)
+            raise AssertionError(f"transient supervisor did not become ready: {stdout!r} {stderr!r}")
+        payload = json.loads(manifest.read_text(encoding="utf-8"))
+        if payload.get("mode") != "transient":
+            raise AssertionError(f"transient supervisor wrote the wrong manifest mode: {payload!r}")
+        previous_runtime = os.environ.get("ADVISOR_RUNTIME_DIR")
+        os.environ["ADVISOR_RUNTIME_DIR"] = str(runtime)
+        try:
+            detected = concurrency.active_pool_manifest(f"http://127.0.0.1:{base_port}/v1")
+        finally:
+            if previous_runtime is None:
+                os.environ.pop("ADVISOR_RUNTIME_DIR", None)
+            else:
+                os.environ["ADVISOR_RUNTIME_DIR"] = previous_runtime
+        if detected.get("run_id") != payload.get("run_id"):
+            raise AssertionError(f"transient manifest was not discoverable by callers: {payload!r}")
+        request_dir = runtime / "transient-requests" / concurrency.key_digest(str(payload["run_id"]), 32)
+        child_environment = transient_child_env(runtime, f"http://127.0.0.1:{base_port}/v1")
+        outputs = [root / f"transient-{index}.json" for index in range(4)]
+        processes = [
+            spawn_child("worker", str(index), 0.7, outputs[index], root / "unused.json", child_environment)
+            for index in range(4)
+        ]
+
+        ready_payloads: list[dict[str, object]] = []
+        ready_deadline = time.monotonic() + 10
+        while time.monotonic() < ready_deadline:
+            ready_payloads = [
+                concurrency.load_json(path)
+                for path in request_dir.glob("*.json")
+                if concurrency.load_json(path).get("status") == "ready"
+            ]
+            if len(ready_payloads) == 3:
+                break
+            time.sleep(0.05)
+        if len(ready_payloads) != 3:
+            all_payloads = [concurrency.load_json(path) for path in request_dir.glob("*.json")]
+            completed_results = [
+                json.loads(path.read_text(encoding="utf-8")) for path in outputs if path.exists()
+            ]
+            child_failures = []
+            for process in processes:
+                if process.poll() is not None:
+                    child_failures.append((process.returncode, process.stderr.read() if process.stderr else ""))
+            raise AssertionError(
+                "transient supervisor did not start three isolated workers: "
+                f"ready={ready_payloads!r} requests={all_payloads!r} "
+                f"results={completed_results!r} children={child_failures!r} manager_status={manager.poll()!r}"
+            )
+        if len({int(item.get("worker_pid") or 0) for item in ready_payloads}) != 3:
+            raise AssertionError("transient calls did not receive distinct worker processes")
+
+        wait_children(processes)
+        results = read_results(outputs)
+        if max_overlap(results) != 3:
+            raise AssertionError(f"transient emergency ceiling did not cap four calls at three: {results!r}")
+        if not all(bool(item.get("transient")) for item in results):
+            raise AssertionError("managed calls did not use transient leases")
+        if len({str(item.get("worker_url")) for item in results}) < 3:
+            raise AssertionError("transient leases did not use the configured isolated ports")
+
+        cleanup_deadline = time.monotonic() + 8
+        while list(request_dir.glob("*.json")) and time.monotonic() < cleanup_deadline:
+            time.sleep(0.05)
+        if list(request_dir.glob("*.json")):
+            raise AssertionError("completed transient calls left worker request records behind")
+        if not all(g4f_pool.port_bindable(port) for port in range(transient_base, transient_base + 3)):
+            raise AssertionError("completed transient calls left worker ports open")
+
+        orphan_output = root / "transient-orphan.json"
+        orphan = spawn_child(
+            "worker",
+            "orphan",
+            30.0,
+            orphan_output,
+            root / "unused.json",
+            child_environment,
+        )
+        orphan_deadline = time.monotonic() + 10
+        while time.monotonic() < orphan_deadline:
+            if any(concurrency.load_json(path).get("status") == "ready" for path in request_dir.glob("*.json")):
+                break
+            time.sleep(0.05)
+        else:
+            orphan.kill()
+            orphan.communicate(timeout=3)
+            raise AssertionError("orphan test worker never became ready")
+        orphan.kill()
+        orphan.communicate(timeout=3)
+        reap_deadline = time.monotonic() + 8
+        while list(request_dir.glob("*.json")) and time.monotonic() < reap_deadline:
+            time.sleep(0.05)
+        if list(request_dir.glob("*.json")):
+            raise AssertionError("supervisor did not reap a transient worker after its owner died")
+        if not all(g4f_pool.port_bindable(port) for port in range(transient_base, transient_base + 3)):
+            raise AssertionError("orphaned transient worker retained its port")
+
+        status = subprocess.run(
+            [sys.executable, str(SCRIPTS / "g4f_pool.py"), "status"],
+            env=env,
+            text=True,
+            capture_output=True,
+            timeout=5,
+            check=False,
+        )
+        if status.returncode != 0 or "active_transient_workers: 0" not in status.stdout:
+            raise AssertionError(f"transient pool status was incorrect: {status.stdout!r} {status.stderr!r}")
+        stopped = subprocess.run(
+            [sys.executable, str(SCRIPTS / "g4f_pool.py"), "stop", "--timeout", "10"],
+            env=env,
+            text=True,
+            capture_output=True,
+            timeout=12,
+            check=False,
+        )
+        if stopped.returncode != 0:
+            raise AssertionError(f"transient supervisor stop failed: {stopped.stdout!r} {stopped.stderr!r}")
+    finally:
+        if manager.poll() is None:
+            manager.terminate()
+        stdout, stderr = manager.communicate(timeout=15)
+        if manager.returncode != 0:
+            raise AssertionError(f"transient supervisor shutdown failed: {stdout!r} {stderr!r}")
+    if not all(g4f_pool.port_bindable(port) for port in range(base_port, base_port + 4)):
+        raise AssertionError("transient supervisor shutdown left a process running")
+
+
 class FakeLease:
     def __init__(self, url: str) -> None:
         self.url = url
@@ -584,11 +897,15 @@ def main() -> int:
         test_fifo_single_worker(root)
         test_same_conversation_serializes(root)
         test_same_conversation_across_state_files_serializes(root)
+        test_remote_admission_capacity(root)
+        test_remote_admission_fifo(root)
+        test_remote_rate_limit_temporarily_serializes(root)
         test_first_turn_transition_serializes(root)
         test_stale_and_timed_out_queue_tickets_are_removed(root)
         test_pool_degrades_after_cross_worker_failures(root)
         test_pool_helpers()
         test_pool_supervisor_lifecycle(root)
+        test_transient_supervisor_lifecycle(root)
         test_advisor_main_coordination(root)
     print("Advisor concurrency tests passed.")
     return 0

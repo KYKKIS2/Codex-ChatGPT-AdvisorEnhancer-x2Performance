@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import random
 import re
 import sys
 import time
@@ -109,6 +110,22 @@ COMPATIBLE_MODEL_FALLBACKS = (
 )
 
 
+class RateLimitError(RuntimeError):
+    def __init__(self, message: str, retry_after: float | None = None) -> None:
+        super().__init__(message)
+        self.retry_after = retry_after
+
+
+def retry_after_seconds(headers: Any) -> float | None:
+    value = headers.get("Retry-After") if headers is not None else None
+    if value is None:
+        return None
+    try:
+        return max(0.0, float(str(value).strip()))
+    except ValueError:
+        return None
+
+
 def system_prompt() -> str:
     return os.environ.get("ADVISOR_SYSTEM_PROMPT", SYSTEM_PROMPT)
 
@@ -202,11 +219,16 @@ def post_json(url: str, payload: dict[str, Any], headers: dict[str, str], timeou
     data = json.dumps(payload).encode("utf-8")
     request = urllib.request.Request(url, data=data, headers=headers, method="POST")
     try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:
+        with urllib.request.urlopen(request, timeout=None if timeout <= 0 else timeout) as response:
             body = response.read().decode("utf-8")
     except urllib.error.HTTPError as exc:
         detail = exc.read().decode("utf-8", errors="replace")
         detail = redact_sensitive(detail)
+        if exc.code == 429:
+            raise RateLimitError(
+                "HTTP 429 rate limit from the remote service: " + safety.truncate(detail, 500),
+                retry_after_seconds(exc.headers),
+            ) from exc
         raise RuntimeError(f"HTTP {exc.code} from {url}: {detail}") from exc
     except urllib.error.URLError as exc:
         raise RuntimeError(f"Could not reach {url}: {exc.reason}") from exc
@@ -221,11 +243,18 @@ def post_json(url: str, payload: dict[str, Any], headers: dict[str, str], timeou
 def get_json(url: str, headers: dict[str, str], timeout: int) -> dict[str, Any]:
     request = urllib.request.Request(url, headers=headers, method="GET")
     try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:
+        # Unlimited advisor completion waits must not turn small metadata reads
+        # into unbounded network hangs.
+        with urllib.request.urlopen(request, timeout=60 if timeout <= 0 else timeout) as response:
             body = response.read().decode("utf-8")
     except urllib.error.HTTPError as exc:
         detail = exc.read().decode("utf-8", errors="replace")
         detail = redact_sensitive(detail)
+        if exc.code == 429:
+            raise RateLimitError(
+                "HTTP 429 rate limit from the remote service: " + safety.truncate(detail, 500),
+                retry_after_seconds(exc.headers),
+            ) from exc
         raise RuntimeError(f"HTTP {exc.code} from {url}: {detail}") from exc
     except urllib.error.URLError as exc:
         raise RuntimeError(f"Could not reach {url}: {exc.reason}") from exc
@@ -237,8 +266,56 @@ def get_json(url: str, headers: dict[str, str], timeout: int) -> dict[str, Any]:
         raise RuntimeError(f"Non-JSON response from {url}: {preview}") from exc
 
 
+def rate_limit_backoff_seconds(attempt: int, retry_after: float | None) -> float:
+    initial = float_env("ADVISOR_RATE_LIMIT_BACKOFF_INITIAL_SECONDS", 5.0, minimum=0.1)
+    maximum = float_env("ADVISOR_RATE_LIMIT_BACKOFF_MAX_SECONDS", 60.0, minimum=initial)
+    jitter_fraction = float_env("ADVISOR_RATE_LIMIT_BACKOFF_JITTER", 0.25, minimum=0.0)
+    exponential = min(maximum, initial * (2 ** min(max(0, attempt - 1), 20)))
+    jitter = random.uniform(0.0, exponential * jitter_fraction)
+    return max(retry_after or 0.0, min(maximum, exponential + jitter))
+
+
+def get_remote_json_with_backoff(
+    url: str,
+    headers: dict[str, str],
+    timeout: int,
+    *,
+    operation: str,
+) -> dict[str, Any]:
+    deadline = None if timeout <= 0 else time.monotonic() + timeout
+    max_retries = int_env("ADVISOR_RATE_LIMIT_MAX_RETRIES", 0, minimum=0)
+    attempt = 0
+    while True:
+        if deadline is None:
+            request_timeout = 60
+        else:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise RateLimitError(f"Rate-limit recovery expired while waiting for {operation}.")
+            request_timeout = max(1, min(60, int(remaining)))
+        try:
+            return get_json(url, headers, request_timeout)
+        except RateLimitError as exc:
+            attempt += 1
+            concurrency.record_remote_rate_limit(exc.retry_after)
+            if max_retries > 0 and attempt > max_retries:
+                raise
+            delay = rate_limit_backoff_seconds(attempt, exc.retry_after)
+            if deadline is not None:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise
+                delay = min(delay, remaining)
+            print(
+                f"Advisor remote rate limit during {operation}; retrying after {delay:.1f}s "
+                f"(attempt {attempt}).",
+                file=sys.stderr,
+            )
+            time.sleep(delay)
+
+
 def compatible_model_ids(base_url: str, headers: dict[str, str], timeout: int) -> set[str]:
-    payload = get_json(f"{base_url}/models", headers, min(timeout, 5))
+    payload = get_json(f"{base_url}/models", headers, 5 if timeout <= 0 else min(timeout, 5))
     models = payload.get("data")
     if not isinstance(models, list):
         return set()
@@ -293,6 +370,8 @@ def resolve_compatible_model(model: str, base_url: str, headers: dict[str, str],
         else:
             models = compatible_model_ids(base_url, headers, timeout)
             model_source = f"{base_url}/models"
+    except RateLimitError:
+        raise
     except RuntimeError as exc:
         print(f"Advisor model validation skipped: {exc}", file=sys.stderr)
         return model
@@ -984,6 +1063,32 @@ def transcript_contains_prompt(messages: list[Any], prompt: str) -> bool:
     )
 
 
+def conversation_has_unfinished_activity_for_prompt(
+    conversation_data: dict[str, Any],
+    prompt: str,
+) -> bool:
+    messages = transcript_from_conversation(conversation_data)
+    normalized_prompt = prompt.strip()
+    last_user_index = -1
+    for index, item in enumerate(messages):
+        if (
+            isinstance(item, dict)
+            and item.get("role") == "user"
+            and str(item.get("content") or "").strip() == normalized_prompt
+        ):
+            last_user_index = index
+    if last_user_index < 0:
+        return False
+    for item in messages[last_user_index + 1:]:
+        if not isinstance(item, dict):
+            continue
+        if item.get("role") == "user":
+            break
+        if item.get("role") == "assistant" and not assistant_item_has_final_content(item):
+            return True
+    return False
+
+
 def latest_transcript_assistant_text_for_prompt(state_path: Path, prompt: str) -> str:
     path = transcript_json_path(state_path)
     if not path.exists():
@@ -1391,7 +1496,14 @@ def sync_remote_conversation(
         return conversation
     url = f"https://chatgpt.com/backend-api/conversation/{conversation_id}"
     try:
-        conversation_data = get_json(url, auth["headers"], timeout)
+        conversation_data = get_remote_json_with_backoff(
+            url,
+            auth["headers"],
+            timeout,
+            operation="conversation sync",
+        )
+    except RateLimitError:
+        raise
     except RuntimeError as exc:
         if os.environ.get("ADVISOR_SYNC_STRICT", "false").lower() in ("1", "true", "yes"):
             raise
@@ -1435,7 +1547,14 @@ def remote_conversation_stream_status(
 ) -> str | None:
     url = f"https://chatgpt.com/backend-api/conversation/{conversation_id}/stream_status"
     try:
-        payload = get_json(url, auth["headers"], timeout)
+        payload = get_remote_json_with_backoff(
+            url,
+            auth["headers"],
+            timeout,
+            operation="conversation status",
+        )
+    except RateLimitError:
+        raise
     except RuntimeError:
         return None
     status = payload.get("status") if isinstance(payload, dict) else None
@@ -1464,19 +1583,38 @@ def fetch_remote_final_text(
     if not auth:
         print("Advisor final fetch skipped: ChatGPT HAR/auth is unavailable.", file=sys.stderr)
         return ""
-    max_polls = int_env("ADVISOR_FINAL_FETCH_MAX_POLLS", 6, minimum=1)
-    fallback_timeout = int_env("ADVISOR_FINAL_FETCH_TIMEOUT", max(timeout, 1), minimum=1)
-    poll_seconds = float_env("ADVISOR_FINAL_FETCH_POLL_SECONDS", 5.0, minimum=0.5)
-    deadline = time.monotonic() + fallback_timeout
+    configured_fetch_timeout = os.environ.get("ADVISOR_FINAL_FETCH_TIMEOUT")
+    fallback_timeout = (
+        int_env("ADVISOR_FINAL_FETCH_TIMEOUT", 0, minimum=0)
+        if configured_fetch_timeout is not None
+        else max(timeout, 0)
+    )
+    deadline = None if fallback_timeout <= 0 else time.monotonic() + fallback_timeout
+    max_polls = int_env(
+        "ADVISOR_FINAL_FETCH_MAX_POLLS",
+        12,
+        minimum=0,
+    )
+    poll_seconds = float_env("ADVISOR_FINAL_FETCH_POLL_SECONDS", 10.0, minimum=0.5)
     url = f"https://chatgpt.com/backend-api/conversation/{conversation_id}"
     last_data: dict[str, Any] | None = None
     non_streaming_polls = 0
     waiting_for_stream = False
-    while time.monotonic() < deadline:
-        remaining_before = max(1, int(deadline - time.monotonic()))
-        request_timeout = max(1, min(timeout, remaining_before))
+    while deadline is None or time.monotonic() < deadline:
+        if deadline is None:
+            request_timeout = 60
+        else:
+            remaining_before = max(1, int(deadline - time.monotonic()))
+            request_timeout = max(1, min(timeout if timeout > 0 else 60, remaining_before))
         try:
-            conversation_data = get_json(url, auth["headers"], request_timeout)
+            conversation_data = get_remote_json_with_backoff(
+                url,
+                auth["headers"],
+                0 if deadline is None else remaining_before,
+                operation="final response fetch",
+            )
+        except RateLimitError:
+            raise
         except RuntimeError as exc:
             if os.environ.get("ADVISOR_SYNC_STRICT", "false").lower() in ("1", "true", "yes"):
                 raise
@@ -1499,8 +1637,15 @@ def fetch_remote_final_text(
                 payload["chatgpt_project_id"] = project_id
             safety.atomic_write_json(state_path, payload)
             return text
-        status = remote_conversation_stream_status(conversation_id, auth, request_timeout)
-        if remote_conversation_is_streaming(status):
+        has_unfinished_activity = conversation_has_unfinished_activity_for_prompt(
+            conversation_data,
+            prompt,
+        )
+        status = None
+        if not has_unfinished_activity:
+            status = remote_conversation_stream_status(conversation_id, auth, request_timeout)
+        active_turn = has_unfinished_activity or remote_conversation_is_streaming(status)
+        if active_turn:
             if not waiting_for_stream:
                 print(
                     "Advisor remote ChatGPT agent turn is still running; "
@@ -1511,7 +1656,9 @@ def fetch_remote_final_text(
             non_streaming_polls = 0
         else:
             non_streaming_polls += 1
-        if non_streaming_polls >= max_polls or time.monotonic() >= deadline:
+        polls_exhausted = max_polls > 0 and non_streaming_polls >= max_polls
+        deadline_expired = deadline is not None and time.monotonic() >= deadline
+        if polls_exhausted or deadline_expired:
             if last_data is not None:
                 transcript = transcript_from_conversation(last_data)
                 if transcript and transcript_contains_prompt(transcript, prompt):
@@ -1522,10 +1669,13 @@ def fetch_remote_final_text(
                         file=sys.stderr,
                     )
             return ""
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            return ""
-        time.sleep(min(poll_seconds, remaining))
+        if deadline is None:
+            time.sleep(poll_seconds)
+        else:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return ""
+            time.sleep(min(poll_seconds, remaining))
     return ""
 
 
@@ -1654,23 +1804,51 @@ def call_compatible(
             f"project_id={project_id or 'none'} state_path={state_path or 'none'}",
             file=sys.stderr,
         )
+    transport_recovered_text = ""
     try:
         response = post_json(f"{base_url}/chat/completions", payload, headers, timeout)
     except RuntimeError as exc:
+        if concurrency.rate_limit_failure(exc):
+            concurrency.record_remote_rate_limit(
+                exc.retry_after if isinstance(exc, RateLimitError) else None
+            )
         if persist and conversation and stale_conversation_error(exc):
             if state_path is not None:
                 remove_state_files(state_path)
             payload.pop("conversation", None)
             response = post_json(f"{base_url}/chat/completions", payload, headers, timeout)
+        elif (
+            persist
+            and sync_remote
+            and not temporary
+            and state_path is not None
+            and conversation
+            and concurrency.transport_failure(exc)
+        ):
+            transport_recovered_text = fetch_remote_final_text(
+                state_path,
+                conversation,
+                prompt,
+                timeout,
+                project_id,
+            )
+            if not transport_recovered_text:
+                raise
+            print(
+                "Advisor recovered the completed remote turn after the local g4f stream failed.",
+                file=sys.stderr,
+            )
+            response = {}
         else:
             raise
-    synced_text = ""
+    synced_text = transport_recovered_text
     if persist and state_path is not None:
-        save_conversation(state_path, response, project_id)
+        if response:
+            save_conversation(state_path, response, project_id)
         if sync_remote and not temporary:
             sync_remote_conversation(state_path, load_conversation(state_path), timeout, project_id, expected_prompt=prompt)
-            synced_text = latest_transcript_assistant_text_for_prompt(state_path, prompt)
-    text = extract_chat_text(response)
+            synced_text = latest_transcript_assistant_text_for_prompt(state_path, prompt) or synced_text
+    text = transport_recovered_text or extract_chat_text(response)
     if (
         persist
         and sync_remote
@@ -1690,7 +1868,7 @@ def call_compatible(
         if not recovered_text:
             raise RuntimeError(
                 "ChatGPT's repo-aware agent turn produced intermediate activity but did not reach "
-                "a final end-of-turn response before the bounded wait expired. "
+                "a final end-of-turn response before the configured wait expired. "
                 + recovery_debug_context(state_path)
             )
         print(
@@ -1740,7 +1918,7 @@ def call_compatible(
             recovered_text = fetch_remote_final_text(state_path, load_conversation(state_path), prompt, timeout, project_id)
             if recovered_text:
                 print(
-                    "Advisor response recovered from bounded final transcript fetch: "
+                    "Advisor response recovered from final transcript fetch: "
                     f"local_bytes={utf8_len(text)} recovered_bytes={utf8_len(recovered_text)}",
                     file=sys.stderr,
                 )
@@ -1822,6 +2000,9 @@ def write_guidance_outputs(args: argparse.Namespace, guidance: str) -> list[Path
 def main() -> int:
     configure_stdio()
     args = parse_args()
+    if args.timeout < 0:
+        print("--timeout cannot be negative; use 0 to wait without a completion deadline.", file=sys.stderr)
+        return 2
     if args.thinking_effort is not None:
         os.environ["ADVISOR_THINKING_EFFORT"] = args.thinking_effort
     if args.allow_outside_project:

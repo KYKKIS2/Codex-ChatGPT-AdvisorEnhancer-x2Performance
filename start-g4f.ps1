@@ -47,13 +47,15 @@ if (-not (Test-Path $Pool)) {
     throw "g4f worker-pool supervisor was not found: $Pool"
 }
 
-$Workers = if ($env:G4F_WORKERS) { [int]$env:G4F_WORKERS } else { 2 }
+$Mode = if ($env:G4F_WORKER_MODE) { $env:G4F_WORKER_MODE } else { "transient" }
+$Workers = if ($env:G4F_WORKERS) { [int]$env:G4F_WORKERS } else { 1 }
 $poolArgs = @(
     $Pool,
     "serve",
     "--python", $Py,
     "--g4f-dir", $G4f,
     "--port", $Port,
+    "--mode", $Mode,
     "--workers", $Workers,
     "--model", $Model,
     "--provider", $Provider

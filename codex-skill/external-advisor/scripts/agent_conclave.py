@@ -16,12 +16,14 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+import advisor_concurrency as concurrency
 import advisor_safety as safety
 import conclave
 
 
-DEFAULT_MAX_WORKERS = 2
-DEFAULT_QUEUE_TIMEOUT = 3600.0
+DEFAULT_MAX_WORKERS = 5
+DEFAULT_QUEUE_TIMEOUT = 0.0
+DEFAULT_TIMEOUT = 0
 
 
 @dataclass
@@ -48,6 +50,12 @@ def configure_stdio() -> None:
     for stream in (sys.stdout, sys.stderr):
         if hasattr(stream, "reconfigure"):
             stream.reconfigure(encoding="utf-8", errors="replace")
+
+
+def combined_subprocess_timeout(request_timeout: float, queue_timeout: float, cushion: float) -> float | None:
+    if request_timeout <= 0 or queue_timeout <= 0:
+        return None
+    return request_timeout + queue_timeout + cushion
 
 
 def utc_now() -> str:
@@ -146,7 +154,7 @@ def run_role(args: argparse.Namespace, role: str, task: str) -> AgentRoleResult:
             errors="replace",
             stdout=subprocess.PIPE,
             stderr=None,
-            timeout=args.queue_timeout + args.timeout + 60,
+            timeout=combined_subprocess_timeout(args.timeout, args.queue_timeout, 60),
         )
     except subprocess.TimeoutExpired:
         return AgentRoleResult(role, False, "", time.monotonic() - started, {}, "role timed out")
@@ -243,7 +251,7 @@ def run_synthesis(
             errors="replace",
             stdout=subprocess.PIPE,
             stderr=None,
-            timeout=args.queue_timeout + args.timeout + 30,
+            timeout=combined_subprocess_timeout(args.timeout, args.queue_timeout, 30),
         )
     except subprocess.TimeoutExpired:
         return False, "", "synthesizer timed out"
@@ -331,12 +339,17 @@ def parse_args() -> argparse.Namespace:
             or os.environ.get("ADVISOR_INTELLIGENCE")
         ),
     )
-    parser.add_argument("--timeout", type=int, default=int(os.environ.get("ADVISOR_AGENT_TIMEOUT", "900")))
+    parser.add_argument(
+        "--timeout",
+        type=int,
+        default=int(os.environ.get("ADVISOR_AGENT_TIMEOUT", str(DEFAULT_TIMEOUT))),
+        help="Maximum completion wait per role; 0 waits until ChatGPT finishes.",
+    )
     parser.add_argument(
         "--queue-timeout",
         type=float,
         default=float(os.environ.get("ADVISOR_QUEUE_TIMEOUT", str(DEFAULT_QUEUE_TIMEOUT))),
-        help="Maximum seconds each role or synthesis may wait for the shared advisor pool.",
+        help="Maximum seconds each role or synthesis may wait for coordination; 0 waits until available.",
     )
     parser.add_argument("--max-output-tokens", type=int, default=int(os.environ.get("ADVISOR_MAX_OUTPUT_TOKENS", "1600")))
     parser.add_argument("--max-workers", type=int, default=DEFAULT_MAX_WORKERS)
@@ -378,12 +391,21 @@ def main() -> int:
     if args.max_workers < 1:
         print("--max-workers must be at least 1.", file=sys.stderr)
         return 2
-    if args.timeout < 1:
-        print("--timeout must be at least 1 second.", file=sys.stderr)
+    if args.timeout < 0:
+        print("--timeout cannot be negative; use 0 to wait until each remote turn finishes.", file=sys.stderr)
         return 2
     if args.queue_timeout < 0:
         print("--queue-timeout cannot be negative.", file=sys.stderr)
         return 2
+    effective_timeout = concurrency.effective_agent_timeout(args.timeout)
+    if effective_timeout != args.timeout:
+        print(
+            "Advisor ignored the legacy 900-second agent cutoff and will wait for each final "
+            "ChatGPT turn. Set ADVISOR_ALLOW_LEGACY_AGENT_TIMEOUT=true only for a deliberate "
+            "bounded diagnostic.",
+            file=sys.stderr,
+        )
+        args.timeout = effective_timeout
     if args.allow_shell:
         print(
             "--allow-shell is disabled: the repo-aware advisor connector is mechanically read-only.",

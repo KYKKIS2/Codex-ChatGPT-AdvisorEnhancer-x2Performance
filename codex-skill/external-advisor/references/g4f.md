@@ -15,9 +15,9 @@ The HAR file must be placed in:
 vendor\gpt4free\har_and_cookies
 ```
 
-The starter supervises two isolated workers by default on `8080` and `8081`. `advisor.py` discovers them through the private machine-wide manifest, serializes calls to the same saved ChatGPT conversation, and leases different workers to independent conversations. Keep callers pointed at the base URL rather than selecting `8081` directly. Use `G4F_WORKERS=1` only for a bounded diagnostic.
+The starter keeps one control endpoint on `8080` and defaults to transient mode. `advisor.py` discovers the private machine-wide manifest and serializes calls to the same saved ChatGPT conversation. A separate FIFO admits at most two remote ChatGPT turns by default (`ADVISOR_REMOTE_MAX_CONCURRENCY=2`) and staggers starts by two seconds. Each admitted call receives one isolated g4f process, which is terminated after the call; dead caller processes are reaped automatically. HTTP 429 causes header-aware jittered backoff and temporarily reduces remote admission to one. Keep callers pointed at the base URL rather than selecting transient ports directly. `G4F_MAX_TRANSIENT_WORKERS` defaults to `32` but is only an emergency local process ceiling. Use `G4F_WORKER_MODE=fixed G4F_WORKERS=2` only for compatibility diagnostics.
 
-Inspect or stop the pool with `python3 ~/.codex/skills/external-advisor/scripts/g4f_pool.py status` and `python3 ~/.codex/skills/external-advisor/scripts/g4f_pool.py stop`.
+Inspect or stop the supervisor with `python3 ~/.codex/skills/external-advisor/scripts/g4f_pool.py status` and `python3 ~/.codex/skills/external-advisor/scripts/g4f_pool.py stop`.
 
 Recommended local settings:
 
@@ -39,5 +39,6 @@ Boundary:
 - Do not commit or print HAR/cookie contents.
 - Do not rely on `OPENAI_API_KEY` for local compatible mode; set `ADVISOR_API_KEY` only if the compatible endpoint requires a token.
 - Do not assume local `g4f` behavior exactly matches official OpenAI API behavior.
-- Do not post directly to `/v1/chat/completions`; that bypasses cross-session worker leasing and conversation locks.
+- Do not post directly to `/v1/chat/completions`; that bypasses transient-worker cleanup and conversation locks.
+- Do not raise remote concurrency to chase throughput. The ChatGPT web backend does not publish the same limit headers or account-tier table as the official API, so use the wrapper's conservative FIFO and backoff defaults.
 - Treat external output as advisory critique and verify important claims.

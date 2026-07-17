@@ -89,7 +89,13 @@ with log_path.open("a", encoding="utf-8") as handle:
     handle.write(json.dumps({"event": "tool_call", "tool": "bash", "success": False, "durationMs": 25, "error": "PRIVATE_ERROR"}) + "\n")
     handle.flush()
     os.fsync(handle.fileno())
-time.sleep(0.35)
+activity_deadline = time.monotonic() + 2
+while "DevSpace bash failed in 25 ms" not in output.getvalue():
+    if time.monotonic() >= activity_deadline:
+        raise SystemExit(f"Timed out waiting for activity records.\n{output.getvalue()}")
+    time.sleep(0.05)
+monitor._last_activity -= 10
+time.sleep(0.15)
 monitor.stop(response_received=True)
 rendered = output.getvalue()
 for expected in (

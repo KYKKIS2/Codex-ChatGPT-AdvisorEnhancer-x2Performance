@@ -6,7 +6,7 @@ This repository bundles Codex skills under `codex-skill/`. The setup scripts ins
 
 Use bundled skills when the user request matches their domain. Prefer the most specific skill first, and combine skills when a web task crosses design, implementation, database, security, and deployment.
 
-- Use `external-advisor` for architecture, strategy, planning, tradeoff analysis, critique, verification, and important judgment-heavy decisions. Prefer `router.py --execute`; when the registered DevSpace connector is ready it runs a repo-aware single agent or agent conclave, otherwise it falls back to prompt-only advisor paths.
+- Use `external-advisor` for architecture, strategy, planning, tradeoff analysis, critique, verification, and important judgment-heavy decisions. Prefer `router.py --execute`; it uses a repo-aware single agent or agent conclave only after the current DevSpace URL has completed a verified ChatGPT MCP turn. A locally healthy but not-yet-added connector stays on prompt-only advisor paths.
 - Use `prepare-goal` when the user wants durable planning files or a ready `/goal` prompt before long autonomous work.
 - Use `frontend-design` for distinctive, production-grade visual UI, page design, layout direction, polished HTML/CSS/React interfaces, and avoiding generic AI-looking web output.
 - Use `web-design-guidelines` when reviewing UI/UX/accessibility or auditing a site against web interface best practices.
@@ -22,7 +22,8 @@ Use bundled skills when the user request matches their domain. Prefer the most s
 ## Advisor Repository Maintenance
 
 - Keep advisor implementation changes under `codex-skill/external-advisor/`, runtime patches under `patches/`, and executable regression entrypoints under `tests/`.
-- Use the skill wrappers and the managed worker pool for live checks. Do not post directly to a worker port or bypass conversation serialization.
+- Use the skill wrappers and managed g4f supervisor for live checks. The default transient mode creates one isolated worker per admitted call, closes it afterward, and serializes turns to the same conversation. A separate machine-wide FIFO admits at most two remote ChatGPT turns by default, staggers starts, backs off on HTTP 429, and temporarily degrades to one turn after throttling. Do not post directly to a control or transient worker port.
+- Repo-aware calls use `--timeout 0 --queue-timeout 0` by default so long MCP/Pro turns return when finished instead of failing at 900 seconds. Keep explicit positive deadlines only for deliberate bounded diagnostics.
 - Repo-aware reviews must remain mechanically read-only and operate on generated sanitized workspaces. Do not weaken denied-path, workspace-identity, current-turn evidence, redaction, or mutation checks to make a failing test pass.
 - Treat `.codex-advisor/`, HAR files, cookies, auth state, local connector state, worker manifests, generated workspaces, logs, and environment files as private local runtime data. Keep them ignored and uncommitted.
 - Before a release, inspect the exact staged diff, probe ignore rules, and scan the staged export for secrets. Test fixtures may use explicit fake values, but real credentials or captured session material must never enter Git.

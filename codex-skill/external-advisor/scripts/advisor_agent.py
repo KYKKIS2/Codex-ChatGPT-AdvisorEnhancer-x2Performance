@@ -19,6 +19,7 @@ from typing import Any
 
 import activity_monitor
 import advisor_agent_connect
+import advisor_concurrency as concurrency
 import advisor_safety as safety
 import agent_mode
 
@@ -28,8 +29,8 @@ SHELL_TOOLS = {"bash", "exec_command", "write_stdin"}
 MUTATION_TOOLS = {"write", "edit", "apply_patch", "show_changes"}
 SAFE_TOOL_NAMES = {"open_workspace", *INSPECTION_TOOLS, *SHELL_TOOLS, *MUTATION_TOOLS}
 DEFAULT_MODEL = "gpt-5-6-thinking"
-DEFAULT_TIMEOUT = 900
-DEFAULT_QUEUE_TIMEOUT = 3600.0
+DEFAULT_TIMEOUT = 0
+DEFAULT_QUEUE_TIMEOUT = 0.0
 
 
 @dataclass
@@ -70,6 +71,12 @@ def configure_stdio() -> None:
             stream.reconfigure(encoding="utf-8", errors="replace")
 
 
+def combined_subprocess_timeout(request_timeout: float, queue_timeout: float, cushion: float) -> float | None:
+    if request_timeout <= 0 or queue_timeout <= 0:
+        return None
+    return request_timeout + queue_timeout + cushion
+
+
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -95,6 +102,48 @@ def private_run_dir(project: Path, role: str) -> Path:
 def connector_status(project: Path) -> dict[str, Any]:
     root = advisor_agent_connect.runtime_root()
     return advisor_agent_connect.connector_runtime_status(project, root=root)
+
+
+def mark_chatgpt_attachment_verified(project: Path, expected_state: dict[str, Any]) -> bool:
+    """Mark only the unchanged live connector that produced verified MCP evidence."""
+    root = advisor_agent_connect.runtime_root()
+    paths = advisor_agent_connect.state_paths(project, root)
+    stable_fields = (
+        "started_utc",
+        "devspace_pid",
+        "devspace_process_identity",
+        "tunnel_pid",
+        "tunnel_process_identity",
+        "mcp_url",
+        "agent_workspace",
+        "allowed_root",
+    )
+    with concurrency.InterProcessLock(paths["lock"], timeout=30.0):
+        current = advisor_agent_connect.read_state(paths["state"])
+        if not current or any(current.get(key) != expected_state.get(key) for key in stable_fields):
+            return False
+        skip_public_probe = os.environ.get("ADVISOR_AGENT_SKIP_PUBLIC_PROBE", "").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+        runtime = advisor_agent_connect.connector_runtime_status(
+            project,
+            root=root,
+            skip_public_probe=skip_public_probe,
+        )
+        if not runtime.get("connector_ready"):
+            return False
+        current.update(
+            {
+                "chatgpt_attachment_verified": True,
+                "chatgpt_attachment_verified_utc": utc_now(),
+                "agent_mode_ready": True,
+            }
+        )
+        safety.atomic_write_json(paths["state"], current)
+    return True
 
 
 def refresh_agent_workspace(project: Path) -> tuple[Path, dict[str, Any]]:
@@ -321,7 +370,7 @@ def remote_conversation_data(state_path: Path, timeout: int) -> tuple[dict[str, 
         data = advisor.get_json(
             f"https://chatgpt.com/backend-api/conversation/{conversation_id}",
             auth["headers"],
-            min(max(timeout, 1), 60),
+            60 if timeout <= 0 else min(timeout, 60),
         )
     except RuntimeError as exc:
         return {}, "could not verify per-conversation MCP activity: " + safety.redact_sensitive_text(str(exc))
@@ -733,7 +782,7 @@ def parse_args() -> argparse.Namespace:
         "--queue-timeout",
         type=float,
         default=float(os.environ.get("ADVISOR_QUEUE_TIMEOUT", str(DEFAULT_QUEUE_TIMEOUT))),
-        help="Maximum seconds to wait for the shared advisor worker/conversation locks.",
+        help="Maximum seconds to wait for worker/conversation locks; 0 waits until available.",
     )
     parser.add_argument("--max-output-tokens", type=int, default=int(os.environ.get("ADVISOR_MAX_OUTPUT_TOKENS", "1600")))
     parser.add_argument("--conversation-key", help="Reuse one saved repo-aware advisor conversation.")
@@ -767,12 +816,21 @@ def main() -> int:
     if args.min_inspection_calls < 0:
         print("--min-inspection-calls cannot be negative.", file=sys.stderr)
         return 2
-    if args.timeout < 1:
-        print("--timeout must be at least 1 second.", file=sys.stderr)
+    if args.timeout < 0:
+        print("--timeout cannot be negative; use 0 to wait until the remote turn finishes.", file=sys.stderr)
         return 2
     if args.queue_timeout < 0:
         print("--queue-timeout cannot be negative.", file=sys.stderr)
         return 2
+    effective_timeout = concurrency.effective_agent_timeout(args.timeout)
+    if effective_timeout != args.timeout:
+        print(
+            "Advisor ignored the legacy 900-second agent cutoff and will wait for the final "
+            "ChatGPT turn. Set ADVISOR_ALLOW_LEGACY_AGENT_TIMEOUT=true only for a deliberate "
+            "bounded diagnostic.",
+            file=sys.stderr,
+        )
+        args.timeout = effective_timeout
     if args.allow_shell:
         print(
             "--allow-shell is disabled: the repo-aware advisor connector is mechanically read-only.",
@@ -870,12 +928,12 @@ def main() -> int:
                 errors="replace",
                 stdout=subprocess.PIPE,
                 stderr=None,
-                timeout=args.queue_timeout + args.timeout + 30,
+                timeout=combined_subprocess_timeout(args.timeout, args.queue_timeout, 30),
             )
             returncode = completed.returncode
             output = completed.stdout.strip()
         except subprocess.TimeoutExpired:
-            errors.append(f"repo-aware advisor exceeded the {args.timeout}-second timeout")
+            errors.append(f"repo-aware advisor exceeded the configured {args.timeout}-second timeout")
         except OSError as exc:
             errors.append(f"could not launch advisor.py: {exc}")
 
@@ -922,6 +980,22 @@ def main() -> int:
         local_evidence = summarize_tool_evidence([], allow_shell=args.allow_shell)
         remote_evidence_error = ""
 
+    attachment_marked = False
+    attachment_mark_error = ""
+    strict_attachment_evidence = not args.no_require_tool_activity and args.min_inspection_calls >= 1
+    if not errors and strict_attachment_evidence:
+        try:
+            attachment_marked = mark_chatgpt_attachment_verified(project, state)
+        except (OSError, RuntimeError) as exc:
+            attachment_mark_error = safety.truncate(
+                safety.redact_sensitive_text(str(exc)),
+                300,
+            )
+        if not attachment_marked and not attachment_mark_error:
+            attachment_mark_error = "connector changed or stopped before attachment verification was recorded"
+    elif not errors:
+        attachment_mark_error = "diagnostic tool-evidence relaxation cannot enable automatic agent routing"
+
     if output:
         safety.atomic_write_text(response_path, output.rstrip() + "\n")
     if args.save and output and not errors:
@@ -958,6 +1032,8 @@ def main() -> int:
         "run_dir": str(run_dir),
         "agent_mode": agent_status,
         "connector_schema_version": state.get("schema_version"),
+        "chatgpt_attachment_marked": attachment_marked,
+        "chatgpt_attachment_mark_error": attachment_mark_error,
     }
     safety.atomic_write_json(metadata_path, payload)
 
@@ -972,6 +1048,12 @@ def main() -> int:
             print(f"Unverified response saved: {response_path}", file=sys.stderr)
     else:
         print(output)
+        if attachment_mark_error:
+            print(
+                "Advisor agent warning: verified response accepted, but automatic agent routing "
+                f"was not enabled: {attachment_mark_error}",
+                file=sys.stderr,
+            )
         print(f"\nAdvisor agent response saved: {response_path}", file=sys.stderr)
         print(f"Advisor agent metadata saved: {metadata_path}", file=sys.stderr)
     return 0 if not errors else 1

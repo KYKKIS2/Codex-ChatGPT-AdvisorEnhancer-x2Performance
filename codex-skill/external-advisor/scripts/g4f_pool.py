@@ -62,22 +62,220 @@ def terminate_process(process: subprocess.Popen[Any], timeout: float = 10.0) -> 
     if process.poll() is not None:
         return
     try:
-        process.terminate()
+        if os.name == "posix":
+            os.killpg(process.pid, signal.SIGTERM)
+        else:
+            process.terminate()
     except OSError:
-        return
+        try:
+            process.terminate()
+        except OSError:
+            return
     try:
         process.wait(timeout=timeout)
         return
     except subprocess.TimeoutExpired:
         pass
     try:
-        process.kill()
+        if os.name == "posix":
+            os.killpg(process.pid, signal.SIGKILL)
+        else:
+            process.kill()
     except OSError:
-        return
+        try:
+            process.kill()
+        except OSError:
+            return
     try:
         process.wait(timeout=3.0)
     except subprocess.TimeoutExpired:
         pass
+
+
+def transient_log_dir(run_id: str) -> Path:
+    path = concurrency.runtime_root() / "transient-logs" / concurrency.key_digest(run_id, 32)
+    safety.ensure_private_dir(path)
+    return path
+
+
+def update_request(path: Path, **updates: Any) -> dict[str, Any]:
+    payload = concurrency.load_json(path)
+    payload.update(updates)
+    safety.atomic_write_json(path, payload, sort_keys=True)
+    return payload
+
+
+def remove_request_artifacts(path: Path, log_path: Path | None = None) -> None:
+    concurrency.transient_release_path(path).unlink(missing_ok=True)
+    path.unlink(missing_ok=True)
+    if log_path is not None:
+        log_path.unlink(missing_ok=True)
+
+
+def reap_stale_transient_requests() -> None:
+    root = concurrency.runtime_root() / "transient-requests"
+    if not root.exists():
+        return
+    for path in root.glob("*/*.json"):
+        payload = concurrency.load_json(path)
+        concurrency.terminate_external_process(
+            int(payload.get("worker_pid") or 0),
+            str(payload.get("worker_identity") or ""),
+        )
+        remove_request_artifacts(path)
+
+
+def start_transient_worker(
+    *,
+    request_path: Path,
+    payload: dict[str, Any],
+    python: Path,
+    g4f_dir: Path,
+    env: dict[str, str],
+    port: int,
+    debug: bool,
+    run_id: str,
+    startup_timeout: float,
+) -> dict[str, Any]:
+    log_path = transient_log_dir(run_id) / f"{request_path.stem}.log"
+    log_handle = log_path.open("ab", buffering=0)
+    try:
+        process = subprocess.Popen(
+            worker_command(python, port, debug),
+            cwd=g4f_dir,
+            env=env,
+            stdin=subprocess.DEVNULL,
+            stdout=log_handle,
+            stderr=subprocess.STDOUT,
+            start_new_session=os.name == "posix",
+        )
+    except BaseException:
+        log_handle.close()
+        log_path.unlink(missing_ok=True)
+        raise
+    url = f"http://127.0.0.1:{port}/v1"
+    update_request(
+        request_path,
+        status="starting",
+        url=url,
+        worker_pid=process.pid,
+        worker_identity=concurrency.process_identity(process.pid),
+        started_at=time.time(),
+    )
+    return {
+        "request_path": request_path,
+        "process": process,
+        "log_handle": log_handle,
+        "log_path": log_path,
+        "url": url,
+        "slot": int(payload.get("slot") or 0),
+        "startup_deadline": time.monotonic() + startup_timeout,
+        "ready": False,
+    }
+
+
+def stop_transient_worker(worker: dict[str, Any]) -> None:
+    process = worker.get("process")
+    if isinstance(process, subprocess.Popen):
+        terminate_process(process)
+    log_handle = worker.get("log_handle")
+    if log_handle is not None:
+        try:
+            log_handle.close()
+        except OSError:
+            pass
+
+
+def service_transient_requests(
+    *,
+    request_dir: Path,
+    active: dict[str, dict[str, Any]],
+    python: Path,
+    g4f_dir: Path,
+    env: dict[str, str],
+    run_id: str,
+    max_workers: int,
+    port_base: int,
+    port_step: int,
+    debug: bool,
+    startup_timeout: float,
+) -> None:
+    active_slots = {int(worker["slot"]) for worker in active.values()}
+    for path in sorted(request_dir.glob("*.json"), key=lambda item: item.name):
+        request_id = path.stem
+        payload = concurrency.load_json(path)
+        release_path = concurrency.transient_release_path(path)
+        owner_alive = concurrency.process_alive(
+            int(payload.get("owner_pid") or 0),
+            str(payload.get("owner_identity") or ""),
+        )
+        worker = active.get(request_id)
+        if release_path.exists() or not owner_alive or payload.get("run_id") != run_id:
+            if worker is not None:
+                stop_transient_worker(worker)
+                active.pop(request_id, None)
+                active_slots.discard(int(worker["slot"]))
+                remove_request_artifacts(path, worker.get("log_path"))
+            else:
+                remove_request_artifacts(path)
+            continue
+        if worker is not None:
+            continue
+        if payload.get("status") != "pending":
+            continue
+        slot = int(payload.get("slot") if payload.get("slot") is not None else -1)
+        if slot < 0 or slot >= max_workers:
+            update_request(path, status="failed", error="assigned transient slot is invalid")
+            continue
+        if slot in active_slots:
+            continue
+        port = port_base + slot * port_step
+        if not port_bindable(port):
+            update_request(path, status="failed", error="assigned transient worker port is unavailable")
+            continue
+        try:
+            worker = start_transient_worker(
+                request_path=path,
+                payload=payload,
+                python=python,
+                g4f_dir=g4f_dir,
+                env=env,
+                port=port,
+                debug=debug,
+                run_id=run_id,
+                startup_timeout=startup_timeout,
+            )
+        except OSError as exc:
+            update_request(path, status="failed", error=f"worker process could not start: {exc}")
+            continue
+        active[request_id] = worker
+        active_slots.add(slot)
+
+    for request_id, worker in list(active.items()):
+        path = worker["request_path"]
+        process = worker["process"]
+        if concurrency.transient_release_path(path).exists():
+            stop_transient_worker(worker)
+            active.pop(request_id, None)
+            remove_request_artifacts(path, worker.get("log_path"))
+            continue
+        if process.poll() is not None:
+            worker["log_handle"].close()
+            active.pop(request_id, None)
+            update_request(
+                path,
+                status="failed",
+                error=f"worker exited with status {process.returncode}",
+            )
+            continue
+        if not worker["ready"] and endpoint_ready(worker["url"]):
+            worker["ready"] = True
+            update_request(path, status="ready", ready_at=time.time())
+            continue
+        if not worker["ready"] and time.monotonic() >= worker["startup_deadline"]:
+            stop_transient_worker(worker)
+            active.pop(request_id, None)
+            update_request(path, status="failed", error="worker did not become ready before startup timeout")
 
 
 def remove_owned_manifest(run_id: str) -> None:
@@ -137,6 +335,21 @@ def command_serve_locked(args: argparse.Namespace) -> int:
     ports = worker_ports(args.port, args.workers, args.port_step)
     if len(set(ports)) != len(ports) or any(port <= 0 or port > 65535 for port in ports):
         raise RuntimeError("g4f worker ports are invalid or overlap.")
+    transient_port_base = args.transient_port_base or args.port + 100
+    transient_ports = worker_ports(
+        transient_port_base,
+        args.max_transient_workers,
+        args.transient_port_step,
+    )
+    if args.mode == "transient":
+        if args.max_transient_workers < 1:
+            raise RuntimeError("The transient-worker ceiling must be at least one.")
+        if (
+            len(set(transient_ports)) != len(transient_ports)
+            or any(port <= 0 or port > 65535 for port in transient_ports)
+            or set(ports).intersection(transient_ports)
+        ):
+            raise RuntimeError("Transient g4f worker ports are invalid or overlap control-worker ports.")
 
     deadline = time.monotonic() + args.port_wait_seconds
     while True:
@@ -155,6 +368,8 @@ def command_serve_locked(args: argparse.Namespace) -> int:
     env["G4F_MODEL"] = args.model
     run_id = uuid.uuid4().hex
     processes: list[subprocess.Popen[Any]] = []
+    transient_processes: dict[str, dict[str, Any]] = {}
+    request_dir = concurrency.transient_request_dir(run_id)
     stopping = False
 
     def request_stop(_signum: int, _frame: Any) -> None:
@@ -167,11 +382,18 @@ def command_serve_locked(args: argparse.Namespace) -> int:
         signal.signal(signum, request_stop)
 
     try:
+        reap_stale_transient_requests()
         print(
-            f"Starting g4f worker pool: workers={args.workers} "
+            f"Starting g4f advisor supervisor: mode={args.mode} control_workers={args.workers} "
             f"ports={','.join(str(port) for port in ports)}",
             flush=True,
         )
+        if args.mode == "transient":
+            print(
+                f"Transient call workers: on-demand, ceiling={args.max_transient_workers}, "
+                f"ports={transient_port_base}-{transient_ports[-1]}",
+                flush=True,
+            )
         print(f"Provider: {args.provider}", flush=True)
         print(f"Model: {args.model}", flush=True)
         for index, port in enumerate(ports):
@@ -180,6 +402,7 @@ def command_serve_locked(args: argparse.Namespace) -> int:
                 cwd=g4f_dir,
                 env=env,
                 stdin=subprocess.DEVNULL,
+                start_new_session=os.name == "posix",
             )
             processes.append(process)
             print(f"Worker {index + 1}: http://127.0.0.1:{port}/v1 (pid {process.pid})", flush=True)
@@ -202,11 +425,12 @@ def command_serve_locked(args: argparse.Namespace) -> int:
             time.sleep(0.25)
 
         manifest = {
-            "schema_version": 1,
+            "schema_version": 2,
             "run_id": run_id,
             "manager_pid": os.getpid(),
             "manager_identity": concurrency.process_identity(os.getpid()),
             "started_at": time.time(),
+            "mode": args.mode,
             "model": args.model,
             "provider": args.provider,
             "workers": [
@@ -220,18 +444,50 @@ def command_serve_locked(args: argparse.Namespace) -> int:
                 for index, (process, port) in enumerate(zip(processes, ports))
             ],
         }
+        if args.mode == "transient":
+            manifest["transient"] = {
+                "max_workers": args.max_transient_workers,
+                "port_base": transient_port_base,
+                "port_step": args.transient_port_step,
+                "startup_timeout": args.transient_startup_timeout,
+            }
         safety.atomic_write_json(concurrency.pool_manifest_path(), manifest, sort_keys=True)
-        print(f"g4f worker pool ready. Manifest: {concurrency.pool_manifest_path()}", flush=True)
+        print(f"g4f advisor supervisor ready. Manifest: {concurrency.pool_manifest_path()}", flush=True)
 
         while not stopping:
             for index, process in enumerate(processes):
                 code = process.poll()
                 if code is not None:
-                    raise RuntimeError(f"g4f worker {index + 1} exited with code {code}; stopping the pool.")
-            time.sleep(0.5)
+                    raise RuntimeError(f"g4f control worker {index + 1} exited with code {code}; stopping the pool.")
+            if args.mode == "transient":
+                service_transient_requests(
+                    request_dir=request_dir,
+                    active=transient_processes,
+                    python=python,
+                    g4f_dir=g4f_dir,
+                    env=env,
+                    run_id=run_id,
+                    max_workers=args.max_transient_workers,
+                    port_base=transient_port_base,
+                    port_step=args.transient_port_step,
+                    debug=args.debug,
+                    startup_timeout=args.transient_startup_timeout,
+                )
+            time.sleep(0.1)
         return 0
     finally:
         remove_owned_manifest(run_id)
+        for worker in list(transient_processes.values()):
+            stop_transient_worker(worker)
+            remove_request_artifacts(worker["request_path"], worker.get("log_path"))
+        transient_processes.clear()
+        for path in request_dir.glob("*.json"):
+            payload = concurrency.load_json(path)
+            concurrency.terminate_external_process(
+                int(payload.get("worker_pid") or 0),
+                str(payload.get("worker_identity") or ""),
+            )
+            remove_request_artifacts(path)
         for process in reversed(processes):
             terminate_process(process)
         for signum, handler in previous_handlers.items():
@@ -246,6 +502,7 @@ def command_status(_args: argparse.Namespace) -> int:
     manager_alive = concurrency.process_alive(manager_pid, str(payload.get("manager_identity") or ""))
     print(f"manifest: {path}")
     print(f"manager_running: {'yes' if manager_alive else 'no'}")
+    print(f"mode: {payload.get('mode') or 'fixed'}")
     live_workers = 0
     for item in workers:
         if not isinstance(item, dict):
@@ -255,6 +512,40 @@ def command_status(_args: argparse.Namespace) -> int:
             live_workers += 1
         print(f"worker_{int(item.get('index') or 0) + 1}: {'running' if alive else 'stopped'} {item.get('url') or ''}")
     print(f"live_workers: {live_workers}")
+    active_transient = 0
+    if payload.get("mode") == "transient" and payload.get("run_id"):
+        for request_path in concurrency.transient_request_dir(str(payload["run_id"])).glob("*.json"):
+            request = concurrency.load_json(request_path)
+            if concurrency.process_alive(
+                int(request.get("worker_pid") or 0),
+                str(request.get("worker_identity") or ""),
+            ):
+                active_transient += 1
+        transient = payload.get("transient") if isinstance(payload.get("transient"), dict) else {}
+        print(f"active_transient_workers: {active_transient}")
+        print(f"transient_worker_ceiling: {int(transient.get('max_workers') or 0)}")
+    configured_remote = concurrency.int_env(
+        "ADVISOR_REMOTE_MAX_CONCURRENCY",
+        concurrency.DEFAULT_REMOTE_CONCURRENCY,
+    )
+    effective_remote, remote_degraded = concurrency.remote_concurrency_limit()
+    occupied_remote_slots = 0
+    for slot in range(configured_remote):
+        lock = concurrency.InterProcessLock(
+            concurrency.runtime_root() / "remote-slots" / f"slot-{slot}.lock",
+            timeout=0.0,
+        )
+        if lock.try_acquire():
+            lock.release()
+        else:
+            occupied_remote_slots += 1
+    remote_queue = concurrency.runtime_root() / "queues" / "remote-chatgpt"
+    concurrency.cleanup_stale_tickets(remote_queue)
+    queued_remote = len(list(remote_queue.glob("*.json"))) if remote_queue.exists() else 0
+    print(f"remote_chatgpt_capacity: {effective_remote}")
+    print(f"remote_chatgpt_degraded: {'yes' if remote_degraded else 'no'}")
+    print(f"occupied_remote_slots: {occupied_remote_slots}")
+    print(f"queued_remote_calls: {queued_remote}")
     return 0 if manager_alive and live_workers == len(workers) and live_workers > 0 else 1
 
 
@@ -287,13 +578,41 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     subparsers = parser.add_subparsers(dest="command", required=True)
 
-    serve = subparsers.add_parser("serve", help="Start and supervise isolated g4f workers.")
+    serve = subparsers.add_parser("serve", help="Start the g4f advisor worker supervisor.")
     serve.add_argument("--python", type=Path, required=True)
     serve.add_argument("--g4f-dir", type=Path, required=True)
     serve.add_argument("--port", type=int, default=int(os.environ.get("G4F_PORT", "8080")))
-    serve.add_argument("--workers", type=int, default=int(os.environ.get("G4F_WORKERS", "2")))
+    serve.add_argument(
+        "--mode",
+        choices=["transient", "fixed"],
+        default=os.environ.get("G4F_WORKER_MODE", "transient"),
+        help="Use one disposable worker per call (default) or a fixed compatibility pool.",
+    )
+    serve.add_argument("--workers", type=int, default=int(os.environ.get("G4F_WORKERS", "1")))
     serve.add_argument("--max-workers", type=int, default=int(os.environ.get("G4F_MAX_WORKERS", "4")))
     serve.add_argument("--port-step", type=int, default=int(os.environ.get("G4F_WORKER_PORT_STEP", "1")))
+    transient_base = os.environ.get("G4F_TRANSIENT_PORT_BASE")
+    serve.add_argument(
+        "--transient-port-base",
+        type=int,
+        default=int(transient_base) if transient_base else None,
+    )
+    serve.add_argument(
+        "--transient-port-step",
+        type=int,
+        default=int(os.environ.get("G4F_TRANSIENT_PORT_STEP", "1")),
+    )
+    serve.add_argument(
+        "--max-transient-workers",
+        type=int,
+        default=int(os.environ.get("G4F_MAX_TRANSIENT_WORKERS", "32")),
+        help="Emergency ceiling for simultaneous disposable call workers.",
+    )
+    serve.add_argument(
+        "--transient-startup-timeout",
+        type=float,
+        default=float(os.environ.get("G4F_TRANSIENT_STARTUP_TIMEOUT", "45")),
+    )
     serve.add_argument("--model", default=os.environ.get("G4F_MODEL", "gpt-5-6-thinking"))
     serve.add_argument("--provider", default=os.environ.get("G4F_PROVIDER", "OpenaiAccount"))
     serve.add_argument("--startup-timeout", type=float, default=float(os.environ.get("G4F_STARTUP_TIMEOUT", "30")))

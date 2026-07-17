@@ -42,7 +42,7 @@ assert_route "verifier" "verifier-loop" --failed-tests --prompt "pytest failed a
 assert_route "conclave" "" --prompt "Which model or framework should I use for training?"
 assert_route "single-advisor" "" --before-final --draft "Draft answer" --prompt "Review before final"
 assert_route "machine-json-verifier" "verifier-loop" --machine-verify --prompt "Verify this patch"
-assert_route "agent-mode" "agent-mode" --agent-allowed-root "$PROJECT" --agent-bridge-executable "$FAKE_BIN/devspace" --prompt "Decide the architecture for advisor memory"
+assert_route "single-advisor" "advisor" --agent-allowed-root "$PROJECT" --agent-bridge-executable "$FAKE_BIN/devspace" --prompt "Decide the architecture for advisor memory"
 assert_route "single-advisor" "" --prompt-only --agent-allowed-root "$PROJECT" --agent-bridge-executable "$FAKE_BIN/devspace" --prompt "Decide the architecture for advisor memory"
 assert_route "single-advisor" "" --agent-allowed-root "$PROJECT" --agent-bridge-executable "$FAKE_BIN/missing-devspace" --prompt "Decide the architecture for advisor memory"
 

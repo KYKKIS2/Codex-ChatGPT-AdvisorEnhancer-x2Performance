@@ -18,6 +18,11 @@ with socket.socket() as sock:
 PY
 )"
 cleanup() {
+  if [[ -n "${PROJECT:-}" && -d "${PROJECT:-}" ]]; then
+    python3 "$SCRIPTS/advisor_agent_connect.py" stop \
+      --project-dir "$PROJECT" \
+      --runtime-root "$PROJECT_ROOT/interrupted-runtime" >/dev/null 2>&1 || true
+  fi
   python3 - "$PROJECT_ROOT" <<'PY'
 import os
 import sys
@@ -130,6 +135,13 @@ echo "https://fake-devspace.trycloudflare.com"
 sleep 300
 EOF
 chmod +x "$FAKE_BIN/cloudflared"
+
+cat > "$FAKE_BIN/cloudflared-hang" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+sleep 300
+EOF
+chmod +x "$FAKE_BIN/cloudflared-hang"
 
 python3 "$SCRIPTS/agent_mode.py" \
   --doctor \
@@ -284,13 +296,14 @@ grep -q "sanitized_copy" /tmp/advisor-agent-sanitized-handoff.txt
 router_json="$(python3 "$SCRIPTS/router.py" \
   --project-dir "$PROJECT" \
   --json \
+  --agent-dry-run \
   --agent-allowed-root "$PROJECT_ROOT" \
   --agent-bridge-executable "$FAKE_BIN/devspace" \
   --agent-workspace-root "$WORKSPACES" \
   --prompt "Decide the architecture for advisor memory")"
 route="$(printf '%s' "$router_json" | python3 -c 'import json,sys; print(json.load(sys.stdin)["route"])')"
 if [[ "$route" != "agent-mode" ]]; then
-  echo "Expected sanitized agent-mode route, got $route" >&2
+  echo "Expected explicit sanitized agent dry-run route, got $route" >&2
   exit 1
 fi
 sanitized_used="$(printf '%s' "$router_json" | python3 -c 'import json,sys; data=json.load(sys.stdin); print(data["agent_mode"]["sanitized_workspace"]["used"])')"
@@ -430,6 +443,7 @@ grep -q "sanitized_workspace_used: yes" /tmp/advisor-agent-setup-sanitized.txt
 router_json="$(python3 "$SCRIPTS/router.py" \
   --project-dir "$PROJECT" \
   --json \
+  --agent-dry-run \
   --agent-sanitized-workspace off \
   --agent-allowed-root "$PROJECT_ROOT" \
   --agent-bridge-executable "$FAKE_BIN/devspace" \
@@ -455,8 +469,8 @@ router_json="$(python3 "$SCRIPTS/router.py" \
   --agent-bridge-executable "$FAKE_BIN/devspace" \
   --prompt "Decide the architecture for advisor memory")"
 route="$(printf '%s' "$router_json" | python3 -c 'import json,sys; print(json.load(sys.stdin)["route"])')"
-if [[ "$route" != "agent-mode" ]]; then
-  echo "Expected config-driven agent-mode route, got $route" >&2
+if [[ "$route" != "single-advisor" ]]; then
+  echo "Expected prompt-only route before connector attachment verification, got $route" >&2
   exit 1
 fi
 
@@ -487,8 +501,8 @@ router_json="$(python3 "$SCRIPTS/router.py" \
   --agent-bridge-executable "$FAKE_BIN/devspace" \
   --prompt "Decide the architecture for advisor memory")"
 route="$(printf '%s' "$router_json" | python3 -c 'import json,sys; print(json.load(sys.stdin)["route"])')"
-if [[ "$route" != "agent-mode" ]]; then
-  echo "Expected agent-mode route, got $route" >&2
+if [[ "$route" != "single-advisor" ]]; then
+  echo "Expected prompt-only route before a live verified connector, got $route" >&2
   exit 1
 fi
 
@@ -508,6 +522,7 @@ fi
 router_json="$(python3 "$SCRIPTS/router.py" \
   --project-dir "$PROJECT" \
   --json \
+  --agent-dry-run \
   --agent-allowed-root "$PROJECT_ROOT" \
   --agent-bridge-executable "$FAKE_BIN/missing-devspace" \
   --prompt "Decide the architecture for advisor memory")"
@@ -555,6 +570,67 @@ PORT="$FAKE_PORT" python3 "$SCRIPTS/advisor_agent_connect.py" \
   --project-dir "$PROJECT" \
   --allowed-root "$PROJECT" \
   --bridge-executable "$FAKE_BIN/devspace" \
+  --cloudflared-executable "$FAKE_BIN/cloudflared-hang" \
+  --config-path "$CONFIG" \
+  --workspace-root "$WORKSPACES" \
+  --runtime-root "$PROJECT_ROOT/interrupted-runtime" \
+  --timeout 30 \
+  --allow-unpatched-devspace \
+  --skip-public-probe >/tmp/advisor-agent-connect-interrupted.txt 2>&1 &
+interrupted_launcher_pid=$!
+interrupted_state_ready=false
+for _attempt in $(seq 1 100); do
+  python3 "$SCRIPTS/advisor_agent_connect.py" \
+    status \
+    --project-dir "$PROJECT" \
+    --skip-public-probe \
+    --runtime-root "$PROJECT_ROOT/interrupted-runtime" \
+    >/tmp/advisor-agent-connect-interrupted-status.json
+  if python3 - /tmp/advisor-agent-connect-interrupted-status.json <<'PY'
+import json
+import sys
+
+data = json.load(open(sys.argv[1], encoding="utf-8"))
+raise SystemExit(0 if data.get("lifecycle_state") == "starting" and data.get("tunnel_pid") else 1)
+PY
+  then
+    interrupted_state_ready=true
+    break
+  fi
+  sleep 0.1
+done
+if [[ "$interrupted_state_ready" != "true" ]]; then
+  echo "Interrupted connector startup never persisted its managed tunnel PID" >&2
+  exit 1
+fi
+kill -KILL "$interrupted_launcher_pid"
+wait "$interrupted_launcher_pid" 2>/dev/null || true
+
+python3 "$SCRIPTS/advisor_agent_connect.py" \
+  stop \
+  --project-dir "$PROJECT" \
+  --runtime-root "$PROJECT_ROOT/interrupted-runtime" >/tmp/advisor-agent-connect-interrupted-stop.txt
+grep -q "tunnel_stopped: yes" /tmp/advisor-agent-connect-interrupted-stop.txt
+python3 "$SCRIPTS/advisor_agent_connect.py" \
+  status \
+  --project-dir "$PROJECT" \
+  --skip-public-probe \
+  --runtime-root "$PROJECT_ROOT/interrupted-runtime" \
+  >/tmp/advisor-agent-connect-interrupted-stopped-status.json
+python3 - /tmp/advisor-agent-connect-interrupted-stopped-status.json <<'PY'
+import json
+import sys
+
+data = json.load(open(sys.argv[1], encoding="utf-8"))
+if data.get("lifecycle_state") != "stopped" or data.get("tunnel_running"):
+    raise SystemExit(f"interrupted connector was not recovered cleanly: {data}")
+PY
+
+PORT="$FAKE_PORT" python3 "$SCRIPTS/advisor_agent_connect.py" \
+  serve \
+  --project-dir "$PROJECT" \
+  --allowed-root "$PROJECT" \
+  --bridge-executable "$FAKE_BIN/devspace" \
   --cloudflared-executable "$FAKE_BIN/cloudflared" \
   --config-path "$CONFIG" \
   --workspace-root "$WORKSPACES" \
@@ -567,6 +643,8 @@ grep -q "chatgpt_connector_url: https://fake-devspace.trycloudflare.com/mcp" /tm
 grep -q "devspace_pid:" /tmp/advisor-agent-connect-serve.txt
 grep -q "tunnel_pid:" /tmp/advisor-agent-connect-serve.txt
 grep -q "connector_ready: yes" /tmp/advisor-agent-connect-serve.txt
+grep -q "chatgpt_attachment_verified: no" /tmp/advisor-agent-connect-serve.txt
+grep -q "agent_mode_ready: no" /tmp/advisor-agent-connect-serve.txt
 grep -q '^DEVSPACE_TOOL_MODE=readonly$' "$FAKE_BIN/devspace-env.txt"
 grep -q '^DEVSPACE_SKILLS=false$' "$FAKE_BIN/devspace-env.txt"
 grep -q '^DEVSPACE_SUBAGENTS=false$' "$FAKE_BIN/devspace-env.txt"
@@ -588,9 +666,56 @@ if data.get("mcp_url") != "https://fake-devspace.trycloudflare.com/mcp":
     raise SystemExit("wrong mcp_url in status")
 if not data.get("connector_ready") or not data.get("devspace_running") or not data.get("tunnel_running"):
     raise SystemExit("expected fake connector processes to be ready")
+if data.get("agent_mode_ready") or data.get("chatgpt_attachment_verified"):
+    raise SystemExit("fresh local connector incorrectly claimed a verified ChatGPT attachment")
 if not data.get("readonly_tool_mode") or data.get("tool_mode") != "readonly":
     raise SystemExit("connector readiness did not require the read-only DevSpace tool mode")
 PY
+
+ADVISOR_AGENT_RUNTIME_ROOT="$PROJECT_ROOT/runtime" \
+ADVISOR_AGENT_SKIP_PUBLIC_PROBE=true \
+PYTHONPATH="$SCRIPTS" \
+python3 - "$PROJECT" <<'PY'
+import os
+import sys
+from pathlib import Path
+
+import advisor_agent
+import advisor_agent_connect
+
+project = Path(sys.argv[1])
+root = advisor_agent_connect.runtime_root()
+state = advisor_agent_connect.connector_runtime_status(
+    project,
+    root=root,
+    skip_public_probe=True,
+)
+if state.get("agent_mode_ready") or state.get("chatgpt_attachment_verified"):
+    raise SystemExit("fresh connector incorrectly started as ChatGPT-attachment verified")
+if not advisor_agent.mark_chatgpt_attachment_verified(project, state):
+    raise SystemExit("verified MCP evidence did not mark the unchanged connector")
+verified = advisor_agent_connect.connector_runtime_status(
+    project,
+    root=root,
+    skip_public_probe=True,
+)
+if not verified.get("agent_mode_ready") or not verified.get("chatgpt_attachment_verified"):
+    raise SystemExit("verified connector was not accepted for automatic agent routing")
+PY
+
+router_json="$(ADVISOR_AGENT_RUNTIME_ROOT="$PROJECT_ROOT/runtime" \
+  ADVISOR_AGENT_SKIP_PUBLIC_PROBE=true \
+  python3 "$SCRIPTS/router.py" \
+    --project-dir "$PROJECT" \
+    --json \
+    --agent-config-path "$CONFIG" \
+    --agent-bridge-executable "$FAKE_BIN/devspace" \
+    --prompt "Decide the architecture for advisor memory")"
+route="$(printf '%s' "$router_json" | python3 -c 'import json,sys; print(json.load(sys.stdin)["route"])')"
+if [[ "$route" != "agent-mode" ]]; then
+  echo "Expected automatic agent-mode after verified MCP attachment, got $route" >&2
+  exit 1
+fi
 
 python3 - /tmp/advisor-agent-connect-status.json <<'PY'
 import json

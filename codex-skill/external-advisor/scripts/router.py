@@ -303,6 +303,30 @@ def forced_decision(route: str, reasons: list[str]) -> RouteDecision:
     raise ValueError(f"Unknown forced route: {route}")
 
 
+def agent_connector_readiness(project_dir: Path) -> dict[str, Any]:
+    try:
+        import advisor_agent_connect  # noqa: PLC0415
+
+        runtime = advisor_agent_connect.connector_runtime_status(
+            project_dir,
+            root=advisor_agent_connect.runtime_root(),
+            skip_public_probe=truthy(os.environ.get("ADVISOR_AGENT_SKIP_PUBLIC_PROBE")),
+        )
+    except Exception as exc:  # pragma: no cover - defensive runtime guard
+        return {
+            "connector_ready": False,
+            "chatgpt_attachment_verified": False,
+            "agent_mode_ready": False,
+            "error": safety.truncate(safety.redact_sensitive_text(str(exc)), 300),
+        }
+    return {
+        "lifecycle_state": str(runtime.get("lifecycle_state") or "absent"),
+        "connector_ready": bool(runtime.get("connector_ready")),
+        "chatgpt_attachment_verified": bool(runtime.get("chatgpt_attachment_verified")),
+        "agent_mode_ready": bool(runtime.get("agent_mode_ready")),
+    }
+
+
 def evaluate_agent_preference(args: argparse.Namespace, decision: RouteDecision) -> tuple[RouteDecision, dict[str, Any] | None]:
     if args.prompt_only:
         return decision, {"available": False, "notes": ["prompt-only override selected"]}
@@ -312,6 +336,22 @@ def evaluate_agent_preference(args: argparse.Namespace, decision: RouteDecision)
         return decision, None
     if decision.machine_json:
         return decision, {"available": False, "notes": ["machine-json verifier keeps the prompt-only evidence loop"]}
+    explicit_agent_attempt = args.force_route in {"agent-mode", "agent-conclave"} or args.agent_dry_run
+    connector = agent_connector_readiness(args.project_dir)
+    if not connector.get("agent_mode_ready") and not explicit_agent_attempt:
+        if not connector.get("connector_ready"):
+            note = "automatic agent routing disabled: local connector is not ready"
+        else:
+            note = (
+                "automatic agent routing disabled: current ChatGPT connector attachment "
+                "has not completed a verified MCP turn"
+            )
+        return decision, {
+            "available": False,
+            "automatic_agent_available": False,
+            "connector_runtime": connector,
+            "notes": [note],
+        }
     try:
         import agent_mode  # noqa: PLC0415
     except Exception as exc:  # pragma: no cover - defensive import guard
@@ -331,8 +371,10 @@ def evaluate_agent_preference(args: argparse.Namespace, decision: RouteDecision)
         case_insensitive=args.agent_case_insensitive_paths or None,
     )
     payload = status.to_dict()
+    payload["connector_runtime"] = connector
     if status.available:
-        reasons = [*decision.reasons, "safe repo-aware agent-mode configured"]
+        payload["automatic_agent_available"] = bool(connector.get("agent_mode_ready"))
+        reasons = [*decision.reasons, "safe repo-aware agent-mode configured and verified"]
         if args.force_route == "agent-conclave" or (
             decision.command_kind == "conclave" and len(decision.roles) > 1
         ):
@@ -485,7 +527,7 @@ def execute_route(args: argparse.Namespace, prompt: str, decision: RouteDecision
         prompt = f"{prompt.strip()}\n\n--- Advisor context pack ---\n" + "\n\n---\n\n".join(blocks)
     if args.error_output:
         prompt = f"{prompt.strip()}\n\n--- Error output / failed evidence ---\n{args.error_output.strip()}"
-    execution_timeout = args.timeout + 30
+    execution_timeout: float | None = args.timeout + 30
     if decision.command_kind == "agent-conclave":
         role_waves = max(
             1,
@@ -493,13 +535,15 @@ def execute_route(args: argparse.Namespace, prompt: str, decision: RouteDecision
             // args.agent_max_workers,
         )
         synthesis_wave = 0 if args.no_synthesis else 1
-        execution_timeout = (
+        execution_timeout = None if args.agent_queue_timeout <= 0 or args.agent_timeout <= 0 else (
             (role_waves + synthesis_wave)
             * (args.agent_queue_timeout + args.agent_timeout)
             + 90
         )
     elif decision.command_kind == "agent-mode":
-        execution_timeout = args.agent_queue_timeout + args.agent_timeout + 60
+        execution_timeout = None if args.agent_queue_timeout <= 0 or args.agent_timeout <= 0 else (
+            args.agent_queue_timeout + args.agent_timeout + 60
+        )
     elif decision.command_kind == "conclave":
         synthesis_wave = 0 if args.no_synthesis or len(decision.roles) == 1 else 1
         execution_timeout = (max(1, len(decision.roles)) + synthesis_wave) * args.timeout + 90
@@ -562,18 +606,23 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--max-output-tokens", type=int, default=int(os.environ.get("ADVISOR_MAX_OUTPUT_TOKENS", "1200")))
     parser.add_argument("--timeout", type=int, default=int(os.environ.get("ADVISOR_TIMEOUT", "300")))
-    parser.add_argument("--agent-timeout", type=int, default=int(os.environ.get("ADVISOR_AGENT_TIMEOUT", "900")))
+    parser.add_argument(
+        "--agent-timeout",
+        type=int,
+        default=int(os.environ.get("ADVISOR_AGENT_TIMEOUT", "0")),
+        help="Maximum repo-aware completion wait; 0 waits until ChatGPT finishes.",
+    )
     parser.add_argument(
         "--agent-queue-timeout",
         type=float,
-        default=float(os.environ.get("ADVISOR_QUEUE_TIMEOUT", "3600")),
-        help="Maximum seconds repo-aware calls may wait for a shared advisor worker lease.",
+        default=float(os.environ.get("ADVISOR_QUEUE_TIMEOUT", "0")),
+        help="Maximum seconds repo-aware calls may wait for coordination; 0 waits until available.",
     )
     parser.add_argument(
         "--agent-max-workers",
         type=int,
-        default=int(os.environ.get("ADVISOR_AGENT_MAX_WORKERS", "2")),
-        help="Maximum repo-aware specialist subprocesses launched together; the g4f pool still limits active calls.",
+        default=int(os.environ.get("ADVISOR_AGENT_MAX_WORKERS", "5")),
+        help="Maximum repo-aware specialist subprocesses launched together; transient g4f workers isolate active calls.",
     )
     parser.add_argument("--project-dir", type=Path, help="Project directory. Defaults to the nearest Git repo root or current directory.")
     parser.add_argument("--allow-sensitive-advisor", action="store_true", help="Allow advisor routing for security/privacy/auth/token tasks after caller redaction.")
@@ -623,6 +672,9 @@ def main() -> int:
     args.project_dir = resolve_project_dir(args.project_dir)
     if args.agent_max_workers < 1:
         print("--agent-max-workers must be at least 1.", file=sys.stderr)
+        return 2
+    if args.agent_timeout < 0 or args.agent_queue_timeout < 0:
+        print("Agent timeout values cannot be negative; use 0 to wait without a deadline.", file=sys.stderr)
         return 2
     if args.agent_allow_shell:
         print(

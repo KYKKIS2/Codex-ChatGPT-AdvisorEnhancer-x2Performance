@@ -218,7 +218,11 @@ finally {
     start_g4f = (Join-Path $Root "start-g4f.ps1")
     base_url = "http://127.0.0.1:8080/v1"
     model = "gpt-5-6-thinking"
-    workers = 2
+    worker_mode = "transient"
+    control_workers = 1
+    max_transient_workers = 32
+    remote_max_concurrency = 2
+    remote_start_interval_seconds = 2
 } | ConvertTo-Json | Set-Content -Encoding UTF8 -Path $SkillConfig
 
 Write-Host ""
