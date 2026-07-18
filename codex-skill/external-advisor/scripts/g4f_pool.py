@@ -35,9 +35,9 @@ def port_bindable(port: int) -> bool:
 def endpoint_ready(url: str, timeout: float = 1.0) -> bool:
     request = urllib.request.Request(f"{url.rstrip('/')}/models", method="GET")
     try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:
+        with concurrency.open_loopback_url(request, timeout=timeout) as response:
             return response.status == 200
-    except (OSError, urllib.error.URLError):
+    except (OSError, RuntimeError, urllib.error.URLError):
         return False
 
 
@@ -46,7 +46,16 @@ def worker_ports(base_port: int, workers: int, step: int) -> list[int]:
 
 
 def worker_command(python: Path, port: int, debug: bool) -> list[str]:
-    command = [str(python), "-m", "g4f", "api", "--port", str(port)]
+    command = [
+        str(python),
+        "-m",
+        "g4f",
+        "api",
+        "--bind",
+        f"127.0.0.1:{port}",
+        "--port",
+        str(port),
+    ]
     if debug:
         command.append("--debug")
     return command
@@ -99,17 +108,35 @@ def transient_log_dir(run_id: str) -> Path:
 
 
 def update_request(path: Path, **updates: Any) -> dict[str, Any]:
-    payload = concurrency.load_json(path)
-    payload.update(updates)
-    safety.atomic_write_json(path, payload, sort_keys=True)
-    return payload
+    with concurrency.transient_request_lock(path):
+        if concurrency.transient_release_path(path).exists() or not path.exists():
+            return concurrency.load_json(path)
+        payload = concurrency.load_json(path)
+        if not payload:
+            return {}
+        payload.update(updates)
+        safety.atomic_write_json(path, payload, sort_keys=True)
+        return payload
+
+
+def validated_transient_log_path(raw_path: str | Path | None) -> Path | None:
+    return concurrency.validated_transient_log_path(raw_path)
+
+
+def recorded_transient_log_path(path: Path) -> Path | None:
+    return validated_transient_log_path(concurrency.load_json(path).get("log_path"))
 
 
 def remove_request_artifacts(path: Path, log_path: Path | None = None) -> None:
-    concurrency.transient_release_path(path).unlink(missing_ok=True)
-    path.unlink(missing_ok=True)
-    if log_path is not None:
-        log_path.unlink(missing_ok=True)
+    with concurrency.transient_request_lock(path):
+        if log_path is None:
+            log_path = recorded_transient_log_path(path)
+        else:
+            log_path = validated_transient_log_path(log_path)
+        path.unlink(missing_ok=True)
+        if log_path is not None:
+            log_path.unlink(missing_ok=True)
+        concurrency.transient_release_path(path).unlink(missing_ok=True)
 
 
 def reap_stale_transient_requests() -> None:
@@ -154,14 +181,26 @@ def start_transient_worker(
         log_path.unlink(missing_ok=True)
         raise
     url = f"http://127.0.0.1:{port}/v1"
-    update_request(
-        request_path,
-        status="starting",
-        url=url,
-        worker_pid=process.pid,
-        worker_identity=concurrency.process_identity(process.pid),
-        started_at=time.time(),
-    )
+    try:
+        registered = update_request(
+            request_path,
+            status="starting",
+            url=url,
+            worker_pid=process.pid,
+            worker_identity=concurrency.process_identity(process.pid),
+            log_path=str(log_path),
+            started_at=time.time(),
+        )
+        if (
+            registered.get("status") != "starting"
+            or int(registered.get("worker_pid") or 0) != process.pid
+        ):
+            raise RuntimeError("transient request was released before worker registration")
+    except BaseException:
+        terminate_process(process)
+        log_handle.close()
+        log_path.unlink(missing_ok=True)
+        raise
     return {
         "request_path": request_path,
         "process": process,
@@ -245,7 +284,7 @@ def service_transient_requests(
                 run_id=run_id,
                 startup_timeout=startup_timeout,
             )
-        except OSError as exc:
+        except (OSError, RuntimeError) as exc:
             update_request(path, status="failed", error=f"worker process could not start: {exc}")
             continue
         active[request_id] = worker
@@ -262,11 +301,18 @@ def service_transient_requests(
         if process.poll() is not None:
             worker["log_handle"].close()
             active.pop(request_id, None)
-            update_request(
+            updated = update_request(
                 path,
                 status="failed",
                 error=f"worker exited with status {process.returncode}",
             )
+            if not updated:
+                # The caller can release/remove the request between the
+                # release check above and process exit. The supervisor still
+                # owns the closed private log and must remove it explicitly.
+                log_path = validated_transient_log_path(worker.get("log_path"))
+                if log_path is not None:
+                    log_path.unlink(missing_ok=True)
             continue
         if not worker["ready"] and endpoint_ready(worker["url"]):
             worker["ready"] = True
@@ -433,6 +479,10 @@ def command_serve_locked(args: argparse.Namespace) -> int:
             "mode": args.mode,
             "model": args.model,
             "provider": args.provider,
+            "remote_chatgpt_capacity": concurrency.int_env(
+                "ADVISOR_REMOTE_MAX_CONCURRENCY",
+                concurrency.DEFAULT_REMOTE_CONCURRENCY,
+            ),
             "workers": [
                 {
                     "index": index,
@@ -524,13 +574,11 @@ def command_status(_args: argparse.Namespace) -> int:
         transient = payload.get("transient") if isinstance(payload.get("transient"), dict) else {}
         print(f"active_transient_workers: {active_transient}")
         print(f"transient_worker_ceiling: {int(transient.get('max_workers') or 0)}")
-    configured_remote = concurrency.int_env(
-        "ADVISOR_REMOTE_MAX_CONCURRENCY",
-        concurrency.DEFAULT_REMOTE_CONCURRENCY,
-    )
+    configured_remote = concurrency.configured_remote_capacity()
     effective_remote, remote_degraded = concurrency.remote_concurrency_limit()
     occupied_remote_slots = 0
-    for slot in range(configured_remote):
+    occupied_retired_slots = 0
+    for slot in concurrency.known_remote_slot_indexes(configured_remote):
         lock = concurrency.InterProcessLock(
             concurrency.runtime_root() / "remote-slots" / f"slot-{slot}.lock",
             timeout=0.0,
@@ -539,12 +587,15 @@ def command_status(_args: argparse.Namespace) -> int:
             lock.release()
         else:
             occupied_remote_slots += 1
+            if slot >= configured_remote:
+                occupied_retired_slots += 1
     remote_queue = concurrency.runtime_root() / "queues" / "remote-chatgpt"
     concurrency.cleanup_stale_tickets(remote_queue)
     queued_remote = len(list(remote_queue.glob("*.json"))) if remote_queue.exists() else 0
     print(f"remote_chatgpt_capacity: {effective_remote}")
     print(f"remote_chatgpt_degraded: {'yes' if remote_degraded else 'no'}")
     print(f"occupied_remote_slots: {occupied_remote_slots}")
+    print(f"occupied_retired_remote_slots: {occupied_retired_slots}")
     print(f"queued_remote_calls: {queued_remote}")
     return 0 if manager_alive and live_workers == len(workers) and live_workers > 0 else 1
 

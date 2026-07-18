@@ -4,14 +4,19 @@
 from __future__ import annotations
 
 import contextlib
+import contextvars
 import errno
 import hashlib
+import ipaddress
 import json
 import os
+import re
 import signal
+import socket
 import sys
 import time
 import urllib.parse
+import urllib.request
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
@@ -90,13 +95,65 @@ def normalized_base_url(value: str) -> str:
     return value.strip().rstrip("/")
 
 
-def local_http_url(value: str) -> bool:
+def loopback_url_candidate(value: str) -> bool:
     parsed = urllib.parse.urlparse(value)
-    return parsed.scheme in {"http", "https"} and (parsed.hostname or "").lower() in {
+    host = (parsed.hostname or "").lower()
+    return parsed.scheme in {"http", "https"} and host in {
         "127.0.0.1",
         "localhost",
         "::1",
     }
+
+
+def local_http_url(value: str) -> bool:
+    parsed = urllib.parse.urlparse(value)
+    host = (parsed.hostname or "").lower()
+    if not loopback_url_candidate(value):
+        return False
+    try:
+        addresses = socket.getaddrinfo(
+            host,
+            parsed.port or (443 if parsed.scheme == "https" else 80),
+            type=socket.SOCK_STREAM,
+        )
+    except OSError:
+        return False
+    resolved = {
+        item[4][0].split("%", 1)[0]
+        for item in addresses
+        if item[4]
+    }
+    if not resolved:
+        return False
+    try:
+        return all(ipaddress.ip_address(address).is_loopback for address in resolved)
+    except ValueError:
+        return False
+
+
+class _RejectRedirects(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, *_args: Any, **_kwargs: Any) -> None:
+        return None
+
+
+_LOOPBACK_OPENER = urllib.request.build_opener(
+    urllib.request.ProxyHandler({}),
+    _RejectRedirects(),
+)
+
+
+def open_loopback_url(
+    request: urllib.request.Request,
+    *,
+    timeout: float | None,
+) -> Any:
+    if not local_http_url(request.full_url):
+        raise RuntimeError("Refusing non-loopback URL in the local advisor transport")
+    response = _LOOPBACK_OPENER.open(request, timeout=timeout)
+    if not local_http_url(response.geturl()):
+        response.close()
+        raise RuntimeError("Local advisor transport escaped the loopback boundary")
+    return response
 
 
 def process_identity(pid: int) -> str:
@@ -108,6 +165,48 @@ def process_identity(pid: int) -> str:
             boot_id = Path("/proc/sys/kernel/random/boot_id").read_text(encoding="utf-8").strip()
             return f"{boot_id}:{stat_fields[21]}"
         except (OSError, IndexError):
+            pass
+    elif os.name == "nt":
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            process_query_limited_information = 0x1000
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+            kernel32.OpenProcess.restype = wintypes.HANDLE
+            kernel32.GetProcessTimes.argtypes = [
+                wintypes.HANDLE,
+                ctypes.POINTER(wintypes.FILETIME),
+                ctypes.POINTER(wintypes.FILETIME),
+                ctypes.POINTER(wintypes.FILETIME),
+                ctypes.POINTER(wintypes.FILETIME),
+            ]
+            kernel32.GetProcessTimes.restype = wintypes.BOOL
+            kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+            kernel32.CloseHandle.restype = wintypes.BOOL
+            handle = kernel32.OpenProcess(
+                process_query_limited_information,
+                False,
+                pid,
+            )
+            if handle:
+                creation = wintypes.FILETIME()
+                exit_time = wintypes.FILETIME()
+                kernel = wintypes.FILETIME()
+                user = wintypes.FILETIME()
+                try:
+                    if kernel32.GetProcessTimes(
+                        handle,
+                        ctypes.byref(creation),
+                        ctypes.byref(exit_time),
+                        ctypes.byref(kernel),
+                        ctypes.byref(user),
+                    ):
+                        return f"windows:{creation.dwHighDateTime:08x}{creation.dwLowDateTime:08x}"
+                finally:
+                    kernel32.CloseHandle(handle)
+        except (AttributeError, OSError, ValueError):
             pass
     return ""
 
@@ -133,7 +232,7 @@ def process_alive(pid: int, expected_identity: str = "") -> bool:
         return False
     if expected_identity:
         current = process_identity(pid)
-        if current and current != expected_identity:
+        if not current or current != expected_identity:
             return False
     return True
 
@@ -267,24 +366,76 @@ def conversation_lock_keys(state_path: Path | None) -> list[str]:
     return keys
 
 
-@contextlib.contextmanager
-def conversation_lock(state_path: Path | None, timeout: float | None) -> Iterator[None]:
-    keys = conversation_lock_keys(state_path)
-    if not keys:
-        yield
-        return
-    locks = [
-        InterProcessLock(
+def state_has_conversation_id(state_path: Path | None) -> bool:
+    return any(
+        key.startswith("conversation:")
+        for key in conversation_lock_keys(state_path)
+    )
+
+
+@dataclass
+class ConversationLockLease:
+    timeout: float | None
+    locks: list[InterProcessLock]
+    keys: set[str]
+
+    def acquire_key(self, key: str) -> None:
+        if key in self.keys:
+            return
+        lock = InterProcessLock(
             runtime_root() / "conversations" / f"{key_digest(key)}.lock",
-            timeout=timeout,
+            timeout=self.timeout,
             wait_message="Advisor queued behind an earlier turn in the same ChatGPT conversation.",
         )
-        for key in sorted(keys)
-    ]
-    with contextlib.ExitStack() as stack:
-        for lock in locks:
-            stack.enter_context(lock)
-        yield
+        lock.acquire()
+        self.locks.append(lock)
+        self.keys.add(key)
+
+    def upgrade_conversation_id(self, conversation_id: str) -> None:
+        normalized = conversation_id.strip()
+        if normalized:
+            self.acquire_key("conversation:" + normalized)
+
+    def release(self) -> None:
+        for lock in reversed(self.locks):
+            lock.release()
+        self.locks.clear()
+        self.keys.clear()
+
+
+_ACTIVE_CONVERSATION_LEASE: contextvars.ContextVar[ConversationLockLease | None] = (
+    contextvars.ContextVar("advisor_active_conversation_lease", default=None)
+)
+
+
+def upgrade_active_conversation_lock(conversation_id: str) -> None:
+    lease = _ACTIVE_CONVERSATION_LEASE.get()
+    if lease is not None:
+        lease.upgrade_conversation_id(conversation_id)
+
+
+@contextlib.contextmanager
+def conversation_lock(
+    state_path: Path | None,
+    timeout: float | None,
+) -> Iterator[ConversationLockLease | None]:
+    if state_path is None:
+        yield None
+        return
+    lease = ConversationLockLease(timeout=timeout, locks=[], keys=set())
+    try:
+        state_key = "state:" + str(state_path.resolve())
+        # Acquire the state lock first, then re-read the state while holding it.
+        # A waiter may have queued before the first turn persisted its new
+        # conversation id; using keys calculated before that wait would miss
+        # the cross-state conversation lock.
+        lease.acquire_key(state_key)
+        for key in conversation_lock_keys(state_path):
+            if key != state_key:
+                lease.acquire_key(key)
+        yield lease
+    finally:
+        lease.release()
 
 
 def remote_rate_state_path() -> Path:
@@ -318,8 +469,22 @@ def record_remote_rate_limit(retry_after: float | None = None, now: float | None
         )
 
 
+def configured_remote_capacity() -> int:
+    manifest = load_json(pool_manifest_path())
+    try:
+        manager_pid = int(manifest.get("manager_pid") or 0)
+        manifest_capacity = int(manifest.get("remote_chatgpt_capacity") or 0)
+    except (TypeError, ValueError):
+        manager_pid = 0
+        manifest_capacity = 0
+    manager_identity = str(manifest.get("manager_identity") or "")
+    if manifest_capacity > 0 and process_alive(manager_pid, manager_identity):
+        return manifest_capacity
+    return int_env("ADVISOR_REMOTE_MAX_CONCURRENCY", DEFAULT_REMOTE_CONCURRENCY)
+
+
 def remote_concurrency_limit(now: float | None = None) -> tuple[int, bool]:
-    configured = int_env("ADVISOR_REMOTE_MAX_CONCURRENCY", DEFAULT_REMOTE_CONCURRENCY)
+    configured = configured_remote_capacity()
     current = time.time() if now is None else now
     with remote_rate_lock():
         state = load_json(remote_rate_state_path())
@@ -328,6 +493,17 @@ def remote_concurrency_limit(now: float | None = None) -> tuple[int, bool]:
         if degraded_until and not degraded:
             remote_rate_state_path().unlink(missing_ok=True)
     return (1 if degraded else configured), degraded
+
+
+def known_remote_slot_indexes(configured_capacity: int) -> list[int]:
+    indexes = set(range(configured_capacity))
+    slot_root = runtime_root() / "remote-slots"
+    if slot_root.exists():
+        for path in slot_root.glob("slot-*.lock"):
+            match = re.fullmatch(r"slot-(\d+)\.lock", path.name)
+            if match:
+                indexes.add(int(match.group(1)))
+    return sorted(indexes)
 
 
 def pace_remote_start(started: float, timeout: float | None) -> None:
@@ -357,8 +533,55 @@ def pace_remote_start(started: float, timeout: float | None) -> None:
         safety.atomic_write_json(state_path, {"last_start_at": time.time()}, sort_keys=True)
 
 
+@dataclass
+class RemoteCallLease:
+    ticket_path: Path
+    queue_started: float
+    timeout: float | None
+    announced: bool
+    selected_slot: int
+    marked_started: bool = False
+
+    def mark_start(self) -> None:
+        if self.marked_started:
+            return
+        pace_remote_start(self.queue_started, self.timeout)
+        self.ticket_path.unlink(missing_ok=True)
+        self.marked_started = True
+        if self.announced:
+            print(
+                "Advisor queue: remote ChatGPT turn admitted after "
+                f"{time.monotonic() - self.queue_started:.1f}s in FIFO order.",
+                file=sys.stderr,
+            )
+        if bool_env("ADVISOR_DEBUG_ROUTE", False):
+            capacity, degraded = remote_concurrency_limit()
+            print(
+                f"Advisor remote lease: slot={self.selected_slot + 1}/{capacity} "
+                f"degraded={'yes' if degraded else 'no'}.",
+                file=sys.stderr,
+            )
+
+
+_ACTIVE_REMOTE_LEASE: contextvars.ContextVar[RemoteCallLease | None] = contextvars.ContextVar(
+    "advisor_active_remote_lease",
+    default=None,
+)
+
+
+def mark_active_remote_start() -> None:
+    lease = _ACTIVE_REMOTE_LEASE.get()
+    if lease is not None:
+        lease.mark_start()
+
+
 @contextlib.contextmanager
-def remote_call_slot(timeout: float | None) -> Iterator[None]:
+def remote_call_slot(
+    timeout: float | None,
+    *,
+    defer_start: bool = False,
+    exclusive: bool = False,
+) -> Iterator[RemoteCallLease]:
     """FIFO admission control for remote ChatGPT turns, independent of local workers."""
     queue_dir = runtime_root() / "queues" / "remote-chatgpt"
     safety.ensure_private_dir(queue_dir)
@@ -394,14 +617,15 @@ def remote_call_slot(timeout: float | None) -> Iterator[None]:
                     file=sys.stderr,
                 )
                 degraded_announced = True
-            if position < capacity:
-                configured_capacity = int_env(
-                    "ADVISOR_REMOTE_MAX_CONCURRENCY",
-                    DEFAULT_REMOTE_CONCURRENCY,
-                )
-                if degraded:
+            # Only the oldest live ticket may claim the next free slot. Once it
+            # finishes start pacing and removes its ticket, the next waiter may
+            # claim another slot, preserving FIFO with capacity greater than one.
+            if position == 0:
+                configured_capacity = configured_remote_capacity()
+                known_slots = known_remote_slot_indexes(configured_capacity)
+                if degraded or exclusive:
                     acquired: list[InterProcessLock] = []
-                    for slot in range(configured_capacity):
+                    for slot in known_slots:
                         candidate = InterProcessLock(
                             runtime_root() / "remote-slots" / f"slot-{slot}.lock",
                             timeout=0.0,
@@ -416,16 +640,34 @@ def remote_call_slot(timeout: float | None) -> Iterator[None]:
                         selected_locks = acquired
                         selected_slot = 0
                 else:
-                    for slot in range(capacity):
-                        candidate = InterProcessLock(
+                    # A restarted supervisor may advertise fewer slots while an
+                    # older wrapper still owns a high-numbered lease. Wait for
+                    # every retired slot to drain before admitting under the
+                    # smaller authoritative capacity.
+                    retired_clear = True
+                    retired_probes: list[InterProcessLock] = []
+                    for slot in (item for item in known_slots if item >= capacity):
+                        probe = InterProcessLock(
                             runtime_root() / "remote-slots" / f"slot-{slot}.lock",
                             timeout=0.0,
                         )
-                        if not candidate.try_acquire():
-                            continue
-                        selected_locks = [candidate]
-                        selected_slot = slot
-                        break
+                        if not probe.try_acquire():
+                            retired_clear = False
+                            break
+                        retired_probes.append(probe)
+                    for probe in reversed(retired_probes):
+                        probe.release()
+                    if retired_clear:
+                        for slot in range(capacity):
+                            candidate = InterProcessLock(
+                                runtime_root() / "remote-slots" / f"slot-{slot}.lock",
+                                timeout=0.0,
+                            )
+                            if not candidate.try_acquire():
+                                continue
+                            selected_locks = [candidate]
+                            selected_slot = slot
+                            break
             if selected_locks:
                 break
             if timeout_expired(started, timeout):
@@ -441,22 +683,16 @@ def remote_call_slot(timeout: float | None) -> Iterator[None]:
                 announced = True
             time.sleep(poll_seconds)
 
-        ticket_path.unlink(missing_ok=True)
-        pace_remote_start(started, timeout)
-        if announced:
-            print(
-                "Advisor queue: remote ChatGPT turn admitted after "
-                f"{time.monotonic() - started:.1f}s in FIFO order.",
-                file=sys.stderr,
-            )
-        if bool_env("ADVISOR_DEBUG_ROUTE", False):
-            capacity, degraded = remote_concurrency_limit()
-            print(
-                f"Advisor remote lease: slot={selected_slot + 1}/{capacity} "
-                f"degraded={'yes' if degraded else 'no'}.",
-                file=sys.stderr,
-            )
-        yield
+        lease = RemoteCallLease(
+            ticket_path=ticket_path,
+            queue_started=started,
+            timeout=timeout,
+            announced=announced,
+            selected_slot=selected_slot,
+        )
+        if not defer_start:
+            lease.mark_start()
+        yield lease
     finally:
         ticket_path.unlink(missing_ok=True)
         for selected_lock in reversed(selected_locks):
@@ -642,6 +878,8 @@ def record_transport_success(url: str, urls: list[str], now: float | None = None
 
 
 def transport_failure(exc: BaseException) -> bool:
+    if getattr(exc, "submission_outcome_unknown", False):
+        return True
     text = str(exc).lower()
     markers = (
         "http 500",
@@ -689,6 +927,37 @@ def transient_request_dir(run_id: str) -> Path:
 
 def transient_release_path(request_path: Path) -> Path:
     return request_path.with_suffix(".release")
+
+
+def transient_request_lock(request_path: Path, timeout: float | None = 10.0) -> InterProcessLock:
+    return InterProcessLock(
+        runtime_root() / "transient-request-locks" / f"{key_digest(str(request_path), 32)}.lock",
+        timeout=timeout,
+    )
+
+
+def validated_transient_log_path(raw_path: str | Path | None) -> Path | None:
+    if not isinstance(raw_path, (str, Path)) or not str(raw_path):
+        return None
+    try:
+        candidate = Path(raw_path).expanduser().resolve()
+        expected_root = (runtime_root() / "transient-logs").resolve()
+    except OSError:
+        return None
+    return candidate if candidate.is_relative_to(expected_root) else None
+
+
+def remove_transient_log(raw_path: str | Path | None) -> None:
+    log_path = validated_transient_log_path(raw_path)
+    if log_path is not None:
+        log_path.unlink(missing_ok=True)
+
+
+def cleanup_warning(message: str, exc: BaseException) -> None:
+    print(
+        f"Advisor transient cleanup warning: {message} ({type(exc).__name__}).",
+        file=sys.stderr,
+    )
 
 
 def timeout_expired(started: float, timeout: float | None) -> bool:
@@ -879,26 +1148,47 @@ def transient_worker_lease(
             )
         yield lease
     finally:
-        ticket_path.unlink(missing_ok=True)
-        if request_path is not None and release_path is not None:
-            safety.atomic_write_text(release_path, f"{time.time():.6f}\n")
-            cleanup_timeout = float_env("ADVISOR_TRANSIENT_RELEASE_TIMEOUT", 20.0, 1.0)
-            cleanup_deadline = time.monotonic() + cleanup_timeout
-            while request_path.exists() and time.monotonic() < cleanup_deadline:
-                current_manifest = load_json(pool_manifest_path())
-                if current_manifest.get("run_id") != run_id:
-                    break
-                time.sleep(0.1)
-            if request_path.exists():
-                payload = load_json(request_path)
-                terminate_external_process(
-                    int(payload.get("worker_pid") or 0),
-                    str(payload.get("worker_identity") or ""),
-                )
-                request_path.unlink(missing_ok=True)
-            release_path.unlink(missing_ok=True)
-        if slot_lock is not None:
-            slot_lock.release()
+        try:
+            try:
+                ticket_path.unlink(missing_ok=True)
+            except OSError as exc:
+                cleanup_warning("could not remove queue ticket", exc)
+            if request_path is not None and release_path is not None:
+                try:
+                    safety.atomic_write_text(release_path, f"{time.time():.6f}\n")
+                except OSError as exc:
+                    cleanup_warning("could not signal worker release", exc)
+                cleanup_timeout = float_env("ADVISOR_TRANSIENT_RELEASE_TIMEOUT", 20.0, 1.0)
+                cleanup_deadline = time.monotonic() + cleanup_timeout
+                while request_path.exists() and time.monotonic() < cleanup_deadline:
+                    current_manifest = load_json(pool_manifest_path())
+                    if current_manifest.get("run_id") != run_id:
+                        break
+                    time.sleep(0.1)
+                if request_path.exists():
+                    try:
+                        with transient_request_lock(request_path):
+                            payload = load_json(request_path)
+                            try:
+                                terminate_external_process(
+                                    int(payload.get("worker_pid") or 0),
+                                    str(payload.get("worker_identity") or ""),
+                                )
+                            finally:
+                                try:
+                                    remove_transient_log(payload.get("log_path"))
+                                except OSError as exc:
+                                    cleanup_warning("could not remove transient worker log", exc)
+                                request_path.unlink(missing_ok=True)
+                    except (OSError, RuntimeError) as exc:
+                        cleanup_warning("caller fallback could not remove worker artifacts", exc)
+                try:
+                    release_path.unlink(missing_ok=True)
+                except OSError as exc:
+                    cleanup_warning("could not remove worker release marker", exc)
+        finally:
+            if slot_lock is not None:
+                slot_lock.release()
 
 
 @contextlib.contextmanager
@@ -1033,7 +1323,23 @@ def coordinated_call(
         0.0,
     )
     queue_timeout = None if configured_queue_timeout <= 0 else configured_queue_timeout
-    with conversation_lock(state_path, queue_timeout):
-        with remote_call_slot(queue_timeout):
-            with worker_lease(configured_base_url, queue_timeout) as lease:
-                yield lease
+    first_turn_exclusive = state_path is not None and not state_has_conversation_id(state_path)
+    # Remote admission is the outer lock. Unknown first turns take every slot,
+    # so no known-conversation caller can hold a conversation lock while waiting
+    # on the first turn's remote slot and deadlock its ID upgrade.
+    with remote_call_slot(
+        queue_timeout,
+        defer_start=True,
+        exclusive=first_turn_exclusive,
+    ) as remote_lease:
+        remote_token = _ACTIVE_REMOTE_LEASE.set(remote_lease)
+        try:
+            with conversation_lock(state_path, queue_timeout) as conversation_lease:
+                conversation_token = _ACTIVE_CONVERSATION_LEASE.set(conversation_lease)
+                try:
+                    with worker_lease(configured_base_url, queue_timeout) as lease:
+                        yield lease
+                finally:
+                    _ACTIVE_CONVERSATION_LEASE.reset(conversation_token)
+        finally:
+            _ACTIVE_REMOTE_LEASE.reset(remote_token)

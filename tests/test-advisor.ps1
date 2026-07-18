@@ -17,7 +17,6 @@ $env:ADVISOR_AUTO_CREATE_PROJECT = "false"
 $env:ADVISOR_PERSIST_CONVERSATION = "false"
 $env:ADVISOR_TEMPORARY = "true"
 $env:ADVISOR_SYNC_REMOTE = "false"
-$env:ADVISOR_AUTO_RETRY_TAIL_FRAGMENT = "false"
 
 try {
     New-Item -ItemType Directory -Force -Path $Project | Out-Null

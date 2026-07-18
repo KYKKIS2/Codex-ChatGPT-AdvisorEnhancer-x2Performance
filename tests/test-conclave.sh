@@ -17,7 +17,6 @@ export ADVISOR_AUTO_CREATE_PROJECT="false"
 export ADVISOR_PERSIST_CONVERSATION="false"
 export ADVISOR_TEMPORARY="true"
 export ADVISOR_SYNC_REMOTE="false"
-export ADVISOR_AUTO_RETRY_TAIL_FRAGMENT="false"
 
 python3 "$CONCLAVE" --project-dir "$PROJECT" --mode strategy --roles planner,critic --no-synthesis --no-sync --prompt "Smoke test. Briefly assess whether a conclave layer should stay bounded and role-based."
 

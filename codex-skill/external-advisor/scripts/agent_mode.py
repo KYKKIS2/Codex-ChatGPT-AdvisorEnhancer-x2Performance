@@ -16,6 +16,7 @@ import os
 import platform
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import uuid
@@ -108,6 +109,11 @@ SANITIZED_SKIP_FILE_SUFFIXES = (
     ".zip",
 )
 
+SANITIZED_GENERATED_FILE_NAMES = {
+    "ADVISOR_SANITIZED_WORKSPACE.md",
+    "SANITIZED_WORKSPACE_MANIFEST.json",
+}
+
 BROWSER_DIR_MARKERS = {
     "application support/google/chrome",
     "application support/firefox",
@@ -134,14 +140,20 @@ SENSITIVE_AGENT_NAME_MARKERS = (
 )
 
 SENSITIVE_AGENT_FILE_NAMES = {
+    ".dockerconfigjson",
+    ".envrc",
     ".netrc",
     ".npmrc",
     ".pypirc",
+    "application_default_credentials.json",
+    "credentials",
+    "credentials.json",
     "id_dsa",
     "id_ecdsa",
     "id_ed25519",
     "id_rsa",
     "pip.conf",
+    "terraform.tfstate",
 }
 
 SENSITIVE_AGENT_SUFFIXES = (
@@ -164,6 +176,15 @@ CONTENT_SECRET_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
         ),
         "secret-looking assignment",
     ),
+    (re.compile(r"\b(?:gh[pousr]_[A-Za-z0-9]{30,}|github_pat_[A-Za-z0-9_]{40,})\b"), "GitHub token"),
+    (re.compile(r"\b(?:AKIA|ASIA)[A-Z0-9]{16}\b"), "AWS access key id"),
+    (re.compile(r"\bAIza[0-9A-Za-z_-]{35}\b"), "Google API key"),
+    (re.compile(r"\bxox[baprs]-[A-Za-z0-9-]{20,}\b"), "Slack token"),
+    (re.compile(r"\bsk_(?:live|test)_[A-Za-z0-9]{20,}\b"), "Stripe secret key"),
+    (re.compile(r"\bsk-ant-[A-Za-z0-9_-]{20,}\b"), "Anthropic API key"),
+    (re.compile(r"\b(?:npm|hf)_[A-Za-z0-9]{24,}\b"), "package or model registry token"),
+    (re.compile(r"\bglpat-[A-Za-z0-9_-]{20,}\b"), "GitLab access token"),
+    (re.compile(r"\bdop_v1_[A-Fa-f0-9]{32,}\b"), "DigitalOcean token"),
 )
 
 
@@ -241,6 +262,7 @@ class SanitizedWorkspaceStatus:
     workspace_dir: str = ""
     workspace_root: str = ""
     workspace_allowed_root: str = ""
+    private_manifest_path: str = ""
     generation_id: str = ""
     source_fingerprint: str = ""
     reused: bool = False
@@ -262,6 +284,7 @@ class SanitizedWorkspaceStatus:
             "workspace_dir": self.workspace_dir,
             "workspace_root": self.workspace_root,
             "workspace_allowed_root": self.workspace_allowed_root,
+            "private_manifest_path": self.private_manifest_path,
             "generation_id": self.generation_id,
             "source_fingerprint": self.source_fingerprint,
             "reused": self.reused,
@@ -589,9 +612,8 @@ def file_looks_binary(sample: bytes) -> bool:
 
 def content_secret_reason(path: Path, *, max_bytes: int) -> str:
     try:
-        with path.open("rb") as handle:
-            sample = handle.read(max_bytes)
-    except OSError as exc:
+        _stat_result, sample = read_regular_file(path, max_content_bytes=max_bytes)
+    except (OSError, RuntimeError) as exc:
         return f"could not inspect file content: {exc}"
     if file_looks_binary(sample):
         return ""
@@ -624,6 +646,8 @@ def redact_sanitized_text(text: str) -> str:
     )
     for pattern, replacement in replacements:
         value = pattern.sub(replacement, value)
+    for pattern, _reason in CONTENT_SECRET_PATTERNS[4:]:
+        value = pattern.sub("[REDACTED_PROVIDER_TOKEN]", value)
     return safety.redact_sensitive_text(value)
 
 
@@ -633,10 +657,21 @@ def sha256_bytes(data: bytes) -> str:
 
 def sha256_file(path: Path) -> str:
     digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
+    flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NONBLOCK", 0)
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    descriptor = os.open(path, flags)
+    try:
+        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+            raise RuntimeError("hash target is not a regular file")
+        with os.fdopen(descriptor, "rb") as handle:
+            descriptor = -1
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+        return digest.hexdigest()
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
 
 
 def scan_project_secrets(
@@ -717,9 +752,12 @@ def scan_project_secrets(
                 add_finding(path, "path", project_sensitive_reason(project, path))
                 continue
             try:
-                stat_result = path.stat()
+                stat_result = path.lstat()
             except OSError as exc:
                 add_finding(path, "unreadable", f"could not stat file safely: {exc}")
+                continue
+            if not stat.S_ISREG(stat_result.st_mode):
+                add_finding(path, "special", "non-regular filesystem entry is denied")
                 continue
             if stat_result.st_size <= max_content_bytes:
                 reason = content_secret_reason(path, max_bytes=max_content_bytes)
@@ -762,12 +800,91 @@ def should_skip_sanitized_file(project: Path, path: Path, *, max_content_bytes: 
     if any(name.endswith(suffix) for suffix in SANITIZED_SKIP_FILE_SUFFIXES):
         return True, "archive/database/bulk data files are omitted from sanitized advisor workspace"
     try:
-        stat_result = path.stat()
+        stat_result = path.lstat()
     except OSError as exc:
         return True, f"could not stat file safely: {exc}"
+    if not stat.S_ISREG(stat_result.st_mode):
+        return True, "non-regular filesystem entry omitted"
     if stat_result.st_size > max_content_bytes:
         return True, f"file exceeds sanitized content inspection limit ({max_content_bytes} bytes)"
     return False, ""
+
+
+def read_regular_file(path: Path, *, max_content_bytes: int) -> tuple[os.stat_result, bytes]:
+    flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NONBLOCK", 0)
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    descriptor = os.open(path, flags)
+    try:
+        stat_result = os.fstat(descriptor)
+        if not stat.S_ISREG(stat_result.st_mode):
+            raise RuntimeError("source entry is not a regular file")
+        if stat_result.st_size > max_content_bytes:
+            raise RuntimeError(
+                f"source file exceeds sanitized content inspection limit ({max_content_bytes} bytes)"
+            )
+        with os.fdopen(descriptor, "rb") as handle:
+            descriptor = -1
+            content = handle.read(max_content_bytes + 1)
+        if len(content) > max_content_bytes:
+            raise RuntimeError(
+                f"source file exceeds sanitized content inspection limit ({max_content_bytes} bytes)"
+            )
+        return stat_result, content
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+
+
+def read_regular_file_beneath(
+    root: Path,
+    relative: Path,
+    *,
+    max_content_bytes: int,
+) -> tuple[os.stat_result, bytes]:
+    """Open a source file without following a swapped parent-directory symlink."""
+    if relative.is_absolute() or not relative.parts or any(part in ("", ".", "..") for part in relative.parts):
+        raise RuntimeError("source path is not a safe project-relative file")
+    if (
+        os.open not in os.supports_dir_fd
+        or not hasattr(os, "O_DIRECTORY")
+        or not hasattr(os, "O_NOFOLLOW")
+    ):
+        raise RuntimeError("secure component-wise source traversal is unavailable on this platform")
+
+    directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_NONBLOCK", 0)
+    file_flags = os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_BINARY", 0) | getattr(os, "O_NONBLOCK", 0)
+    root_descriptor = os.open(root, directory_flags)
+    current_descriptor = root_descriptor
+    file_descriptor = -1
+    try:
+        for component in relative.parts[:-1]:
+            next_descriptor = os.open(component, directory_flags, dir_fd=current_descriptor)
+            if current_descriptor != root_descriptor:
+                os.close(current_descriptor)
+            current_descriptor = next_descriptor
+        file_descriptor = os.open(relative.parts[-1], file_flags, dir_fd=current_descriptor)
+        stat_result = os.fstat(file_descriptor)
+        if not stat.S_ISREG(stat_result.st_mode):
+            raise RuntimeError("source entry is not a regular file")
+        if stat_result.st_size > max_content_bytes:
+            raise RuntimeError(
+                f"source file exceeds sanitized content inspection limit ({max_content_bytes} bytes)"
+            )
+        with os.fdopen(file_descriptor, "rb") as handle:
+            file_descriptor = -1
+            content = handle.read(max_content_bytes + 1)
+        if len(content) > max_content_bytes:
+            raise RuntimeError(
+                f"source file exceeds sanitized content inspection limit ({max_content_bytes} bytes)"
+            )
+        return stat_result, content
+    finally:
+        if file_descriptor >= 0:
+            os.close(file_descriptor)
+        if current_descriptor != root_descriptor:
+            os.close(current_descriptor)
+        os.close(root_descriptor)
 
 
 def sanitized_file_entry(
@@ -785,9 +902,12 @@ def sanitized_file_entry(
     if skip:
         return None, reason
     try:
-        stat_result = path.stat()
-        source_content = path.read_bytes()
-    except OSError as exc:
+        stat_result, source_content = read_regular_file_beneath(
+            project,
+            relative,
+            max_content_bytes=max_content_bytes,
+        )
+    except (OSError, RuntimeError) as exc:
         return None, f"could not inspect file safely: {exc}"
     source_hash = sha256_bytes(source_content)
     redacted_content: bytes | None = None
@@ -874,6 +994,10 @@ def build_sanitized_copy_plan(project: Path, *, max_content_bytes: int) -> Sanit
                 remember_skip(source, "symlink omitted")
                 continue
             relative = rel_root / name
+            if len(relative.parts) == 1 and name in SANITIZED_GENERATED_FILE_NAMES:
+                plan.skipped_files += 1
+                remember_skip(source, "reserved sanitized-workspace metadata path omitted")
+                continue
             entry, skip_reason = sanitized_file_entry(
                 project,
                 source,
@@ -881,6 +1005,9 @@ def build_sanitized_copy_plan(project: Path, *, max_content_bytes: int) -> Sanit
                 max_content_bytes=max_content_bytes,
             )
             if entry is None:
+                if skip_reason.startswith("could not inspect file safely"):
+                    plan.errors.append(f"{relative.as_posix()}: {skip_reason}")
+                    continue
                 plan.skipped_files += 1
                 remember_skip(source, skip_reason)
                 continue
@@ -892,7 +1019,8 @@ def build_sanitized_copy_plan(project: Path, *, max_content_bytes: int) -> Sanit
             record(
                 "file",
                 relative,
-                f"{entry.source_sha256}:{entry.target_sha256}:{entry.mode}",
+                f"{entry.target_sha256}:{entry.mode}:"
+                f"{'redacted' if entry.redacted_content is not None else 'verbatim'}",
             )
     plan.fingerprint = digest.hexdigest()
     return plan
@@ -923,21 +1051,136 @@ def reusable_sanitized_generation(
     workspace: Path,
     *,
     fingerprint: str,
+    entries: list[SanitizedCopyEntry],
 ) -> dict[str, Any] | None:
     marker = workspace / "ADVISOR_SANITIZED_WORKSPACE.md"
     manifest_path = workspace / "SANITIZED_WORKSPACE_MANIFEST.json"
-    if not workspace.is_dir() or not marker.is_file() or not manifest_path.is_file():
+    try:
+        if (
+            not stat.S_ISDIR(workspace.lstat().st_mode)
+            or not stat.S_ISREG(marker.lstat().st_mode)
+            or not stat.S_ISREG(manifest_path.lstat().st_mode)
+        ):
+            return None
+    except OSError:
         return None
     try:
-        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
+        _manifest_stat, manifest_bytes = read_regular_file(
+            manifest_path,
+            max_content_bytes=16 * 1024 * 1024,
+        )
+        manifest = json.loads(manifest_bytes.decode("utf-8"))
+    except (OSError, RuntimeError, UnicodeDecodeError, json.JSONDecodeError):
         return None
     if not isinstance(manifest, dict) or manifest.get("source_fingerprint") != fingerprint:
+        return None
+    recorded_manifest_hash = manifest.get("manifest_sha256")
+    hash_payload = {key: value for key, value in manifest.items() if key != "manifest_sha256"}
+    expected_manifest_hash = sha256_bytes(
+        json.dumps(
+            hash_payload,
+            ensure_ascii=True,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+    )
+    try:
+        marker_hash = sha256_file(marker)
+    except (OSError, RuntimeError):
+        return None
+    if (
+        manifest.get("schema_version") != "2.3"
+        or manifest.get("fingerprint_scope") != "sanitized-output"
+        or not isinstance(recorded_manifest_hash, str)
+        or recorded_manifest_hash != expected_manifest_hash
+        or manifest.get("marker_sha256") != marker_hash
+    ):
+        return None
+    expected_files = {
+        entry.relative.as_posix(): {
+            "sha256": entry.target_sha256,
+            "mode": 0o500 if entry.mode & 0o111 else 0o400,
+        }
+        for entry in entries
+    }
+    try:
+        paths = list(workspace.rglob("*"))
+        actual_files = {
+            path.relative_to(workspace).as_posix()
+            for path in paths
+            if path.is_file() and not path.is_symlink()
+        }
+        actual_dirs = {
+            path.relative_to(workspace).as_posix()
+            for path in paths
+            if path.is_dir() and not path.is_symlink()
+        }
+        expected_dirs: set[str] = set()
+        for relative in expected_files:
+            parent = Path(relative).parent
+            while parent != Path("."):
+                expected_dirs.add(parent.as_posix())
+                parent = parent.parent
+        if any(path.is_symlink() for path in paths):
+            return None
+        if actual_files != set(expected_files) | SANITIZED_GENERATED_FILE_NAMES:
+            return None
+        if actual_dirs != expected_dirs:
+            return None
+        if stat.S_IMODE(workspace.lstat().st_mode) != 0o500:
+            return None
+        for path in paths:
+            relative = path.relative_to(workspace).as_posix()
+            actual_mode = stat.S_IMODE(path.lstat().st_mode)
+            if path.is_dir() and actual_mode != 0o500:
+                return None
+            if path.is_file():
+                expected_mode = (
+                    0o400
+                    if relative in SANITIZED_GENERATED_FILE_NAMES
+                    else int(expected_files[relative]["mode"])
+                )
+                if actual_mode != expected_mode:
+                    return None
+        for relative, expected in expected_files.items():
+            target = workspace / relative
+            if sha256_file(target) != expected["sha256"]:
+                return None
+    except OSError:
         return None
     clean_scan = scan_project_secrets(workspace)
     if not clean_scan.ok:
         return None
     return manifest
+
+
+def git_source_provenance(project: Path) -> dict[str, Any]:
+    def git(*args: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            ["git", "-C", str(project), *args],
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            timeout=5,
+            check=False,
+        )
+
+    try:
+        head = git("rev-parse", "HEAD")
+        tree = git("rev-parse", "HEAD^{tree}")
+        status = git("status", "--porcelain=v1", "--untracked-files=normal")
+    except (OSError, subprocess.TimeoutExpired):
+        return {"available": False}
+    if head.returncode != 0 or tree.returncode != 0 or status.returncode != 0:
+        return {"available": False}
+    return {
+        "available": True,
+        "head_commit": head.stdout.strip(),
+        "head_tree": tree.stdout.strip(),
+        "dirty": bool(status.stdout.strip()),
+    }
 
 
 def make_tree_read_only(root: Path) -> None:
@@ -953,20 +1196,88 @@ def make_tree_read_only(root: Path) -> None:
 
 
 def make_tree_writable_for_cleanup(root: Path) -> None:
-    if not root.exists():
-        return
-    for path in sorted(root.rglob("*"), key=lambda item: len(item.parts)):
+    if root.is_symlink():
         try:
-            if path.is_dir():
-                os.chmod(path, 0o700)
-            elif path.is_file():
-                os.chmod(path, 0o600)
+            root.unlink()
         except OSError:
             pass
+        return
+    if not root.exists():
+        return
+    try:
+        if not stat.S_ISDIR(root.lstat().st_mode):
+            root.unlink(missing_ok=True)
+            return
+    except OSError:
+        return
+    for current, dirs, files in os.walk(root, topdown=False, followlinks=False):
+        for name in [*files, *dirs]:
+            path = Path(current) / name
+            try:
+                mode = path.lstat().st_mode
+                if stat.S_ISLNK(mode) or not (stat.S_ISREG(mode) or stat.S_ISDIR(mode)):
+                    path.unlink(missing_ok=True)
+                elif stat.S_ISDIR(mode):
+                    os.chmod(path, 0o700, follow_symlinks=False)
+                else:
+                    os.chmod(path, 0o600, follow_symlinks=False)
+            except OSError:
+                pass
     try:
         os.chmod(root, 0o700)
     except OSError:
         pass
+
+
+def remove_generated_tree(root: Path) -> None:
+    try:
+        mode = root.lstat().st_mode
+    except FileNotFoundError:
+        return
+    if stat.S_ISLNK(mode) or not stat.S_ISDIR(mode):
+        root.unlink(missing_ok=True)
+        return
+    make_tree_writable_for_cleanup(root)
+    shutil.rmtree(root)
+
+
+def write_private_sanitization_manifest(
+    project_root: Path,
+    project: Path,
+    plan: SanitizedCopyPlan,
+    public_manifest: dict[str, Any],
+) -> Path:
+    """Persist sensitive omission details outside the MCP-readable generation."""
+    generation_id = str(public_manifest.get("generation_id") or "")
+    if not re.fullmatch(r"[0-9a-f]{24}", generation_id):
+        raise RuntimeError("sanitized generation id is invalid")
+    root = project_root / "private-manifests"
+    safety.ensure_private_dir(root)
+    path = root / f"{generation_id}.json"
+    payload = {
+        "schema_version": "1.0",
+        "source_path_hash": hashlib.sha256(
+            str(project).encode("utf-8", errors="replace")
+        ).hexdigest(),
+        "source_project_name": project.name,
+        "source_fingerprint": plan.fingerprint,
+        "source_git": public_manifest.get("source_git"),
+        "generation_id": generation_id,
+        "generated_utc": public_manifest.get("generated_utc"),
+        "copied_files": public_manifest.get("copied_files"),
+        "copied_dirs": public_manifest.get("copied_dirs"),
+        "redacted_files": len(plan.redacted_paths),
+        "skipped_files": plan.skipped_files,
+        "skipped_dirs": plan.skipped_dirs,
+        "skipped_symlinks": plan.skipped_symlinks,
+        "skipped_paths": plan.skipped_paths,
+        "redacted_paths": plan.redacted_paths,
+        "public_manifest_sha256": public_manifest.get("manifest_sha256"),
+        "warning": "Private local sanitization audit. Do not expose this file through MCP.",
+    }
+    safety.atomic_write_json(path, payload)
+    os.chmod(path, 0o600)
+    return path
 
 
 def create_sanitized_workspace(
@@ -1013,25 +1324,53 @@ def create_sanitized_workspace(
         status.errors.append(f"could not create sanitized workspace generation root: {exc}")
         return status
 
-    plan = build_sanitized_copy_plan(project, max_content_bytes=max_content_bytes)
-    if plan.errors:
-        status.errors.extend(plan.errors)
-        return status
-    status.source_fingerprint = plan.fingerprint
-    generation_id = plan.fingerprint[:24]
-    workspace = generations_root / generation_id
-    status.workspace_dir = str(workspace)
-    status.generation_id = generation_id
-
     lock = concurrency.InterProcessLock(
         project_root / ".workspace.lock",
         timeout=300.0,
         wait_message="Advisor agent-mode is waiting for another session to finish the sanitized workspace snapshot.",
     )
     with lock:
-        existing_manifest = reusable_sanitized_generation(workspace, fingerprint=plan.fingerprint)
+        plan = build_sanitized_copy_plan(project, max_content_bytes=max_content_bytes)
+        if plan.errors:
+            status.errors.extend(plan.errors)
+            return status
+        source_git = git_source_provenance(project)
+        status.source_fingerprint = plan.fingerprint
+        generation_id = plan.fingerprint[:24]
+        workspace = generations_root / generation_id
+        status.workspace_dir = str(workspace)
+        status.generation_id = generation_id
+
+        existing_manifest = reusable_sanitized_generation(
+            workspace,
+            fingerprint=plan.fingerprint,
+            entries=plan.entries,
+        )
         if existing_manifest is not None:
+            final_plan = build_sanitized_copy_plan(project, max_content_bytes=max_content_bytes)
+            final_git = git_source_provenance(project)
+            if (
+                final_plan.errors
+                or final_plan.fingerprint != plan.fingerprint
+                or final_git != source_git
+                or existing_manifest.get("source_git") != final_git
+            ):
+                status.errors.append(
+                    "source project changed while the sanitized snapshot was being verified; retry"
+                )
+                return status
+            try:
+                private_manifest = write_private_sanitization_manifest(
+                    project_root,
+                    project,
+                    final_plan,
+                    existing_manifest,
+                )
+            except (OSError, RuntimeError) as exc:
+                status.errors.append(f"could not write private sanitization audit: {exc}")
+                return status
             populate_sanitized_status_from_manifest(status, workspace, existing_manifest, reused=True)
+            status.private_manifest_path = str(private_manifest)
             return status
 
         staging = project_root / f".staging-{uuid.uuid4().hex}"
@@ -1041,29 +1380,27 @@ def create_sanitized_workspace(
         try:
             safety.ensure_private_dir(staging)
             for entry in plan.entries:
-                before = entry.source.stat()
+                before, source_content = read_regular_file_beneath(
+                    project,
+                    entry.relative,
+                    max_content_bytes=max_content_bytes,
+                )
                 if (
                     before.st_size != entry.size
                     or before.st_mtime_ns != entry.mtime_ns
                     or before.st_mode != entry.mode
                 ):
                     raise RuntimeError("source project changed while the sanitized snapshot was being prepared; retry")
+                if sha256_bytes(source_content) != entry.source_sha256:
+                    raise RuntimeError("source project content changed while the sanitized snapshot was being prepared; retry")
                 target = staging / entry.relative
                 target.parent.mkdir(parents=True, exist_ok=True)
-                if entry.redacted_content is None:
-                    shutil.copy2(entry.source, target, follow_symlinks=False)
-                else:
-                    target.write_bytes(entry.redacted_content)
-                    os.chmod(target, entry.mode & 0o777)
-                after = entry.source.stat()
-                if (
-                    after.st_size != entry.size
-                    or after.st_mtime_ns != entry.mtime_ns
-                    or after.st_mode != entry.mode
-                ):
-                    raise RuntimeError("source project changed while the sanitized snapshot was being prepared; retry")
-                if sha256_file(entry.source) != entry.source_sha256:
-                    raise RuntimeError("source project content changed while the sanitized snapshot was being prepared; retry")
+                target.write_bytes(
+                    entry.redacted_content
+                    if entry.redacted_content is not None
+                    else source_content
+                )
+                os.chmod(target, entry.mode & 0o777)
                 if sha256_file(target) != entry.target_sha256:
                     raise RuntimeError("sanitized workspace content hash verification failed")
 
@@ -1073,7 +1410,7 @@ def create_sanitized_workspace(
                 "# Advisor Sanitized Workspace",
                 "",
                 "This directory is an automatically generated content-hashed, read-only review snapshot for ChatGPT/DevSpace advisor agent-mode.",
-                "It omits local secrets, advisor transcripts, dependency caches, generated build outputs, archives, databases, and symlinks.",
+                "It omits detected secret-looking material, advisor transcripts, dependency caches, generated build outputs, archives, databases, and symlinks.",
                 "Codex must verify final facts against the original checkout before acting on advisor claims.",
                 "",
                 f"source_project_name: {project.name}",
@@ -1085,18 +1422,15 @@ def create_sanitized_workspace(
                 f"skipped_dirs: {plan.skipped_dirs}",
                 f"skipped_symlinks: {plan.skipped_symlinks}",
             ]
-            if plan.skipped_samples:
-                marker_lines.extend(["", "Skipped path samples:"])
-                marker_lines.extend(f"- {item}" for item in plan.skipped_samples)
-            if plan.redacted_paths:
-                marker_lines.extend(["", "Redacted source paths:"])
-                marker_lines.extend(f"- {item}" for item in plan.redacted_paths)
+            marker_text = "\n".join(marker_lines) + "\n"
             manifest = {
-                "schema_version": "2.0",
+                "schema_version": "2.3",
                 "scanner": "external-advisor-agent-mode",
+                "fingerprint_scope": "sanitized-output",
                 "source_path_hash": hashlib.sha256(str(project).encode("utf-8", errors="replace")).hexdigest(),
                 "source_project_name": project.name,
                 "source_fingerprint": plan.fingerprint,
+                "source_git": source_git,
                 "generation_id": generation_id,
                 "generated_utc": generated_utc,
                 "copied_files": len(plan.entries),
@@ -1105,12 +1439,18 @@ def create_sanitized_workspace(
                 "skipped_files": plan.skipped_files,
                 "skipped_dirs": plan.skipped_dirs,
                 "skipped_symlinks": plan.skipped_symlinks,
-                "skipped_samples": plan.skipped_samples,
-                "skipped_paths": plan.skipped_paths,
-                "redacted_paths": plan.redacted_paths,
+                "marker_sha256": sha256_bytes(marker_text.encode("utf-8")),
                 "warning": "This is an incomplete content-hashed, read-only sanitized review snapshot. Codex must verify final facts in the original checkout.",
             }
-            safety.atomic_write_text(staging / "ADVISOR_SANITIZED_WORKSPACE.md", "\n".join(marker_lines) + "\n")
+            manifest["manifest_sha256"] = sha256_bytes(
+                json.dumps(
+                    manifest,
+                    ensure_ascii=True,
+                    separators=(",", ":"),
+                    sort_keys=True,
+                ).encode("utf-8")
+            )
+            safety.atomic_write_text(staging / "ADVISOR_SANITIZED_WORKSPACE.md", marker_text)
             safety.atomic_write_json(staging / "SANITIZED_WORKSPACE_MANIFEST.json", manifest)
 
             clean_scan = scan_project_secrets(staging)
@@ -1119,19 +1459,46 @@ def create_sanitized_workspace(
                 for finding in clean_scan.findings[:12]:
                     status.errors.append(f"{finding.path}: {finding.reason}")
                 return status
-            if workspace.exists():
-                make_tree_writable_for_cleanup(workspace)
-                shutil.rmtree(workspace)
+            final_plan = build_sanitized_copy_plan(project, max_content_bytes=max_content_bytes)
+            final_git = git_source_provenance(project)
+            if (
+                final_plan.errors
+                or final_plan.fingerprint != plan.fingerprint
+                or final_git != source_git
+            ):
+                raise RuntimeError(
+                    "source project changed while the sanitized snapshot was being prepared; retry"
+                )
+            if workspace.exists() or workspace.is_symlink():
+                remove_generated_tree(workspace)
             os.replace(staging, workspace)
             make_tree_read_only(workspace)
+            post_publish_plan = build_sanitized_copy_plan(
+                project,
+                max_content_bytes=max_content_bytes,
+            )
+            if (
+                post_publish_plan.errors
+                or post_publish_plan.fingerprint != plan.fingerprint
+                or git_source_provenance(project) != source_git
+            ):
+                raise RuntimeError(
+                    "source project changed before the sanitized snapshot could be returned; retry"
+                )
+            private_manifest = write_private_sanitization_manifest(
+                project_root,
+                project,
+                post_publish_plan,
+                manifest,
+            )
             populate_sanitized_status_from_manifest(status, workspace, manifest, reused=False)
+            status.private_manifest_path = str(private_manifest)
         except (OSError, RuntimeError) as exc:
             status.errors.append(f"could not create sanitized workspace generation: {exc}")
         finally:
-            if staging.exists():
+            if staging.exists() or staging.is_symlink():
                 try:
-                    make_tree_writable_for_cleanup(staging)
-                    shutil.rmtree(staging)
+                    remove_generated_tree(staging)
                 except OSError:
                     pass
     return status
@@ -1484,13 +1851,12 @@ def render_status_text(status: AgentModeStatus, *, include_node: bool = True) ->
 def handoff_prompt(status: AgentModeStatus, *, task: str = "", worktree: bool = True) -> str:
     if not status.available or not status.selected_root:
         raise RuntimeError("Agent mode is not available for this project.")
+    # The read-only DevSpace surface accepts checkout mode only. A sanitized
+    # snapshot describes what is mounted, not an open_workspace mode.
+    del worktree
     task = safety.truncate(safety.redact_sensitive_text(task.strip()), 3000)
-    workspace = {"path": status.project_dir}
+    workspace = {"path": status.project_dir, "mode": "checkout"}
     sanitized_used = bool(status.sanitized_workspace and status.sanitized_workspace.used)
-    if sanitized_used:
-        workspace["mode"] = "sanitized_copy"
-    elif worktree and status.worktree and status.worktree.available:
-        workspace["mode"] = "worktree"
     workspace_json = json.dumps(workspace, indent=2)
     lines = [
         "# Advisor Agent-Mode Handoff",
@@ -1509,8 +1875,11 @@ def handoff_prompt(status: AgentModeStatus, *, task: str = "", worktree: bool = 
         "- Inspect first. Read `AGENTS.md`, README, relevant tests, manifests, and nearby implementation before giving advice.",
         "- Do not read, print, summarize, or request secrets: `.env*`, HAR files, cookies, tokens, private keys, wallet files, browser profiles, `.codex-advisor`, or unrelated private files.",
         "- Use the narrow opened workspace only. Do not ask for `~`, `/`, drive roots, browser profiles, or secret stores.",
-        "- If the workspace mode is `sanitized_copy`, it intentionally omits local secrets, advisor transcripts, dependency caches, archives, databases, and symlinks. Do not ask for the original checkout; ask Codex to verify missing facts locally instead.",
-        "- Prefer worktree review. Managed worktrees are workflow isolation, not a security boundary.",
+        (
+            "- This checkout-mode path is a generated sanitized snapshot. It intentionally omits detected secrets, advisor transcripts, dependency caches, archives, databases, and symlinks. Do not ask for the original checkout; ask Codex to verify missing facts locally instead."
+            if sanitized_used
+            else "- This connector is checkout-only. Do not request a worktree or baseRef."
+        ),
         "- Treat shell tools as local-machine access. If shell is needed, ask first and explain the exact command.",
         "- Return evidence-backed critique: what you inspected, risks, concrete recommendations, and which claims still need Codex verification.",
         "",

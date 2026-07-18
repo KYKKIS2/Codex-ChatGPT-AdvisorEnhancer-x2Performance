@@ -71,9 +71,13 @@ call must first prove the current ChatGPT attachment with exact MCP evidence.
 - Gives each admitted call its own isolated g4f process and closes it after the
   call, while a separate FIFO remote-safety queue limits ChatGPT traffic.
 - Builds redacted context packs and evidence-backed verifier loops.
-- Creates content-hashed, read-only sanitized snapshots for repo-aware review.
+- Creates content-hashed, read-only sanitized snapshots for repo-aware review,
+  verifies reused generations, and records safe source Git provenance.
 - Verifies the exact ChatGPT conversation used one expected workspace and made
   successful read/search calls before accepting an agent answer.
+- Checkpoints each repo-aware role and synthesis before submission so an
+  interrupted conclave can recover completed online work without replaying an
+  ambiguous ChatGPT turn.
 - Shows sanitized live tool activity without exposing arguments, paths,
   contents, raw errors, credentials, conversation IDs, or private reasoning.
 
@@ -207,6 +211,8 @@ Windows:
 ```
 
 The default supervisor keeps one control/health endpoint on port `8080`.
+Control and transient workers bind explicitly to `127.0.0.1`; local health and
+completion requests disable inherited proxies and reject redirects.
 Each wrapped advisor call receives a new isolated g4f process on a private
 transient port; that process is terminated as soon as the call exits. Advisor
 callers always use:
@@ -217,15 +223,28 @@ http://127.0.0.1:8080/v1
 
 The wrapper leases transient workers through a private machine-wide
 coordinator. Calls to the same saved conversation remain serialized. Separate
-from the local process ceiling, a machine-wide FIFO admits at most two remote
-ChatGPT turns by default and staggers their starts by two seconds. Excess calls
-wait without polling ChatGPT, then each admitted call receives its own disposable
-g4f process. The local emergency ceiling remains 32, but it is not a recommended
-remote concurrency target.
+state files that reference the same conversation share the conversation lock;
+on a first turn, the active state-path lock is upgraded to the returned
+conversation id before that id is persisted. Unknown first turns temporarily
+lease every remote slot, preventing a known conversation alias from holding the
+new id lock while the first turn waits to upgrade it. Independently of the local process
+ceiling, a machine-wide FIFO admits at most two remote
+ChatGPT turns by default. The running supervisor records that capacity as the
+machine-wide authority, so conflicting caller environments cannot silently
+raise it. The oldest waiter keeps its FIFO ticket while its disposable worker
+starts; the two-second pacing gate runs only when that worker is ready and
+immediately before the remote turn submission. Excess calls wait without
+polling ChatGPT. The local emergency ceiling remains 32, but it is not a
+recommended remote concurrency target.
 
-If ChatGPT returns HTTP `429`, the wrapper honors a numeric `Retry-After` header
-when present, otherwise uses jittered exponential backoff capped at 60 seconds,
-and temporarily reduces new remote admission to one turn. This follows
+If ChatGPT returns HTTP `429`, the wrapper records a machine-wide cooldown and
+temporarily reduces new remote admission to one turn. Idempotent conversation,
+status, and evidence `GET` requests honor numeric `Retry-After` when present and
+otherwise use jittered exponential backoff capped at 60 seconds. A
+non-idempotent turn-submission `POST` is attempted exactly once per wrapper
+invocation. Every POST-side error fails closed; recovery may only perform
+anchored, idempotent transcript/status reads because a second submission after
+ambiguous acceptance can create a duplicate ChatGPT branch. This follows
 [OpenAI's rate-limit guidance](https://developers.openai.com/api/docs/guides/rate-limits),
 although the private ChatGPT web backend does not publish an exact concurrency
 limit. Do not post directly to `/v1/chat/completions` or select a transient port
@@ -243,15 +262,19 @@ Useful diagnostics:
 
 ```bash
 G4F_MAX_TRANSIENT_WORKERS=16 ./start-g4f.sh
-ADVISOR_REMOTE_MAX_CONCURRENCY=1 python3 ~/.codex/skills/external-advisor/scripts/router.py --execute --prompt "..."
+python3 ~/.codex/skills/external-advisor/scripts/g4f_pool.py stop
+ADVISOR_REMOTE_MAX_CONCURRENCY=1 ./start-g4f.sh
 G4F_WORKER_MODE=fixed G4F_WORKERS=2 ./start-g4f.sh
 G4F_PORT=8180 ./start-g4f.sh
 G4F_DEBUG=true ./start-g4f.sh
 ```
 
 Keep `ADVISOR_REMOTE_MAX_CONCURRENCY=2` as the normal maximum. Lower it to `1`
-when the account is already being throttled. Raising it should be a deliberate
-diagnostic after stable low-rate operation, not the default for conclaves.
+when the account is already being throttled. Capacity is captured when the
+supervisor starts, so stop and restart that supervisor after changing it;
+per-caller overrides are intentionally ignored while the supervisor is live.
+Raising it should be a deliberate diagnostic after stable low-rate operation,
+not the default for conclaves.
 
 ## Basic Advisor Usage
 
@@ -407,20 +430,50 @@ The default workflow:
    symlinks, binary files, archives, databases, and oversized files.
 4. Redacts secret-looking text only when a second scan confirms the redacted
    result is clean.
-5. Verifies source and target hashes while publishing the generation.
-6. Writes `SANITIZED_WORKSPACE_MANIFEST.json` with the complete omission and
-   redaction lists.
-7. Makes the published generation read-only.
-8. Starts the patched DevSpace server in `readonly` tool mode.
+5. Builds the authoritative source plan while holding the per-project
+   generation lock, verifies source and target hashes while publishing, then
+   repeats the full source-tree and Git-provenance scan before reuse or return.
+   Source changes fail closed instead of returning a stale generation.
+6. Rejects symlinks and non-regular source entries such as FIFOs, sockets, and
+   devices, opens every source path component with no-follow descriptor-relative
+   traversal, and performs cleanup without following hostile symlinks.
+7. Rechecks every copied path, directory, hash, generated-metadata checksum,
+   symlink boundary, and exact mode before reusing an existing generation.
+8. Writes a public `SANITIZED_WORKSPACE_MANIFEST.json` with counts, hashes, and
+   source Git commit/tree and dirty-state provenance, without omitted or
+   redacted source filenames.
+9. Stores the complete omission and redaction audit in a mode-`0600` private
+   manifest under the project workspace parent, outside the exact MCP root.
+10. Makes directories and executable files mode `0500` and other files mode
+   `0400`.
+11. Starts the patched DevSpace server in `readonly` tool mode on literal
+    `127.0.0.1`.
+12. Pins DevSpace to one exact current generation through a private atomic
+    pointer. Historical generations and staging directories remain outside the
+    MCP-readable boundary even though the same connector URL can be reused.
 
 The exposed MCP tool surface contains workspace open, read, grep, glob, and
 list operations. Shell, write, edit, and patch tools are not registered.
-`--allow-shell` is rejected by the agent wrappers.
+The patched server verifies the exact runtime registration set, advertises only
+checkout mode, rejects worktree/base-ref opens, and rechecks the exact pinned
+root on every workspace operation. `--allow-shell` is rejected by the agent
+wrappers.
+
+Repo-aware wrappers also require `ADVISOR_PROVIDER=openai-compatible` and a
+loopback `ADVISOR_BASE_URL` (`127.0.0.1`, `localhost`, or `::1`). They reject a
+remote compatible endpoint before constructing or sending repository-derived
+prompts. Loopback requests bypass proxy environment variables, reject HTTP
+redirects, and require every resolved address to remain loopback. Prompt-only
+advisor lanes may still use an explicitly configured
+official or remote provider when appropriate.
 
 This is defense in depth, not a guarantee that heuristic secret detection can
-identify every possible sensitive value. Review the generated manifest when
-the repository has unusual confidential data. Codex still validates findings
-in the original checkout.
+identify every possible sensitive value. It is not a general PII, customer-data,
+or legal-classification engine. Obtain the data owner's approval before exposing
+repositories with customer records or unusual confidential data. Review the
+private manifest locally because its omission list and source filenames can
+themselves be sensitive; that detailed list is not exposed through MCP. Codex
+still validates findings in the original checkout.
 
 ### Start The Connector
 
@@ -456,6 +509,11 @@ The helper cannot edit ChatGPT account settings or attach the app to a chat.
 Connector attachment is conversation-specific and can become stale after a
 tunnel or app replacement.
 
+Refreshing repository content does not require a new MCP URL. Before each
+repo-aware turn the wrapper builds and verifies the latest sanitized generation,
+then atomically moves the running connector's exact-root pointer to that one
+generation. A URL change is needed only when the tunnel/app itself changes.
+
 A fresh or rotated connector starts with `agent_mode_ready: no`. After adding
 the URL in ChatGPT, run one direct `advisor_agent.py` call as shown below. A
 successful fail-closed MCP turn records the attachment against that unchanged
@@ -487,7 +545,7 @@ python3 ~/.codex/skills/external-advisor/scripts/advisor_agent.py \
 
 Acceptance is fail-closed. The wrapper checks the exact current ChatGPT turn for:
 
-- exactly one attempted and successful `open_workspace`
+- one real attempted and successful `open_workspace` in the private DevSpace log
 - the expected sanitized generation path
 - the returned workspace ID and root
 - at least one successful read, grep, glob, or list call
@@ -503,6 +561,11 @@ private DevSpace log has a matching successful tool record under the unique
 workspace ID returned by the same conversation's `open_workspace`. The shared
 log window alone is never accepted as role evidence, so unrelated concurrent
 calls cannot satisfy the check.
+
+The graph can also retain an unmatched failed `open_workspace` request even
+when DevSpace executed exactly one successful open. That graph-only artifact is
+accepted only when the private workspace-attributed log proves exactly one real
+open and all normal path, ordering, workspace-ID, and denied-tool checks pass.
 
 ### Run A Repo-Aware Conclave
 
@@ -524,6 +587,35 @@ admitted role gets its own disposable g4f process. Synthesis is prompt-only and
 receives the verified specialist reports; it does not claim additional
 repository inspection.
 
+Each role receives a private request checkpoint and turn journal before its
+non-idempotent submission. If Codex or the terminal stops after ChatGPT accepted
+the work, the online agents may continue to completion. Resume the same run
+later:
+
+```bash
+python3 ~/.codex/skills/external-advisor/scripts/agent_conclave.py \
+  --resume-run .codex-advisor/agent-conclave-runs/<run-directory>
+```
+
+Resume first performs only project-conversation and transcript `GET` requests.
+It matches the unique checkpointed prompt, verifies the final marker and exact
+DevSpace evidence, and recovers the saved report. A role is submitted after
+resume only when its local journal proves submission never began. A submitted
+turn that is still running or not yet discoverable remains `remote-pending` and
+is never replayed automatically. The prompt-only synthesis uses the same
+checkpoint and GET-only recovery rule. One per-run lock prevents two local
+Codex sessions from reconciling or submitting the same interrupted run at once.
+Synthesis checkpoints are keyed to the exact successful-role reports, so a
+role recovered after an earlier partial synthesis triggers a new synthesis
+instead of silently reusing the incomplete one.
+
+One interrupted standalone agent can be reconciled directly:
+
+```bash
+python3 ~/.codex/skills/external-advisor/scripts/advisor_agent.py \
+  --resume-run-dir .codex-advisor/agent-runs/<run-directory>
+```
+
 Repo-aware calls wait for the real final ChatGPT turn by default:
 
 ```text
@@ -531,10 +623,22 @@ Repo-aware calls wait for the real final ChatGPT turn by default:
 --timeout 0
 ```
 
-`0` means no arbitrary wall-clock deadline. Transport failures, invalid model
-routes, denied MCP activity, dead callers, and supervisor shutdown still fail
-closed. Set positive values only when an operator deliberately needs bounded
-execution.
+`0` means no arbitrary completion or inactive-poll deadline after the submitted
+turn is observed. Prompt or stream acceptance must first appear within
+`ADVISOR_FINAL_FETCH_ACCEPTANCE_TIMEOUT` (180 seconds by default), so a missing
+or definitely unaccepted turn cannot retain locks forever. Idempotent remote
+reads retry bounded transient network failures, while transport failures that
+cannot be correlated to a conversation, invalid model routes, denied MCP
+activity, dead callers, and supervisor shutdown still fail closed. Set positive
+values only when an operator deliberately needs bounded execution.
+
+Normal transcript recovery is anchored to the message that preceded the submitted
+turn, so repeating an identical prompt cannot select an older answer. If the
+very first turn is accepted remotely but its local stream stops before any
+conversation id is returned, an interrupted repo-aware run uses its unique
+checkpoint marker to discover exactly one matching conversation in the bound
+ChatGPT Project. No match or multiple matches fail closed and never trigger a
+blind resubmission.
 
 A failed run updates `latest-agent-conclave-attempt.md` but does not overwrite
 the last successful `latest-agent-conclave.md`.
@@ -758,9 +862,14 @@ guidance.
 - ChatGPT app attachment and availability can vary by conversation and account
   surface.
 - Secret detection is heuristic; sanitized snapshots intentionally prefer
-  omission over completeness.
+  omission over completeness and are not a general PII classifier.
+- Interrupted recovery requires valid ChatGPT authentication, the original
+  project binding, and exactly one conversation matching the checkpointed
+  prompt. Otherwise the run remains pending and requires operator diagnosis.
 - Read-only agent review does not replace Codex testing or local verification.
-- Windows does not yet have parity for every repo-aware shell regression.
+- Prompt-only advisor lanes support Windows, but sanitized repo-aware generation
+  currently requires POSIX descriptor-relative no-follow traversal and fails
+  closed on platforms that cannot provide it.
 
 The durable idea is independent of the prototype transport:
 

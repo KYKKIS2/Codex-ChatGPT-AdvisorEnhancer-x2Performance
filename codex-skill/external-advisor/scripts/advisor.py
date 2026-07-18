@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 import argparse
+import http.client
+import hashlib
 import json
 import os
 import random
@@ -116,6 +118,54 @@ class RateLimitError(RuntimeError):
         self.retry_after = retry_after
 
 
+class AmbiguousSubmissionError(RuntimeError):
+    """A non-idempotent POST may have reached the local or remote service."""
+
+    submission_outcome_unknown = True
+
+
+STREAM_STATUS_UNKNOWN = "UNKNOWN"
+STREAMING_STATUSES = {"IS_STREAMING", "STREAMING", "IN_PROGRESS", "RUNNING", "PENDING"}
+COMPLETE_STREAM_STATUSES = {"NOT_STREAMING", "COMPLETE", "COMPLETED", "FINISHED", "IDLE"}
+
+
+def turn_journal_path() -> Path | None:
+    raw = os.environ.get("ADVISOR_TURN_JOURNAL_PATH")
+    if not raw:
+        return None
+    path = Path(raw).expanduser().resolve()
+    private_root = (advisor_project_dir() / ".codex-advisor").resolve()
+    try:
+        path.relative_to(private_root)
+    except ValueError as exc:
+        raise RuntimeError("Advisor turn journal must stay under the project's .codex-advisor directory.") from exc
+    return path
+
+
+def record_turn_phase(phase: str, **fields: Any) -> None:
+    path = turn_journal_path()
+    if path is None:
+        return
+    existing: dict[str, Any] = {}
+    if path.exists():
+        try:
+            value = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(value, dict):
+                existing = value
+        except (OSError, json.JSONDecodeError):
+            existing = {}
+    now = time.time()
+    payload = {
+        **existing,
+        "schema_version": 1,
+        "phase": phase,
+        "created_at": existing.get("created_at", now),
+        "updated_at": now,
+        **fields,
+    }
+    safety.atomic_write_json(path, payload, sort_keys=True)
+
+
 def retry_after_seconds(headers: Any) -> float | None:
     value = headers.get("Retry-After") if headers is not None else None
     if value is None:
@@ -215,29 +265,50 @@ def redact_sensitive(text: str) -> str:
     return safety.redact_sensitive_text(text)
 
 
+def open_url(request: urllib.request.Request, timeout: float | None) -> Any:
+    if concurrency.loopback_url_candidate(request.full_url):
+        return concurrency.open_loopback_url(request, timeout=timeout)
+    return urllib.request.urlopen(request, timeout=timeout)
+
+
 def post_json(url: str, payload: dict[str, Any], headers: dict[str, str], timeout: int) -> dict[str, Any]:
     data = json.dumps(payload).encode("utf-8")
     request = urllib.request.Request(url, data=data, headers=headers, method="POST")
     try:
-        with urllib.request.urlopen(request, timeout=None if timeout <= 0 else timeout) as response:
+        with open_url(request, None if timeout <= 0 else timeout) as response:
             body = response.read().decode("utf-8")
     except urllib.error.HTTPError as exc:
-        detail = exc.read().decode("utf-8", errors="replace")
+        try:
+            detail = exc.read().decode("utf-8", errors="replace")
+        except (http.client.HTTPException, OSError, UnicodeError):
+            detail = "response body unavailable"
         detail = redact_sensitive(detail)
         if exc.code == 429:
             raise RateLimitError(
                 "HTTP 429 rate limit from the remote service: " + safety.truncate(detail, 500),
                 retry_after_seconds(exc.headers),
             ) from exc
-        raise RuntimeError(f"HTTP {exc.code} from {url}: {detail}") from exc
-    except urllib.error.URLError as exc:
-        raise RuntimeError(f"Could not reach {url}: {exc.reason}") from exc
+        raise AmbiguousSubmissionError(f"HTTP {exc.code} from {url}: {detail}") from exc
+    except (
+        urllib.error.URLError,
+        TimeoutError,
+        ConnectionError,
+        http.client.HTTPException,
+        UnicodeError,
+        OSError,
+    ) as exc:
+        raise AmbiguousSubmissionError(
+            f"The response to the non-idempotent POST from {url} failed ({type(exc).__name__})."
+        ) from exc
 
     try:
-        return json.loads(body)
+        parsed = json.loads(body)
     except json.JSONDecodeError as exc:
         preview = safety.truncate(redact_sensitive(body), 500)
-        raise RuntimeError(f"Non-JSON response from {url}: {preview}") from exc
+        raise AmbiguousSubmissionError(f"Non-JSON response from {url}: {preview}") from exc
+    if not isinstance(parsed, dict):
+        raise AmbiguousSubmissionError(f"Unexpected JSON response shape from {url}.")
+    return parsed
 
 
 def get_json(url: str, headers: dict[str, str], timeout: int) -> dict[str, Any]:
@@ -245,7 +316,7 @@ def get_json(url: str, headers: dict[str, str], timeout: int) -> dict[str, Any]:
     try:
         # Unlimited advisor completion waits must not turn small metadata reads
         # into unbounded network hangs.
-        with urllib.request.urlopen(request, timeout=60 if timeout <= 0 else timeout) as response:
+        with open_url(request, 60 if timeout <= 0 else timeout) as response:
             body = response.read().decode("utf-8")
     except urllib.error.HTTPError as exc:
         detail = exc.read().decode("utf-8", errors="replace")
@@ -275,6 +346,14 @@ def rate_limit_backoff_seconds(attempt: int, retry_after: float | None) -> float
     return max(retry_after or 0.0, min(maximum, exponential + jitter))
 
 
+def transient_get_backoff_seconds(attempt: int) -> float:
+    initial = float_env("ADVISOR_REMOTE_GET_BACKOFF_INITIAL_SECONDS", 1.0, minimum=0.1)
+    maximum = float_env("ADVISOR_REMOTE_GET_BACKOFF_MAX_SECONDS", 10.0, minimum=initial)
+    jitter_fraction = float_env("ADVISOR_REMOTE_GET_BACKOFF_JITTER", 0.25, minimum=0.0)
+    exponential = min(maximum, initial * (2 ** min(max(0, attempt - 1), 20)))
+    return min(maximum, exponential + random.uniform(0.0, exponential * jitter_fraction))
+
+
 def get_remote_json_with_backoff(
     url: str,
     headers: dict[str, str],
@@ -284,7 +363,9 @@ def get_remote_json_with_backoff(
 ) -> dict[str, Any]:
     deadline = None if timeout <= 0 else time.monotonic() + timeout
     max_retries = int_env("ADVISOR_RATE_LIMIT_MAX_RETRIES", 0, minimum=0)
+    max_transient_retries = int_env("ADVISOR_REMOTE_GET_MAX_TRANSIENT_RETRIES", 3, minimum=0)
     attempt = 0
+    transient_attempt = 0
     while True:
         if deadline is None:
             request_timeout = 60
@@ -309,6 +390,22 @@ def get_remote_json_with_backoff(
             print(
                 f"Advisor remote rate limit during {operation}; retrying after {delay:.1f}s "
                 f"(attempt {attempt}).",
+                file=sys.stderr,
+            )
+            time.sleep(delay)
+        except RuntimeError as exc:
+            if not concurrency.transport_failure(exc) or transient_attempt >= max_transient_retries:
+                raise
+            transient_attempt += 1
+            delay = transient_get_backoff_seconds(transient_attempt)
+            if deadline is not None:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise
+                delay = min(delay, remaining)
+            print(
+                f"Advisor transient remote error during {operation}; retrying after {delay:.1f}s "
+                f"(attempt {transient_attempt}/{max_transient_retries}).",
                 file=sys.stderr,
             )
             time.sleep(delay)
@@ -803,6 +900,9 @@ def save_conversation(path: Path, response: dict[str, Any], project_id: str | No
     conversation = find_conversation_payload(response)
     if conversation is None:
         return
+    conversation_id = conversation.get("conversation_id")
+    if isinstance(conversation_id, str) and conversation_id.strip():
+        concurrency.upgrade_active_conversation_lock(conversation_id)
     payload: dict[str, Any] = {"conversation": conversation}
     if project_id:
         payload["chatgpt_project_id"] = project_id
@@ -1019,12 +1119,39 @@ def latest_finished_assistant_text(conversation_data: dict[str, Any]) -> str:
     return ""
 
 
-def latest_finished_assistant_text_for_prompt_data(conversation_data: dict[str, Any], prompt: str) -> str:
+def messages_after_id(messages: list[Any], message_id: str | None) -> list[Any]:
+    if not message_id:
+        return messages
+    for index, item in enumerate(messages):
+        if isinstance(item, dict) and item.get("id") == message_id:
+            return messages[index + 1:]
+    return []
+
+
+def latest_finished_assistant_text_for_prompt_data(
+    conversation_data: dict[str, Any],
+    prompt: str,
+    after_message_id: str | None = None,
+) -> str:
     transcript = transcript_from_conversation(conversation_data)
-    return latest_assistant_text_after_prompt_messages(transcript, prompt)
+    return latest_assistant_text_after_prompt_messages(transcript, prompt, after_message_id)
 
 
-def latest_assistant_text_after_prompt_messages(messages: list[Any], prompt: str) -> str:
+def latest_assistant_text_after_prompt_messages(
+    messages: list[Any],
+    prompt: str,
+    after_message_id: str | None = None,
+) -> str:
+    item = latest_assistant_item_after_prompt_messages(messages, prompt, after_message_id)
+    return str(item.get("content") or "").strip() if item is not None else ""
+
+
+def latest_assistant_item_after_prompt_messages(
+    messages: list[Any],
+    prompt: str,
+    after_message_id: str | None = None,
+) -> dict[str, Any] | None:
+    messages = messages_after_id(messages, after_message_id)
     normalized_prompt = prompt.strip()
     last_user_index = -1
     for index, item in enumerate(messages):
@@ -1033,7 +1160,7 @@ def latest_assistant_text_after_prompt_messages(messages: list[Any], prompt: str
         if str(item.get("content") or "").strip() == normalized_prompt:
             last_user_index = index
     if last_user_index < 0:
-        return ""
+        return None
     candidates: list[dict[str, Any]] = []
     for item in messages[last_user_index + 1:]:
         if not isinstance(item, dict):
@@ -1049,11 +1176,16 @@ def latest_assistant_text_after_prompt_messages(messages: list[Any], prompt: str
             continue
         content = str(item.get("content") or "").strip()
         if content:
-            return content
-    return ""
+            return item
+    return None
 
 
-def transcript_contains_prompt(messages: list[Any], prompt: str) -> bool:
+def transcript_contains_prompt(
+    messages: list[Any],
+    prompt: str,
+    after_message_id: str | None = None,
+) -> bool:
+    messages = messages_after_id(messages, after_message_id)
     normalized_prompt = prompt.strip()
     return any(
         isinstance(item, dict)
@@ -1066,8 +1198,9 @@ def transcript_contains_prompt(messages: list[Any], prompt: str) -> bool:
 def conversation_has_unfinished_activity_for_prompt(
     conversation_data: dict[str, Any],
     prompt: str,
+    after_message_id: str | None = None,
 ) -> bool:
-    messages = transcript_from_conversation(conversation_data)
+    messages = messages_after_id(transcript_from_conversation(conversation_data), after_message_id)
     normalized_prompt = prompt.strip()
     last_user_index = -1
     for index, item in enumerate(messages):
@@ -1089,21 +1222,42 @@ def conversation_has_unfinished_activity_for_prompt(
     return False
 
 
-def latest_transcript_assistant_text_for_prompt(state_path: Path, prompt: str) -> str:
+def latest_transcript_assistant_text_for_prompt(
+    state_path: Path,
+    prompt: str,
+    after_message_id: str | None = None,
+) -> str:
+    item = latest_transcript_assistant_item_for_prompt(
+        state_path,
+        prompt,
+        after_message_id,
+    )
+    return str(item.get("content") or "").strip() if item is not None else ""
+
+
+def latest_transcript_assistant_item_for_prompt(
+    state_path: Path,
+    prompt: str,
+    after_message_id: str | None = None,
+) -> dict[str, Any] | None:
     path = transcript_json_path(state_path)
     if not path.exists():
-        return ""
+        return None
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
     except json.JSONDecodeError:
-        return ""
+        return None
     messages = data.get("messages")
     if not isinstance(messages, list):
-        return ""
-    return latest_assistant_text_after_prompt_messages(messages, prompt)
+        return None
+    return latest_assistant_item_after_prompt_messages(messages, prompt, after_message_id)
 
 
-def transcript_has_unfinished_assistant_after_prompt(state_path: Path, prompt: str) -> bool:
+def transcript_has_unfinished_assistant_after_prompt(
+    state_path: Path,
+    prompt: str,
+    after_message_id: str | None = None,
+) -> bool:
     path = transcript_json_path(state_path)
     if not path.exists():
         return False
@@ -1114,6 +1268,7 @@ def transcript_has_unfinished_assistant_after_prompt(state_path: Path, prompt: s
     messages = data.get("messages")
     if not isinstance(messages, list):
         return False
+    messages = messages_after_id(messages, after_message_id)
     normalized_prompt = prompt.strip()
     last_user_index = -1
     for index, item in enumerate(messages):
@@ -1136,7 +1291,12 @@ def transcript_has_unfinished_assistant_after_prompt(state_path: Path, prompt: s
     return False
 
 
-def latest_assistant_metadata_after_prompt_messages(messages: list[Any], prompt: str) -> dict[str, Any]:
+def latest_assistant_metadata_after_prompt_messages(
+    messages: list[Any],
+    prompt: str,
+    after_message_id: str | None = None,
+) -> dict[str, Any]:
+    messages = messages_after_id(messages, after_message_id)
     normalized_prompt = prompt.strip()
     last_user_index = -1
     for index, item in enumerate(messages):
@@ -1163,7 +1323,11 @@ def latest_assistant_metadata_after_prompt_messages(messages: list[Any], prompt:
     return {}
 
 
-def latest_transcript_assistant_metadata_for_prompt(state_path: Path, prompt: str) -> dict[str, Any]:
+def latest_transcript_assistant_metadata_for_prompt(
+    state_path: Path,
+    prompt: str,
+    after_message_id: str | None = None,
+) -> dict[str, Any]:
     path = transcript_json_path(state_path)
     if not path.exists():
         return {}
@@ -1174,7 +1338,7 @@ def latest_transcript_assistant_metadata_for_prompt(state_path: Path, prompt: st
     messages = data.get("messages")
     if not isinstance(messages, list):
         return {}
-    return latest_assistant_metadata_after_prompt_messages(messages, prompt)
+    return latest_assistant_metadata_after_prompt_messages(messages, prompt, after_message_id)
 
 
 def rejected_resolved_model_slugs() -> set[str]:
@@ -1205,12 +1369,16 @@ def metadata_is_current_pro_request(metadata: dict[str, Any]) -> bool:
     return bool(metadata_pro_request_model(metadata)) and metadata_matches_current_pro_effort(metadata)
 
 
-def assert_resolved_model_route(state_path: Path | None, prompt: str) -> None:
+def assert_resolved_model_route(
+    state_path: Path | None,
+    prompt: str,
+    after_message_id: str | None = None,
+) -> None:
     if bool_env("ADVISOR_ALLOW_RESOLVED_MODEL_DOWNGRADE", False):
         return
     if state_path is None:
         return
-    metadata = latest_transcript_assistant_metadata_for_prompt(state_path, prompt)
+    metadata = latest_transcript_assistant_metadata_for_prompt(state_path, prompt, after_message_id)
     if not metadata:
         return
     resolved = metadata.get("resolved_model_slug")
@@ -1234,12 +1402,16 @@ def assert_resolved_model_route(state_path: Path | None, prompt: str) -> None:
         )
 
 
-def assert_pro_model_route(state_path: Path | None, prompt: str) -> None:
+def assert_pro_model_route(
+    state_path: Path | None,
+    prompt: str,
+    after_message_id: str | None = None,
+) -> None:
     if not is_pro_request(os.environ.get("ADVISOR_THINKING_EFFORT")):
         return
     if state_path is None:
         return
-    metadata = latest_transcript_assistant_metadata_for_prompt(state_path, prompt)
+    metadata = latest_transcript_assistant_metadata_for_prompt(state_path, prompt, after_message_id)
     if not metadata:
         return
     resolved = (
@@ -1413,40 +1585,6 @@ def recovery_disabled_reasons(persist: bool, temporary: bool, sync_remote: bool)
     return reasons
 
 
-def bool_env_default_true(name: str) -> bool:
-    value = os.environ.get(name)
-    if value is None:
-        return True
-    return value.lower() in ("1", "true", "yes", "on")
-
-
-def call_compatible_with_recovery(
-    prompt: str,
-    model: str,
-    timeout: int,
-    *,
-    _monitor_active: bool = False,
-) -> str:
-    old_values = {
-        "ADVISOR_PERSIST_CONVERSATION": os.environ.get("ADVISOR_PERSIST_CONVERSATION"),
-        "ADVISOR_TEMPORARY": os.environ.get("ADVISOR_TEMPORARY"),
-        "ADVISOR_SYNC_REMOTE": os.environ.get("ADVISOR_SYNC_REMOTE"),
-        "ADVISOR_AUTO_RETRY_TAIL_FRAGMENT": os.environ.get("ADVISOR_AUTO_RETRY_TAIL_FRAGMENT"),
-    }
-    os.environ["ADVISOR_PERSIST_CONVERSATION"] = "true"
-    os.environ["ADVISOR_TEMPORARY"] = "false"
-    os.environ["ADVISOR_SYNC_REMOTE"] = "true"
-    os.environ["ADVISOR_AUTO_RETRY_TAIL_FRAGMENT"] = "false"
-    try:
-        return call_compatible(prompt, model, timeout, _monitor_active=_monitor_active)
-    finally:
-        for name, value in old_values.items():
-            if value is None:
-                os.environ.pop(name, None)
-            else:
-                os.environ[name] = value
-
-
 def utf8_len(text: str) -> int:
     return len(text.encode("utf-8", errors="replace"))
 
@@ -1485,6 +1623,7 @@ def sync_remote_conversation(
     timeout: int,
     project_id: str | None = None,
     expected_prompt: str | None = None,
+    expected_after_message_id: str | None = None,
 ) -> dict[str, Any] | None:
     if not conversation:
         return conversation
@@ -1519,13 +1658,31 @@ def sync_remote_conversation(
         return conversation
 
     transcript = transcript_from_conversation(conversation_data)
-    if expected_prompt is not None and not transcript_contains_prompt(transcript, expected_prompt):
+    if expected_prompt is not None and not transcript_contains_prompt(
+        transcript,
+        expected_prompt,
+        expected_after_message_id,
+    ):
         print(
             "Advisor remote sync did not yet contain the current prompt; keeping local adapter state.",
             file=sys.stderr,
         )
         return conversation
     latest_id = latest_finished_assistant_message_id(conversation_data)
+    if expected_prompt is not None:
+        candidate = latest_assistant_item_after_prompt_messages(
+            transcript,
+            expected_prompt,
+            expected_after_message_id,
+        )
+        # Do not advance persistent parent state to a legacy-looking progress
+        # item. The caller will prove completion through stream status or wait
+        # for an explicit end_turn before persisting the new parent.
+        latest_id = (
+            str(candidate.get("id") or "")
+            if candidate is not None and candidate.get("end_turn") is True
+            else ""
+        )
     if latest_id:
         conversation["message_id"] = latest_id
         conversation["parent_message_id"] = latest_id
@@ -1556,13 +1713,20 @@ def remote_conversation_stream_status(
     except RateLimitError:
         raise
     except RuntimeError:
-        return None
+        return STREAM_STATUS_UNKNOWN
     status = payload.get("status") if isinstance(payload, dict) else None
-    return str(status).strip().upper() if status is not None else None
+    normalized = str(status).strip().upper() if status is not None else ""
+    if normalized in STREAMING_STATUSES or normalized in COMPLETE_STREAM_STATUSES:
+        return normalized
+    return STREAM_STATUS_UNKNOWN
 
 
 def remote_conversation_is_streaming(status: str | None) -> bool:
-    return status in {"IS_STREAMING", "STREAMING", "IN_PROGRESS", "RUNNING", "PENDING"}
+    return status in STREAMING_STATUSES
+
+
+def remote_conversation_is_complete(status: str | None) -> bool:
+    return status in COMPLETE_STREAM_STATUSES
 
 
 def fetch_remote_final_text(
@@ -1571,6 +1735,7 @@ def fetch_remote_final_text(
     prompt: str,
     timeout: int,
     project_id: str | None = None,
+    after_message_id: str | None = None,
 ) -> str:
     if not conversation:
         print("Advisor final fetch skipped: no conversation id was returned by the local adapter.", file=sys.stderr)
@@ -1590,6 +1755,15 @@ def fetch_remote_final_text(
         else max(timeout, 0)
     )
     deadline = None if fallback_timeout <= 0 else time.monotonic() + fallback_timeout
+    acceptance_timeout = int_env(
+        "ADVISOR_FINAL_FETCH_ACCEPTANCE_TIMEOUT",
+        180,
+        minimum=1,
+    )
+    acceptance_deadline = time.monotonic() + acceptance_timeout
+    if deadline is not None:
+        acceptance_deadline = min(acceptance_deadline, deadline)
+    acceptance_observed = False
     max_polls = int_env(
         "ADVISOR_FINAL_FETCH_MAX_POLLS",
         12,
@@ -1600,6 +1774,12 @@ def fetch_remote_final_text(
     last_data: dict[str, Any] | None = None
     non_streaming_polls = 0
     waiting_for_stream = False
+    unknown_status_started: float | None = None
+    unknown_status_timeout = int_env(
+        "ADVISOR_FINAL_FETCH_UNKNOWN_STATUS_TIMEOUT",
+        180,
+        minimum=1,
+    )
     while deadline is None or time.monotonic() < deadline:
         if deadline is None:
             request_timeout = 60
@@ -1621,10 +1801,25 @@ def fetch_remote_final_text(
             print(f"Advisor final fetch skipped: {redact_sensitive(str(exc))}", file=sys.stderr)
             return ""
         last_data = conversation_data
-        text = latest_finished_assistant_text_for_prompt_data(conversation_data, prompt)
+        transcript = transcript_from_conversation(conversation_data)
+        prompt_visible = transcript_contains_prompt(transcript, prompt, after_message_id)
+        candidate = latest_assistant_item_after_prompt_messages(
+            transcript, prompt, after_message_id
+        )
+        text = str(candidate.get("content") or "").strip() if candidate is not None else ""
+        status: str | None = None
+        status_checked = False
+        # Old transcripts can omit end_turn. Do not mistake a final-looking
+        # progress message for completion while ChatGPT still reports a stream.
+        completion_indeterminate = False
+        if text and candidate is not None and "end_turn" not in candidate:
+            status = remote_conversation_stream_status(conversation_id, auth, request_timeout)
+            status_checked = True
+            if not remote_conversation_is_complete(status):
+                text = ""
+                completion_indeterminate = not remote_conversation_is_streaming(status)
         if text:
-            transcript = transcript_from_conversation(conversation_data)
-            latest_id = latest_finished_assistant_message_id(conversation_data)
+            latest_id = candidate.get("id") if candidate is not None else None
             if latest_id:
                 conversation["message_id"] = latest_id
                 conversation["parent_message_id"] = latest_id
@@ -1640,11 +1835,13 @@ def fetch_remote_final_text(
         has_unfinished_activity = conversation_has_unfinished_activity_for_prompt(
             conversation_data,
             prompt,
+            after_message_id,
         )
-        status = None
-        if not has_unfinished_activity:
+        if not has_unfinished_activity and not status_checked:
             status = remote_conversation_stream_status(conversation_id, auth, request_timeout)
         active_turn = has_unfinished_activity or remote_conversation_is_streaming(status)
+        if prompt_visible or active_turn:
+            acceptance_observed = True
         if active_turn:
             if not waiting_for_stream:
                 print(
@@ -1656,18 +1853,46 @@ def fetch_remote_final_text(
             non_streaming_polls = 0
         else:
             non_streaming_polls += 1
-        polls_exhausted = max_polls > 0 and non_streaming_polls >= max_polls
+        if completion_indeterminate:
+            if unknown_status_started is None:
+                unknown_status_started = time.monotonic()
+        else:
+            unknown_status_started = None
+        polls_exhausted = (
+            deadline is not None
+            and max_polls > 0
+            and non_streaming_polls >= max_polls
+        )
         deadline_expired = deadline is not None and time.monotonic() >= deadline
-        if polls_exhausted or deadline_expired:
+        acceptance_expired = (
+            not acceptance_observed and time.monotonic() >= acceptance_deadline
+        )
+        unknown_status_expired = bool(
+            unknown_status_started is not None
+            and time.monotonic() - unknown_status_started >= unknown_status_timeout
+        )
+        if polls_exhausted or deadline_expired or acceptance_expired or unknown_status_expired:
             if last_data is not None:
                 transcript = transcript_from_conversation(last_data)
-                if transcript and transcript_contains_prompt(transcript, prompt):
+                if transcript and transcript_contains_prompt(transcript, prompt, after_message_id):
                     write_transcript(state_path, last_data, transcript)
                 elif transcript:
                     print(
                         "Advisor final fetch did not expose the current prompt; leaving transcript unchanged.",
                         file=sys.stderr,
                     )
+            if acceptance_expired:
+                print(
+                    "Advisor final fetch did not observe the submitted turn before the "
+                    "acceptance deadline; refusing to wait forever on an unaccepted request.",
+                    file=sys.stderr,
+                )
+            if unknown_status_expired:
+                print(
+                    "Advisor could not prove that a missing-end_turn assistant message was final; "
+                    "failing closed after the indeterminate-status window.",
+                    file=sys.stderr,
+                )
             return ""
         if deadline is None:
             time.sleep(poll_seconds)
@@ -1769,6 +1994,7 @@ def call_compatible(
     if project_id:
         payload["gizmo_id"] = project_id
     conversation = None
+    turn_parent_message_id: str | None = None
     if use_state:
         state_path = default_state_path()
         conversation = load_conversation(state_path)
@@ -1782,6 +2008,9 @@ def call_compatible(
         if sync_remote and not temporary:
             conversation = sync_remote_conversation(state_path, conversation, timeout, project_id)
         if conversation:
+            raw_parent = conversation.get("message_id")
+            if isinstance(raw_parent, str) and raw_parent:
+                turn_parent_message_id = raw_parent
             payload["conversation"] = conversation
     else:
         state_path = None
@@ -1805,19 +2034,36 @@ def call_compatible(
             file=sys.stderr,
         )
     transport_recovered_text = ""
+    journal_fields = {
+        "prompt_sha256": hashlib.sha256(prompt.encode("utf-8", errors="replace")).hexdigest(),
+        "state_path_sha256": (
+            hashlib.sha256(str(state_path.resolve()).encode("utf-8", errors="replace")).hexdigest()
+            if state_path is not None
+            else ""
+        ),
+        "had_parent_message": bool(turn_parent_message_id),
+    }
+    record_turn_phase("preflight-complete", **journal_fields)
+    concurrency.mark_active_remote_start()
+    record_turn_phase("submission-started", **journal_fields)
     try:
         response = post_json(f"{base_url}/chat/completions", payload, headers, timeout)
     except RuntimeError as exc:
-        if concurrency.rate_limit_failure(exc):
+        record_turn_phase(
+            "submission-outcome-unknown",
+            **journal_fields,
+            error_type=type(exc).__name__,
+        )
+        rate_limited = concurrency.rate_limit_failure(exc)
+        if rate_limited:
             concurrency.record_remote_rate_limit(
                 exc.retry_after if isinstance(exc, RateLimitError) else None
             )
-        if persist and conversation and stale_conversation_error(exc):
-            if state_path is not None:
-                remove_state_files(state_path)
-            payload.pop("conversation", None)
-            response = post_json(f"{base_url}/chat/completions", payload, headers, timeout)
-        elif (
+            # Turn submission is non-idempotent. A blind retry can create a
+            # duplicate ChatGPT branch, so fail this request after recording
+            # the machine-wide cooldown and let later calls queue safely.
+            raise
+        if (
             persist
             and sync_remote
             and not temporary
@@ -1831,6 +2077,7 @@ def call_compatible(
                 prompt,
                 timeout,
                 project_id,
+                turn_parent_message_id,
             )
             if not transport_recovered_text:
                 raise
@@ -1841,13 +2088,64 @@ def call_compatible(
             response = {}
         else:
             raise
+    else:
+        record_turn_phase("response-received", **journal_fields)
     synced_text = transport_recovered_text
+    legacy_candidate_unconfirmed = False
     if persist and state_path is not None:
         if response:
             save_conversation(state_path, response, project_id)
+            saved = load_conversation(state_path)
+            saved_id = saved.get("conversation_id") if isinstance(saved, dict) else None
+            record_turn_phase(
+                "conversation-persisted",
+                **journal_fields,
+                conversation_id_sha256=(
+                    hashlib.sha256(saved_id.encode("utf-8", errors="replace")).hexdigest()
+                    if isinstance(saved_id, str) and saved_id
+                    else ""
+                ),
+            )
         if sync_remote and not temporary:
-            sync_remote_conversation(state_path, load_conversation(state_path), timeout, project_id, expected_prompt=prompt)
-            synced_text = latest_transcript_assistant_text_for_prompt(state_path, prompt) or synced_text
+            sync_remote_conversation(
+                state_path,
+                load_conversation(state_path),
+                timeout,
+                project_id,
+                expected_prompt=prompt,
+                expected_after_message_id=turn_parent_message_id,
+            )
+            synced_text = (
+                latest_transcript_assistant_text_for_prompt(
+                    state_path,
+                    prompt,
+                    turn_parent_message_id,
+                )
+                or synced_text
+            )
+            synced_candidate = latest_transcript_assistant_item_for_prompt(
+                state_path,
+                prompt,
+                turn_parent_message_id,
+            )
+            if synced_candidate is not None and "end_turn" not in synced_candidate:
+                saved_conversation = load_conversation(state_path)
+                saved_conversation_id = saved_conversation.get("conversation_id")
+                auth = load_chatgpt_auth()
+                if isinstance(saved_conversation_id, str) and saved_conversation_id and auth:
+                    stream_status = remote_conversation_stream_status(
+                        saved_conversation_id,
+                        auth,
+                        timeout,
+                    )
+                    legacy_candidate_unconfirmed = not remote_conversation_is_complete(
+                        stream_status
+                    )
+                    if legacy_candidate_unconfirmed:
+                        synced_text = transport_recovered_text
+                else:
+                    legacy_candidate_unconfirmed = True
+                    synced_text = transport_recovered_text
     text = transport_recovered_text or extract_chat_text(response)
     if (
         persist
@@ -1855,7 +2153,14 @@ def call_compatible(
         and not temporary
         and state_path is not None
         and not synced_text
-        and transcript_has_unfinished_assistant_after_prompt(state_path, prompt)
+        and (
+            legacy_candidate_unconfirmed
+            or transcript_has_unfinished_assistant_after_prompt(
+                state_path,
+                prompt,
+                turn_parent_message_id,
+            )
+        )
     ):
         saved_conversation = load_conversation(state_path)
         recovered_text = fetch_remote_final_text(
@@ -1864,6 +2169,7 @@ def call_compatible(
             prompt,
             timeout,
             project_id,
+            turn_parent_message_id,
         )
         if not recovered_text:
             raise RuntimeError(
@@ -1876,6 +2182,8 @@ def call_compatible(
             f"local_bytes={utf8_len(text)} recovered_bytes={utf8_len(recovered_text)}",
             file=sys.stderr,
         )
+        text = recovered_text
+        transport_recovered_text = recovered_text
         synced_text = recovered_text
     had_transport_corruption = False
     if should_prefer_synced_text(text, synced_text):
@@ -1889,7 +2197,11 @@ def call_compatible(
         embedded_text = ""
         embedded_conversation_data = find_conversation_data_payload(response)
         if embedded_conversation_data is not None:
-            embedded_text = latest_finished_assistant_text_for_prompt_data(embedded_conversation_data, prompt)
+            embedded_text = latest_finished_assistant_text_for_prompt_data(
+                embedded_conversation_data,
+                prompt,
+                turn_parent_message_id,
+            )
         if should_prefer_synced_text(text, embedded_text):
             print(
                 "Advisor response recovered from embedded conversation payload: "
@@ -1906,16 +2218,22 @@ def call_compatible(
                 file=sys.stderr,
             )
             text = deduped_text
-    if disabled and looks_like_tail_fragment(text, prompt) and bool_env_default_true("ADVISOR_AUTO_RETRY_TAIL_FRAGMENT"):
-        print(
+    if disabled and looks_like_tail_fragment(text, prompt):
+        raise RuntimeError(
             "Advisor response looks like a tail fragment while transcript recovery is disabled "
-            f"({', '.join(disabled)}); retrying once with persistent remote sync.",
-            file=sys.stderr,
+            f"({', '.join(disabled)}). Refusing an automatic second turn submission; "
+            "rerun explicitly with persistent remote sync enabled."
         )
-        return call_compatible_with_recovery(prompt, model, timeout, _monitor_active=True)
     if response_needs_remote_recovery(text, prompt, had_transport_corruption=had_transport_corruption):
         if persist and state_path is not None:
-            recovered_text = fetch_remote_final_text(state_path, load_conversation(state_path), prompt, timeout, project_id)
+            recovered_text = fetch_remote_final_text(
+                state_path,
+                load_conversation(state_path),
+                prompt,
+                timeout,
+                project_id,
+                turn_parent_message_id,
+            )
             if recovered_text:
                 print(
                     "Advisor response recovered from final transcript fetch: "
@@ -1937,8 +2255,9 @@ def call_compatible(
             "Retry with normal transcript sync enabled, or refresh the HAR/session if this repeats. "
             + recovery_debug_context(state_path)
         )
-    assert_resolved_model_route(state_path, prompt)
-    assert_pro_model_route(state_path, prompt)
+    assert_resolved_model_route(state_path, prompt, turn_parent_message_id)
+    assert_pro_model_route(state_path, prompt, turn_parent_message_id)
+    record_turn_phase("completed", **journal_fields)
     return text
 
 

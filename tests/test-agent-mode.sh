@@ -19,9 +19,11 @@ PY
 )"
 cleanup() {
   if [[ -n "${PROJECT:-}" && -d "${PROJECT:-}" ]]; then
-    python3 "$SCRIPTS/advisor_agent_connect.py" stop \
-      --project-dir "$PROJECT" \
-      --runtime-root "$PROJECT_ROOT/interrupted-runtime" >/dev/null 2>&1 || true
+    for runtime_dir in "$PROJECT_ROOT/runtime" "$PROJECT_ROOT/interrupted-runtime"; do
+      python3 "$SCRIPTS/advisor_agent_connect.py" stop \
+        --project-dir "$PROJECT" \
+        --runtime-root "$runtime_dir" >/dev/null 2>&1 || true
+    done
   fi
   python3 - "$PROJECT_ROOT" <<'PY'
 import os
@@ -56,22 +58,47 @@ function parseToolMode(mode) {
 }
 EOF
 cat >"$DEVSPACE_FIXTURE/server.js" <<'EOF'
+import { readFileSync } from "node:fs";
+function registerAppTool() {}
 function serverInstructions(config) {
     return "default";
 }
-function tools(config, server, toolNames) {
+function createMcpServer(config, workspaces, toolNames) {
+    const server = {};
+    registerAppTool(server, "open_workspace", {
+        description: "Open a local project directory as a coding workspace. Call this once per project folder or worktree before reading, editing, searching, writing, showing changes, or running commands. Reuse the returned workspaceId for later calls in the same folder; do not call open_workspace again unless switching folders/worktrees, changing checkout/worktree mode, the workspaceId is rejected as unknown, or the user explicitly asks to reopen. By default this opens the actual checkout; set mode=\"worktree\" when the user asks for an isolated or parallel coding session. Returns a workspaceId, loaded root project instructions, and nested instruction file paths the model should read before working in those directories.",
+        inputSchema: {
+            mode: z
+                .enum(["checkout", "worktree"])
+                .optional()
+                .describe("Defaults to checkout. Use checkout to work in the actual directory. Use worktree to create an isolated managed Git worktree for parallel work."),
+            baseRef: z
+                .string()
+                .optional()
+                .describe("Git ref to base a worktree on. Only used with mode=\"worktree\". Defaults to HEAD."),
+        },
+    }, async ({ path, mode, baseRef }) => {
+        const startedAt = performance.now();
+        const { workspace, agentsFiles, availableAgentsFiles } = await workspaces.openWorkspace({ path, mode, baseRef });
+    });
+    registerAppTool(server, toolNames.read, {}, async ({ workspaceId }) => {
+        const workspace = workspaces.getWorkspace(workspaceId);
+    });
     if (config.toolMode !== "codex") {
         registerAppTool(server, toolNames.write, {
     if (config.toolMode === "full") {
         registerAppTool(server, toolNames.grep, {
     if (config.toolMode !== "codex") {
         registerAppTool(server, toolNames.shell, {
+    return server;
 }
 EOF
 python3 "$SCRIPTS/devspace_readonly_patch.py" --executable "$DEVSPACE_FIXTURE/cli.js" >/tmp/devspace-readonly-patch.txt
 python3 "$SCRIPTS/devspace_readonly_patch.py" --check --executable "$DEVSPACE_FIXTURE/cli.js" >/tmp/devspace-readonly-check.txt
 grep -q 'mode === "readonly"' "$DEVSPACE_FIXTURE/config.js"
 grep -q 'config.toolMode !== "readonly"' "$DEVSPACE_FIXTURE/server.js"
+grep -q 'literal("checkout")' "$DEVSPACE_FIXTURE/server.js"
+grep -q 'assertAdvisorReadonlyToolSurface' "$DEVSPACE_FIXTURE/server.js"
 
 PROJECT="$PROJECT_ROOT/project with spaces"
 mkdir -p "$PROJECT"
@@ -109,13 +136,19 @@ cat > "$FAKE_BIN/devspace" <<EOF
 set -euo pipefail
 if [[ "\${1:-}" == "serve" ]]; then
   printf '%s\n' \
+    "HOST=\${HOST:-}" \
     "DEVSPACE_TOOL_MODE=\${DEVSPACE_TOOL_MODE:-}" \
+    "DEVSPACE_READONLY_EXACT_ROOT_FILE=\${DEVSPACE_READONLY_EXACT_ROOT_FILE:-}" \
     "DEVSPACE_SKILLS=\${DEVSPACE_SKILLS:-}" \
+    "DEVSPACE_SKILL_PATHS=\${DEVSPACE_SKILL_PATHS:-}" \
     "DEVSPACE_SUBAGENTS=\${DEVSPACE_SUBAGENTS:-}" \
+    "DEVSPACE_WIDGETS=\${DEVSPACE_WIDGETS:-}" \
     "DEVSPACE_LOG_REQUESTS=\${DEVSPACE_LOG_REQUESTS:-}" \
+    "DEVSPACE_LOG_ASSETS=\${DEVSPACE_LOG_ASSETS:-}" \
     "DEVSPACE_LOG_TOOL_CALLS=\${DEVSPACE_LOG_TOOL_CALLS:-}" \
     "DEVSPACE_LOG_SHELL_COMMANDS=\${DEVSPACE_LOG_SHELL_COMMANDS:-}" \
     "DEVSPACE_TRUST_PROXY=\${DEVSPACE_TRUST_PROXY:-}" \
+    "DEVSPACE_OAUTH_ALLOWED_REDIRECT_HOSTS=\${DEVSPACE_OAUTH_ALLOWED_REDIRECT_HOSTS:-}" \
     > "$FAKE_BIN/devspace-env.txt"
   exec python3 "$FAKE_BIN/fake_devspace_server.py"
 elif [[ "\${1:-}" == "config" && "\${2:-}" == "get" && "\${3:-}" == "publicBaseUrl" ]]; then
@@ -162,7 +195,11 @@ python3 "$SCRIPTS/agent_mode.py" \
 grep -q "Review-only default" /tmp/advisor-agent-handoff.txt
 grep -q "Open exactly one workspace" /tmp/advisor-agent-handoff.txt
 grep -q "Review the architecture." /tmp/advisor-agent-handoff.txt
-grep -q '"mode": "sanitized_copy"' /tmp/advisor-agent-handoff.txt
+grep -q '"mode": "checkout"' /tmp/advisor-agent-handoff.txt
+if grep -q '"mode": "\(sanitized_copy\|worktree\)"' /tmp/advisor-agent-handoff.txt; then
+  echo "Advisor handoff advertised a mode rejected by the read-only connector" >&2
+  exit 1
+fi
 
 PYTHONPATH="$SCRIPTS" python3 - "$PROJECT" "$PROJECT_ROOT" "$FAKE_BIN/devspace" "$OUTSIDE" <<'PY'
 import os
@@ -277,7 +314,25 @@ PY
 
 printf 'TOKEN=abcdefghijklmnopqrstuvwxyz123456\n' > "$PROJECT/.env.local"
 printf 'api_key = "abcdefghijklmnopqrstuvwxyz123456"\n' > "$PROJECT/secret-fixture.py"
+provider_token="ghp_$(printf '%030d' 0)"
+printf 'provider example: %s\n' "$provider_token" > "$PROJECT/provider-token-fixture.txt"
 printf '\0binary-secret-fixture\n' > "$PROJECT/binary-secret-fixture.bin"
+printf 'source collision must not replace generated metadata\n' > "$PROJECT/ADVISOR_SANITIZED_WORKSPACE.md"
+printf '{"source":"collision"}\n' > "$PROJECT/SANITIZED_WORKSPACE_MANIFEST.json"
+mkfifo "$PROJECT/special-source-fifo"
+timeout 5 env PYTHONPATH="$SCRIPTS" python3 - "$PROJECT" <<'PY'
+import sys
+from pathlib import Path
+
+import agent_mode
+
+scan = agent_mode.scan_project_secrets(Path(sys.argv[1]))
+if not any(
+    finding.path == "special-source-fifo" and finding.kind == "special"
+    for finding in scan.findings
+):
+    raise SystemExit("secret preflight did not reject a non-regular source entry")
+PY
 python3 - "$PROJECT/large-secret-fixture.txt" <<'PY'
 import sys
 from pathlib import Path
@@ -291,8 +346,12 @@ python3 "$SCRIPTS/agent_mode.py" \
   --bridge-executable "$FAKE_BIN/devspace" \
   --workspace-root "$WORKSPACES" \
   --task "Review with sanitized copy." >/tmp/advisor-agent-sanitized-handoff.txt
-grep -q '"mode": "sanitized_copy"' /tmp/advisor-agent-sanitized-handoff.txt
-grep -q "sanitized_copy" /tmp/advisor-agent-sanitized-handoff.txt
+grep -q '"mode": "checkout"' /tmp/advisor-agent-sanitized-handoff.txt
+grep -q "generated sanitized snapshot" /tmp/advisor-agent-sanitized-handoff.txt
+if grep -q '"mode": "\(sanitized_copy\|worktree\)"' /tmp/advisor-agent-sanitized-handoff.txt; then
+  echo "Sanitized handoff advertised a mode rejected by the read-only connector" >&2
+  exit 1
+fi
 router_json="$(python3 "$SCRIPTS/router.py" \
   --project-dir "$PROJECT" \
   --json \
@@ -312,6 +371,7 @@ if [[ "$sanitized_used" != "True" ]]; then
   exit 1
 fi
 sanitized_dir="$(printf '%s' "$router_json" | python3 -c 'import json,sys; data=json.load(sys.stdin); print(data["agent_mode"]["sanitized_workspace"]["workspace_dir"])')"
+private_manifest="$(printf '%s' "$router_json" | python3 -c 'import json,sys; data=json.load(sys.stdin); print(data["agent_mode"]["sanitized_workspace"]["private_manifest_path"])')"
 if [[ ! -d "$sanitized_dir" ]]; then
   echo "Expected sanitized workspace directory to exist: $sanitized_dir" >&2
   exit 1
@@ -324,6 +384,11 @@ if grep -q "abcdefghijklmnopqrstuvwxyz123456" "$sanitized_dir/secret-fixture.py"
   echo "Sanitized workspace did not redact a tracked text fixture." >&2
   exit 1
 fi
+if grep -q "$provider_token" "$sanitized_dir/provider-token-fixture.txt"; then
+  echo "Sanitized workspace did not redact a provider-specific token fixture." >&2
+  exit 1
+fi
+grep -q '\[REDACTED_PROVIDER_TOKEN\]' "$sanitized_dir/provider-token-fixture.txt"
 if [[ -e "$sanitized_dir/large-secret-fixture.txt" ]]; then
   echo "Sanitized workspace copied an unscanned oversized text file." >&2
   exit 1
@@ -337,20 +402,73 @@ if [[ -w "$sanitized_dir/README.md" ]]; then
   exit 1
 fi
 grep -q "Advisor Sanitized Workspace" "$sanitized_dir/ADVISOR_SANITIZED_WORKSPACE.md"
+if grep -q "source collision" "$sanitized_dir/ADVISOR_SANITIZED_WORKSPACE.md"; then
+  echo "Source file replaced reserved sanitized workspace metadata" >&2
+  exit 1
+fi
 test -f "$sanitized_dir/SANITIZED_WORKSPACE_MANIFEST.json"
-python3 - "$sanitized_dir/SANITIZED_WORKSPACE_MANIFEST.json" <<'PY'
+test -f "$private_manifest"
+if [[ "$private_manifest" == "$sanitized_dir"/* ]]; then
+  echo "Private sanitization audit was placed inside the MCP-readable snapshot" >&2
+  exit 1
+fi
+if [[ "$(stat -c '%a' "$private_manifest")" != "600" ]]; then
+  echo "Private sanitization audit does not have mode 600" >&2
+  exit 1
+fi
+python3 - "$sanitized_dir/SANITIZED_WORKSPACE_MANIFEST.json" "$private_manifest" <<'PY'
 import json
 import sys
 from pathlib import Path
 
 manifest = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+private = json.loads(Path(sys.argv[2]).read_text(encoding="utf-8"))
+if manifest.get("schema_version") != "2.3" or manifest.get("fingerprint_scope") != "sanitized-output":
+    raise SystemExit("sanitized manifest did not identify its output-only fingerprint scope")
 if manifest.get("redacted_files", 0) < 1:
     raise SystemExit("sanitized manifest did not record redacted source files")
-skipped = "\n".join(manifest.get("skipped_paths") or [])
-for expected in ("large-secret-fixture.txt", "binary-secret-fixture.bin"):
+for private_key in ("skipped_samples", "skipped_paths", "redacted_paths"):
+    if private_key in manifest:
+        raise SystemExit(f"public sanitized manifest exposed private path detail: {private_key}")
+source_git = manifest.get("source_git") or {}
+if not source_git.get("available") or not source_git.get("head_commit") or not source_git.get("head_tree"):
+    raise SystemExit("sanitized manifest did not record source Git provenance")
+if source_git.get("dirty") is not True:
+    raise SystemExit("sanitized manifest did not record the dirty source checkout")
+skipped = "\n".join(private.get("skipped_paths") or [])
+for expected in (
+    "large-secret-fixture.txt",
+    "binary-secret-fixture.bin",
+    "ADVISOR_SANITIZED_WORKSPACE.md",
+    "SANITIZED_WORKSPACE_MANIFEST.json",
+    "special-source-fifo",
+):
     if expected not in skipped:
-        raise SystemExit(f"sanitized manifest did not record the omission for {expected}")
+        raise SystemExit(f"private sanitization audit did not record the omission for {expected}")
+public_text = Path(sys.argv[1]).read_text(encoding="utf-8")
+marker_text = Path(sys.argv[1]).with_name("ADVISOR_SANITIZED_WORKSPACE.md").read_text(encoding="utf-8")
+for private_name in ("large-secret-fixture.txt", "binary-secret-fixture.bin", "secret-fixture.py"):
+    if private_name in public_text or private_name in marker_text:
+        raise SystemExit(f"public snapshot metadata exposed an omitted or redacted path: {private_name}")
 PY
+
+# Changing only bytes that redact to the same output must not expose a new
+# source-derived generation fingerprint.
+printf 'api_key = "zyxwvutsrqponmlkjihgfedcba654321"\n' > "$PROJECT/secret-fixture.py"
+redacted_reuse_json="$(python3 "$SCRIPTS/agent_mode.py" \
+  --doctor \
+  --json \
+  --project-dir "$PROJECT" \
+  --allowed-root "$PROJECT_ROOT" \
+  --bridge-executable "$FAKE_BIN/devspace" \
+  --workspace-root "$WORKSPACES")"
+redacted_reuse_dir="$(printf '%s' "$redacted_reuse_json" | python3 -c 'import json,sys; print(json.load(sys.stdin)["agent_mode"]["sanitized_workspace"]["workspace_dir"])')"
+redacted_reused="$(printf '%s' "$redacted_reuse_json" | python3 -c 'import json,sys; print(json.load(sys.stdin)["agent_mode"]["sanitized_workspace"]["reused"])')"
+if [[ "$redacted_reuse_dir" != "$sanitized_dir" || "$redacted_reused" != "True" ]]; then
+  echo "Redacted source bytes changed the public sanitized-output fingerprint" >&2
+  exit 1
+fi
+printf 'api_key = "abcdefghijklmnopqrstuvwxyz123456"\n' > "$PROJECT/secret-fixture.py"
 
 PYTHONPATH="$SCRIPTS" python3 - "$PROJECT" "$PROJECT_ROOT" "$FAKE_BIN/devspace" "$WORKSPACES" <<'PY'
 import json
@@ -398,6 +516,126 @@ if len(paths) != 1:
     raise SystemExit(f"concurrent callers selected different workspace generations: {paths}")
 if not any(payload["agent_mode"]["sanitized_workspace"]["reused"] for payload in payloads):
     raise SystemExit("expected at least one concurrent caller to reuse the published generation")
+
+workspace = Path(next(iter(paths)))
+readme = workspace / "README.md"
+readme.chmod(0o600)
+readme.write_text("tampered\n", encoding="utf-8")
+rebuilt = run()
+if rebuilt.returncode != 0:
+    raise SystemExit("tampered sanitized generation was not rebuilt:\n" + rebuilt.stderr)
+rebuilt_payload = json.loads(rebuilt.stdout)
+if rebuilt_payload["agent_mode"]["sanitized_workspace"]["reused"]:
+    raise SystemExit("tampered sanitized generation was incorrectly reused")
+if readme.read_text(encoding="utf-8") != "safe\n" or readme.stat().st_mode & 0o222:
+    raise SystemExit("sanitized generation rebuild did not restore verified read-only content")
+
+readme.chmod(0o440)
+rebuilt = run()
+if rebuilt.returncode != 0:
+    raise SystemExit("mode-tampered sanitized file was not rebuilt:\n" + rebuilt.stderr)
+rebuilt_payload = json.loads(rebuilt.stdout)
+if rebuilt_payload["agent_mode"]["sanitized_workspace"]["reused"]:
+    raise SystemExit("sanitized generation with a non-canonical file mode was reused")
+workspace = Path(rebuilt_payload["agent_mode"]["sanitized_workspace"]["workspace_dir"])
+readme = workspace / "README.md"
+if readme.stat().st_mode & 0o777 != 0o400:
+    raise SystemExit("sanitized rebuild did not restore the exact non-executable file mode")
+
+executable = workspace / "devspace"
+if executable.exists():
+    executable.chmod(0o400)
+    rebuilt = run()
+    if rebuilt.returncode != 0:
+        raise SystemExit("mode-tampered sanitized executable was not rebuilt:\n" + rebuilt.stderr)
+    rebuilt_payload = json.loads(rebuilt.stdout)
+    if rebuilt_payload["agent_mode"]["sanitized_workspace"]["reused"]:
+        raise SystemExit("sanitized generation lost an executable bit without rebuilding")
+    workspace = Path(rebuilt_payload["agent_mode"]["sanitized_workspace"]["workspace_dir"])
+    if (workspace / "devspace").stat().st_mode & 0o777 != 0o500:
+        raise SystemExit("sanitized rebuild did not restore the exact executable file mode")
+
+workspace.chmod(0o550)
+rebuilt = run()
+if rebuilt.returncode != 0:
+    raise SystemExit("mode-tampered sanitized directory was not rebuilt:\n" + rebuilt.stderr)
+rebuilt_payload = json.loads(rebuilt.stdout)
+if rebuilt_payload["agent_mode"]["sanitized_workspace"]["reused"]:
+    raise SystemExit("sanitized generation with a non-canonical directory mode was reused")
+workspace = Path(rebuilt_payload["agent_mode"]["sanitized_workspace"]["workspace_dir"])
+if workspace.stat().st_mode & 0o777 != 0o500:
+    raise SystemExit("sanitized rebuild did not restore the exact directory mode")
+
+marker = workspace / "ADVISOR_SANITIZED_WORKSPACE.md"
+marker.chmod(0o600)
+marker.write_text("tampered metadata\n", encoding="utf-8")
+marker.chmod(0o400)
+rebuilt = run()
+if rebuilt.returncode != 0:
+    raise SystemExit("tampered sanitized metadata was not rebuilt:\n" + rebuilt.stderr)
+rebuilt_payload = json.loads(rebuilt.stdout)
+if rebuilt_payload["agent_mode"]["sanitized_workspace"]["reused"]:
+    raise SystemExit("tampered sanitized metadata was incorrectly reused")
+if "# Advisor Sanitized Workspace" not in marker.read_text(encoding="utf-8"):
+    raise SystemExit("sanitized metadata rebuild did not restore the generated marker")
+
+# A source change while a caller waits for the generation lock must be reflected
+# in the selected generation. Planning before the lock would incorrectly reuse
+# the old snapshot here.
+lock_path = workspaces / agent_mode.sanitized_workspace_slug(project) / ".workspace.lock"
+generation_lock = agent_mode.concurrency.InterProcessLock(lock_path, timeout=5)
+generation_lock.acquire()
+waiting = subprocess.Popen(command, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+try:
+    import time
+
+    time.sleep(1.3)
+    (project / "README.md").write_text("changed while waiting\n", encoding="utf-8")
+finally:
+    generation_lock.release()
+stdout, stderr = waiting.communicate(timeout=30)
+if waiting.returncode != 0:
+    raise SystemExit("lock-wait snapshot generation failed:\n" + stderr)
+wait_payload = json.loads(stdout)
+wait_workspace = Path(wait_payload["agent_mode"]["sanitized_workspace"]["workspace_dir"])
+if (wait_workspace / "README.md").read_text(encoding="utf-8") != "changed while waiting\n":
+    raise SystemExit("snapshot reused a source plan captured before the generation lock")
+(project / "README.md").write_text("safe\n", encoding="utf-8")
+
+# Cleanup must unlink a hostile symlink without chmod-following its target.
+restored = run()
+if restored.returncode != 0:
+    raise SystemExit("could not restore the baseline sanitized generation:\n" + restored.stderr)
+cleanup_workspace = Path(json.loads(restored.stdout)["agent_mode"]["sanitized_workspace"]["workspace_dir"])
+outside_target = workspaces.parent / "cleanup-target.txt"
+outside_target.write_text("outside-safe\n", encoding="utf-8")
+outside_target.chmod(0o400)
+target_mode = outside_target.stat().st_mode
+cleanup_workspace.chmod(0o700)
+(cleanup_workspace / "tampered-link").symlink_to(outside_target)
+rebuilt = run()
+if rebuilt.returncode != 0:
+    raise SystemExit("symlink-tampered sanitized generation was not rebuilt:\n" + rebuilt.stderr)
+if outside_target.read_text(encoding="utf-8") != "outside-safe\n":
+    raise SystemExit("sanitized cleanup modified a symlink target")
+if outside_target.stat().st_mode != target_mode:
+    raise SystemExit("sanitized cleanup chmod-followed a symlink target")
+rebuilt_workspace = Path(json.loads(rebuilt.stdout)["agent_mode"]["sanitized_workspace"]["workspace_dir"])
+if (rebuilt_workspace / "tampered-link").exists() or (rebuilt_workspace / "tampered-link").is_symlink():
+    raise SystemExit("sanitized cleanup retained a hostile symlink")
+
+root_target = workspaces.parent / "workspace-root-symlink-target"
+root_target.mkdir()
+(root_target / "sentinel.txt").write_text("do-not-touch\n", encoding="utf-8")
+agent_mode.remove_generated_tree(rebuilt_workspace)
+rebuilt_workspace.symlink_to(root_target, target_is_directory=True)
+rebuilt = run()
+if rebuilt.returncode != 0:
+    raise SystemExit("symlinked generation root was not replaced safely:\n" + rebuilt.stderr)
+if (root_target / "sentinel.txt").read_text(encoding="utf-8") != "do-not-touch\n":
+    raise SystemExit("generation cleanup followed a root symlink")
+if Path(json.loads(rebuilt.stdout)["agent_mode"]["sanitized_workspace"]["workspace_dir"]).is_symlink():
+    raise SystemExit("sanitized generation remained a root symlink")
 PY
 
 PYTHONPATH="$SCRIPTS" python3 - <<'PY'
@@ -565,7 +803,17 @@ if python3 "$SCRIPTS/advisor_agent_connect.py" \
 fi
 grep -q "must use https" /tmp/advisor-agent-connect-bad-url.txt
 
-PORT="$FAKE_PORT" python3 "$SCRIPTS/advisor_agent_connect.py" \
+PORT="$FAKE_PORT" \
+DEVSPACE_SKILLS=true \
+DEVSPACE_SKILL_PATHS=/tmp/unsafe \
+DEVSPACE_SUBAGENTS=true \
+DEVSPACE_WIDGETS=full \
+DEVSPACE_LOG_REQUESTS=true \
+DEVSPACE_LOG_ASSETS=true \
+DEVSPACE_LOG_SHELL_COMMANDS=true \
+DEVSPACE_TRUST_PROXY=true \
+DEVSPACE_OAUTH_ALLOWED_REDIRECT_HOSTS=evil.example \
+python3 "$SCRIPTS/advisor_agent_connect.py" \
   serve \
   --project-dir "$PROJECT" \
   --allowed-root "$PROJECT" \
@@ -626,7 +874,17 @@ if data.get("lifecycle_state") != "stopped" or data.get("tunnel_running"):
     raise SystemExit(f"interrupted connector was not recovered cleanly: {data}")
 PY
 
-PORT="$FAKE_PORT" python3 "$SCRIPTS/advisor_agent_connect.py" \
+PORT="$FAKE_PORT" \
+DEVSPACE_SKILLS=true \
+DEVSPACE_SKILL_PATHS=/tmp/unsafe \
+DEVSPACE_SUBAGENTS=true \
+DEVSPACE_WIDGETS=full \
+DEVSPACE_LOG_REQUESTS=true \
+DEVSPACE_LOG_ASSETS=true \
+DEVSPACE_LOG_SHELL_COMMANDS=true \
+DEVSPACE_TRUST_PROXY=true \
+DEVSPACE_OAUTH_ALLOWED_REDIRECT_HOSTS=evil.example \
+python3 "$SCRIPTS/advisor_agent_connect.py" \
   serve \
   --project-dir "$PROJECT" \
   --allowed-root "$PROJECT" \
@@ -645,13 +903,19 @@ grep -q "tunnel_pid:" /tmp/advisor-agent-connect-serve.txt
 grep -q "connector_ready: yes" /tmp/advisor-agent-connect-serve.txt
 grep -q "chatgpt_attachment_verified: no" /tmp/advisor-agent-connect-serve.txt
 grep -q "agent_mode_ready: no" /tmp/advisor-agent-connect-serve.txt
+grep -q '^HOST=127.0.0.1$' "$FAKE_BIN/devspace-env.txt"
 grep -q '^DEVSPACE_TOOL_MODE=readonly$' "$FAKE_BIN/devspace-env.txt"
+grep -Eq '^DEVSPACE_READONLY_EXACT_ROOT_FILE=.+readonly-exact-root.txt$' "$FAKE_BIN/devspace-env.txt"
 grep -q '^DEVSPACE_SKILLS=false$' "$FAKE_BIN/devspace-env.txt"
+grep -q '^DEVSPACE_SKILL_PATHS=$' "$FAKE_BIN/devspace-env.txt"
 grep -q '^DEVSPACE_SUBAGENTS=false$' "$FAKE_BIN/devspace-env.txt"
+grep -q '^DEVSPACE_WIDGETS=off$' "$FAKE_BIN/devspace-env.txt"
 grep -q '^DEVSPACE_LOG_REQUESTS=false$' "$FAKE_BIN/devspace-env.txt"
+grep -q '^DEVSPACE_LOG_ASSETS=false$' "$FAKE_BIN/devspace-env.txt"
 grep -q '^DEVSPACE_LOG_TOOL_CALLS=true$' "$FAKE_BIN/devspace-env.txt"
 grep -q '^DEVSPACE_LOG_SHELL_COMMANDS=false$' "$FAKE_BIN/devspace-env.txt"
 grep -q '^DEVSPACE_TRUST_PROXY=false$' "$FAKE_BIN/devspace-env.txt"
+grep -q '^DEVSPACE_OAUTH_ALLOWED_REDIRECT_HOSTS=chatgpt.com,localhost,127.0.0.1$' "$FAKE_BIN/devspace-env.txt"
 
 python3 "$SCRIPTS/advisor_agent_connect.py" \
   status \
@@ -661,6 +925,7 @@ python3 "$SCRIPTS/advisor_agent_connect.py" \
 python3 - <<'PY' /tmp/advisor-agent-connect-status.json
 import json
 import sys
+from pathlib import Path
 data = json.load(open(sys.argv[1], encoding="utf-8"))
 if data.get("mcp_url") != "https://fake-devspace.trycloudflare.com/mcp":
     raise SystemExit("wrong mcp_url in status")
@@ -670,10 +935,15 @@ if data.get("agent_mode_ready") or data.get("chatgpt_attachment_verified"):
     raise SystemExit("fresh local connector incorrectly claimed a verified ChatGPT attachment")
 if not data.get("readonly_tool_mode") or data.get("tool_mode") != "readonly":
     raise SystemExit("connector readiness did not require the read-only DevSpace tool mode")
+pointer = Path(data["readonly_exact_root_file"])
+if not data.get("readonly_exact_root_ready") or pointer.read_text(encoding="utf-8").strip() != str(Path(data["agent_workspace"]).resolve()):
+    raise SystemExit("connector did not pin its exact current review snapshot")
 PY
 
 ADVISOR_AGENT_RUNTIME_ROOT="$PROJECT_ROOT/runtime" \
 ADVISOR_AGENT_SKIP_PUBLIC_PROBE=true \
+ADVISOR_AGENT_CONFIG="$CONFIG" \
+ADVISOR_AGENT_WORKSPACE_ROOT="$WORKSPACES" \
 PYTHONPATH="$SCRIPTS" \
 python3 - "$PROJECT" <<'PY'
 import os
@@ -692,6 +962,24 @@ state = advisor_agent_connect.connector_runtime_status(
 )
 if state.get("agent_mode_ready") or state.get("chatgpt_attachment_verified"):
     raise SystemExit("fresh connector incorrectly started as ChatGPT-attachment verified")
+old_workspace = Path(state["agent_workspace"]).resolve()
+(project / "README.md").write_text("pin rotation\n", encoding="utf-8")
+workspace, agent_status = advisor_agent.refresh_agent_workspace(project)
+if workspace == old_workspace:
+    raise SystemExit("source change did not create a new sanitized review generation")
+sanitized = agent_status.get("sanitized_workspace") or {}
+state = advisor_agent_connect.pin_connector_workspace(
+    project,
+    state,
+    workspace,
+    generation=str(sanitized.get("generation_id") or ""),
+    fingerprint=str(sanitized.get("source_fingerprint") or ""),
+)
+if not state.get("readonly_exact_root_ready"):
+    raise SystemExit("refreshed sanitized generation was not pinned as the exact connector root")
+pointer = Path(state["readonly_exact_root_file"])
+if pointer.read_text(encoding="utf-8").strip() != str(workspace):
+    raise SystemExit("exact connector root pointer did not rotate to the refreshed generation")
 if not advisor_agent.mark_chatgpt_attachment_verified(project, state):
     raise SystemExit("verified MCP evidence did not mark the unchanged connector")
 verified = advisor_agent_connect.connector_runtime_status(

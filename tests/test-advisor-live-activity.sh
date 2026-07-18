@@ -178,7 +178,6 @@ with patched_env(
     ADVISOR_PERSIST_CONVERSATION="false",
     ADVISOR_TEMPORARY="true",
     ADVISOR_SYNC_REMOTE="false",
-    ADVISOR_AUTO_RETRY_TAIL_FRAGMENT="false",
     ADVISOR_VALIDATE_MODEL="false",
 ):
     with patched(

@@ -18,6 +18,5 @@ export ADVISOR_AUTO_CREATE_PROJECT="false"
 export ADVISOR_PERSIST_CONVERSATION="false"
 export ADVISOR_TEMPORARY="true"
 export ADVISOR_SYNC_REMOTE="false"
-export ADVISOR_AUTO_RETRY_TAIL_FRAGMENT="false"
 
 python3 "$ADVISOR" --prompt "Smoke test. Reply with ADVISOR_SETUP_OK and one short sentence."

@@ -74,8 +74,28 @@ def state_paths(project: Path, root: Path) -> dict[str, Path]:
         "state": project_dir / "state.json",
         "log": project_dir / "devspace.log",
         "tunnel_log": project_dir / "cloudflared.log",
+        "exact_root": project_dir / "readonly-exact-root.txt",
         "lock": project_dir / "lifecycle.lock",
     }
+
+
+def write_exact_root(path: Path, workspace: Path) -> None:
+    resolved = workspace.expanduser().resolve()
+    if not resolved.is_dir():
+        raise RuntimeError("The pinned advisor workspace does not exist.")
+    safety.atomic_write_text(path, str(resolved) + "\n")
+    try:
+        os.chmod(path, 0o600)
+    except OSError:
+        pass
+
+
+def exact_root_matches(path: Path, workspace: Path) -> bool:
+    try:
+        recorded = Path(path.read_text(encoding="utf-8").strip()).expanduser().resolve()
+        return recorded == workspace.expanduser().resolve() and recorded.is_dir()
+    except (OSError, ValueError):
+        return False
 
 
 def path_is_sensitive_for_display(path: Path) -> bool:
@@ -171,9 +191,9 @@ def read_devspace_runtime(bridge_path: str, cwd: Path) -> dict[str, Any]:
             parsed = {}
         if isinstance(parsed, dict):
             config = parsed
-    host = str(os.environ.get("HOST") or config.get("host") or "127.0.0.1").strip()
-    if host in {"0.0.0.0", "::"}:
-        host = "127.0.0.1"
+    # The public Cloudflare endpoint is the only intended remote surface.
+    # Ignore inherited/configured listener hosts and keep DevSpace on loopback.
+    host = "127.0.0.1"
     try:
         port = int(os.environ.get("PORT") or config.get("port") or 7676)
     except (TypeError, ValueError) as exc:
@@ -203,7 +223,12 @@ def probe_mcp_url(url: str, *, timeout: float = 5.0) -> dict[str, Any]:
         headers={"Accept": "application/json, text/event-stream"},
     )
     try:
-        with urlopen(request, timeout=timeout) as response:
+        response = (
+            concurrency.open_loopback_url(request, timeout=timeout)
+            if concurrency.loopback_url_candidate(url)
+            else urlopen(request, timeout=timeout)
+        )
+        with response:
             result["status"] = int(getattr(response, "status", 0) or 0)
             challenge = str(response.headers.get("WWW-Authenticate") or "")
             result["oauth_challenge"] = "bearer" in challenge.lower()
@@ -213,7 +238,7 @@ def probe_mcp_url(url: str, *, timeout: float = 5.0) -> dict[str, Any]:
         result["oauth_challenge"] = "bearer" in challenge.lower()
         if exc.code != 401:
             result["error"] = f"HTTP {exc.code}"
-    except (URLError, OSError, TimeoutError) as exc:
+    except (URLError, OSError, RuntimeError, TimeoutError) as exc:
         reason = getattr(exc, "reason", exc)
         result["error"] = safety.truncate(safety.redact_sensitive_text(str(reason)), 240)
         return result
@@ -531,6 +556,7 @@ def start_devspace_process(
     base_url: str,
     runtime: dict[str, Any],
     log_path: Path,
+    exact_root_path: Path,
 ) -> subprocess.Popen[Any]:
     command = command_for_devspace(args, status)
     if not args.allow_unpatched_devspace:
@@ -541,12 +567,17 @@ def start_devspace_process(
     env["HOST"] = str(runtime["host"])
     env["PORT"] = str(runtime["port"])
     env["DEVSPACE_TOOL_MODE"] = "readonly"
-    env.setdefault("DEVSPACE_SKILLS", "false")
-    env.setdefault("DEVSPACE_SUBAGENTS", "false")
-    env.setdefault("DEVSPACE_LOG_REQUESTS", "false")
-    env.setdefault("DEVSPACE_LOG_TOOL_CALLS", "true")
-    env.setdefault("DEVSPACE_LOG_SHELL_COMMANDS", "false")
-    env.setdefault("DEVSPACE_TRUST_PROXY", "false")
+    env["DEVSPACE_READONLY_EXACT_ROOT_FILE"] = str(exact_root_path)
+    env["DEVSPACE_SKILLS"] = "false"
+    env["DEVSPACE_SKILL_PATHS"] = ""
+    env["DEVSPACE_SUBAGENTS"] = "false"
+    env["DEVSPACE_WIDGETS"] = "off"
+    env["DEVSPACE_LOG_REQUESTS"] = "false"
+    env["DEVSPACE_LOG_ASSETS"] = "false"
+    env["DEVSPACE_LOG_TOOL_CALLS"] = "true"
+    env["DEVSPACE_LOG_SHELL_COMMANDS"] = "false"
+    env["DEVSPACE_TRUST_PROXY"] = "false"
+    env["DEVSPACE_OAUTH_ALLOWED_REDIRECT_HOSTS"] = "chatgpt.com,localhost,127.0.0.1"
     return start_logged_process(
         command,
         cwd=Path(status.project_dir),
@@ -594,6 +625,13 @@ def connector_runtime_status(
     tunnel_available = tunnel_running if tunnel_managed else True
     workspace = Path(str(state.get("agent_workspace") or ""))
     workspace_exists = workspace.is_dir() if str(workspace) not in {"", "."} else False
+    exact_root_path = Path(str(state.get("readonly_exact_root_file") or paths["exact_root"])).expanduser().resolve()
+    expected_exact_root_path = paths["exact_root"].resolve()
+    exact_root_ready = bool(
+        workspace_exists
+        and exact_root_path == expected_exact_root_path
+        and exact_root_matches(exact_root_path, workspace)
+    )
     local_url = str(state.get("local_mcp_url") or "")
     public_url = str(state.get("mcp_url") or "")
     readonly_tool_mode = state.get("tool_mode") == "readonly"
@@ -614,6 +652,7 @@ def connector_runtime_status(
         devspace_running
         and tunnel_available
         and workspace_exists
+        and exact_root_ready
         and readonly_tool_mode
         and local_probe.get("ready")
         and public_probe.get("ready")
@@ -635,6 +674,7 @@ def connector_runtime_status(
         "tunnel_running": tunnel_running,
         "tunnel_available": tunnel_available,
         "workspace_exists": workspace_exists,
+        "readonly_exact_root_ready": exact_root_ready,
         "readonly_tool_mode": readonly_tool_mode,
         "chatgpt_attachment_verified": chatgpt_attachment_verified,
         "local_probe": local_probe,
@@ -645,6 +685,50 @@ def connector_runtime_status(
         "checked_utc": utc_now(),
     }
     return result
+
+
+def pin_connector_workspace(
+    project: Path,
+    expected_state: dict[str, Any],
+    workspace: Path,
+    *,
+    generation: str = "",
+    fingerprint: str = "",
+) -> dict[str, Any]:
+    """Atomically move a live read-only connector to one verified snapshot."""
+    root = runtime_root()
+    paths = state_paths(project, root)
+    stable_fields = (
+        "started_utc",
+        "devspace_pid",
+        "devspace_process_identity",
+        "tunnel_pid",
+        "tunnel_process_identity",
+        "mcp_url",
+        "allowed_root",
+        "readonly_exact_root_file",
+        "tool_mode",
+    )
+    workspace = workspace.expanduser().resolve()
+    with concurrency.InterProcessLock(paths["lock"], timeout=30.0):
+        current = read_state(paths["state"])
+        if not current or any(current.get(key) != expected_state.get(key) for key in stable_fields):
+            raise RuntimeError("The DevSpace connector changed before its review snapshot could be pinned.")
+        allowed_root = Path(str(current.get("allowed_root") or "")).expanduser().resolve()
+        if not agent_mode.path_is_same_or_child(workspace, allowed_root):
+            raise RuntimeError("The refreshed review snapshot is outside the connector's generated workspace root.")
+        write_exact_root(paths["exact_root"], workspace)
+        current.update(
+            {
+                "agent_workspace": str(workspace),
+                "readonly_exact_root_file": str(paths["exact_root"]),
+                "workspace_generation": generation,
+                "workspace_fingerprint": fingerprint,
+                "updated_utc": utc_now(),
+            }
+        )
+        safety.atomic_write_json(paths["state"], current)
+    return connector_runtime_status(project, root=root, skip_public_probe=True)
 
 
 def print_connect_summary(
@@ -746,6 +830,30 @@ def command_serve(args: argparse.Namespace) -> int:
             and existing_covers_workspace
             and not args.force
         ):
+            write_exact_root(paths["exact_root"], latest_workspace)
+            existing.update(
+                {
+                    "agent_workspace": str(latest_workspace),
+                    "readonly_exact_root_file": str(paths["exact_root"]),
+                    "workspace_generation": (
+                        status.sanitized_workspace.generation_id
+                        if status.sanitized_workspace and status.sanitized_workspace.used
+                        else ""
+                    ),
+                    "workspace_fingerprint": (
+                        status.sanitized_workspace.source_fingerprint
+                        if status.sanitized_workspace and status.sanitized_workspace.used
+                        else ""
+                    ),
+                    "updated_utc": utc_now(),
+                }
+            )
+            safety.atomic_write_json(paths["state"], existing)
+            existing = connector_runtime_status(
+                resolve_project(args.project_dir),
+                root=runtime_root(args.runtime_root),
+                skip_public_probe=args.skip_public_probe,
+            )
             handoff = status_to_handoff(status, args.task or "")
             print_connect_summary(
                 setup=setup,
@@ -772,6 +880,7 @@ def command_serve(args: argparse.Namespace) -> int:
         tunnel_proc: subprocess.Popen[Any] | None = None
         devspace_proc: subprocess.Popen[Any] | None = None
         attempt_started_utc = utc_now()
+        write_exact_root(paths["exact_root"], Path(status.project_dir))
 
         def persist_lifecycle(
             lifecycle_state: str,
@@ -805,6 +914,7 @@ def command_serve(args: argparse.Namespace) -> int:
                     if status.sanitized_workspace and status.sanitized_workspace.used
                     else ""
                 ),
+                "readonly_exact_root_file": str(paths["exact_root"]),
                 "tool_mode": "readonly",
                 "chatgpt_attachment_verified": False,
                 "agent_mode_ready": False,
@@ -847,12 +957,17 @@ def command_serve(args: argparse.Namespace) -> int:
             env["HOST"] = str(runtime["host"])
             env["PORT"] = str(runtime["port"])
             env["DEVSPACE_TOOL_MODE"] = "readonly"
-            env.setdefault("DEVSPACE_SKILLS", "false")
-            env.setdefault("DEVSPACE_SUBAGENTS", "false")
-            env.setdefault("DEVSPACE_LOG_REQUESTS", "false")
-            env.setdefault("DEVSPACE_LOG_TOOL_CALLS", "true")
-            env.setdefault("DEVSPACE_LOG_SHELL_COMMANDS", "false")
-            env.setdefault("DEVSPACE_TRUST_PROXY", "false")
+            env["DEVSPACE_READONLY_EXACT_ROOT_FILE"] = str(paths["exact_root"])
+            env["DEVSPACE_SKILLS"] = "false"
+            env["DEVSPACE_SKILL_PATHS"] = ""
+            env["DEVSPACE_SUBAGENTS"] = "false"
+            env["DEVSPACE_WIDGETS"] = "off"
+            env["DEVSPACE_LOG_REQUESTS"] = "false"
+            env["DEVSPACE_LOG_ASSETS"] = "false"
+            env["DEVSPACE_LOG_TOOL_CALLS"] = "true"
+            env["DEVSPACE_LOG_SHELL_COMMANDS"] = "false"
+            env["DEVSPACE_TRUST_PROXY"] = "false"
+            env["DEVSPACE_OAUTH_ALLOWED_REDIRECT_HOSTS"] = "chatgpt.com,localhost,127.0.0.1"
             print(f"chatgpt_connector_url: {mcp_url}")
             print("Starting DevSpace in foreground. Press Ctrl-C to stop it.", file=sys.stderr)
             os.execvpe(command[0], command, env)
@@ -864,6 +979,7 @@ def command_serve(args: argparse.Namespace) -> int:
                 base_url=selected_base,
                 runtime=runtime,
                 log_path=paths["log"],
+                exact_root_path=paths["exact_root"],
             )
             try:
                 persist_lifecycle(

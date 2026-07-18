@@ -35,12 +35,6 @@ REQUIRED_EXECUTABLES=(
   "$ROOT/tests/test-security-regressions.sh"
   "$ROOT/tests/test-agent-mode.sh"
   "$ROOT/tests/test-agent-conclave.sh"
-  "$ROOT/codex-skill/external-advisor/scripts/agent_mode.py"
-  "$ROOT/codex-skill/external-advisor/scripts/advisor_agent.py"
-  "$ROOT/codex-skill/external-advisor/scripts/agent_conclave.py"
-  "$ROOT/codex-skill/external-advisor/scripts/advisor_agent_setup.py"
-  "$ROOT/codex-skill/external-advisor/scripts/advisor_agent_connect.py"
-  "$ROOT/codex-skill/external-advisor/scripts/devspace_readonly_patch.py"
 )
 REQUIRED_CORE_FILES=(
   "$PATCH"
@@ -52,6 +46,11 @@ REQUIRED_CORE_FILES=(
   "$ROOT/codex-skill/external-advisor/scripts/advisor_concurrency.py"
   "$ROOT/codex-skill/external-advisor/scripts/advisor_safety.py"
   "$ROOT/codex-skill/external-advisor/scripts/agent_mode.py"
+  "$ROOT/codex-skill/external-advisor/scripts/advisor_agent.py"
+  "$ROOT/codex-skill/external-advisor/scripts/agent_conclave.py"
+  "$ROOT/codex-skill/external-advisor/scripts/advisor_agent_setup.py"
+  "$ROOT/codex-skill/external-advisor/scripts/advisor_agent_connect.py"
+  "$ROOT/codex-skill/external-advisor/scripts/devspace_readonly_patch.py"
   "$ROOT/codex-skill/external-advisor/scripts/conclave.py"
   "$ROOT/codex-skill/external-advisor/scripts/context_pack.py"
   "$ROOT/codex-skill/external-advisor/scripts/critique_final.py"
@@ -159,7 +158,6 @@ mkdir -p -m 700 "$G4F/har_and_cookies"
 chmod 700 "$G4F/har_and_cookies"
 
 chmod +x "${REQUIRED_EXECUTABLES[@]}"
-chmod +x "$ROOT"/codex-skill/external-advisor/scripts/*.py
 
 installed_devspace_version=""
 if command -v devspace >/dev/null 2>&1; then

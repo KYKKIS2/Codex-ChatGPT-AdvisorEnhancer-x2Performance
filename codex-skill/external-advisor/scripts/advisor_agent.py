@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 from collections import Counter
+import fnmatch
 import json
 import os
 import re
@@ -16,6 +17,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlencode
 
 import activity_monitor
 import advisor_agent_connect
@@ -38,10 +40,12 @@ class ToolEvidence:
     total: int
     sequence: list[str]
     successful: list[str]
+    result_only_successful: list[str]
     failed: list[str]
     disallowed: list[str]
     attempted_open_workspace_count: int
     open_workspace_count: int
+    failed_open_workspace_count: int
     inspection_count: int
     wrong_workspace_open_count: int
     inspection_before_open_count: int
@@ -53,10 +57,12 @@ class ToolEvidence:
             "total": self.total,
             "sequence": self.sequence,
             "successful": self.successful,
+            "result_only_successful": self.result_only_successful,
             "failed": self.failed,
             "disallowed": self.disallowed,
             "attempted_open_workspace_count": self.attempted_open_workspace_count,
             "open_workspace_count": self.open_workspace_count,
+            "failed_open_workspace_count": self.failed_open_workspace_count,
             "inspection_count": self.inspection_count,
             "wrong_workspace_open_count": self.wrong_workspace_open_count,
             "inspection_before_open_count": self.inspection_before_open_count,
@@ -99,6 +105,47 @@ def private_run_dir(project: Path, role: str) -> Path:
     return run_dir
 
 
+def validated_run_dir(project: Path, raw: Path, *, create: bool) -> Path:
+    root = (project / ".codex-advisor").resolve()
+    path = raw.expanduser().resolve()
+    try:
+        relative = path.relative_to(root)
+    except ValueError as exc:
+        raise RuntimeError("Advisor agent run directories must stay under the project's .codex-advisor directory.") from exc
+    if not relative.parts:
+        raise RuntimeError("The project .codex-advisor root cannot be used as an agent run directory.")
+    if create:
+        safety.ensure_private_dir(path)
+    elif not path.is_dir():
+        raise RuntimeError("The requested advisor agent run directory does not exist.")
+    return path
+
+
+def read_json_object(path: Path) -> dict[str, Any]:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def journal_proves_submission(journal: dict[str, Any]) -> bool:
+    return str(journal.get("phase") or "") in {
+        "submission-started",
+        "submission-outcome-unknown",
+        "response-received",
+        "conversation-persisted",
+        "completed",
+    }
+
+
+def validate_recovery_marker(value: str | None) -> str:
+    marker = value or f"ADVISOR-AGENT-{uuid.uuid4().hex.upper()}-COMPLETE"
+    if not re.fullmatch(r"[A-Za-z0-9_-]{16,160}", marker):
+        raise RuntimeError("The advisor recovery marker must be 16-160 ASCII letters, digits, underscores, or hyphens.")
+    return marker
+
+
 def connector_status(project: Path) -> dict[str, Any]:
     root = advisor_agent_connect.runtime_root()
     return advisor_agent_connect.connector_runtime_status(project, root=root)
@@ -117,6 +164,7 @@ def mark_chatgpt_attachment_verified(project: Path, expected_state: dict[str, An
         "mcp_url",
         "agent_workspace",
         "allowed_root",
+        "readonly_exact_root_file",
     )
     with concurrency.InterProcessLock(paths["lock"], timeout=30.0):
         current = advisor_agent_connect.read_state(paths["state"])
@@ -195,18 +243,20 @@ def read_tool_records(log_path: Path) -> list[dict[str, Any]]:
             continue
         tool = record.get("tool")
         success = record.get("success")
-        if not isinstance(tool, str) or tool not in SAFE_TOOL_NAMES or not isinstance(success, bool):
+        if not isinstance(tool, str) or not tool.strip() or not isinstance(success, bool):
             continue
+        normalized_tool = tool if tool in SAFE_TOOL_NAMES else "unknown"
         workspace_id = record.get("workspaceId")
         path = record.get("path")
         item = {
-            "tool": tool,
+            "tool": normalized_tool,
             "success": success,
             "workspace_id": workspace_id if isinstance(workspace_id, str) else "",
             "path": path if isinstance(path, str) else None,
+            "selectors": inspection_path_selectors(normalized_tool, record),
             "source": "project-log",
         }
-        if tool == "open_workspace":
+        if normalized_tool == "open_workspace":
             item.update(
                 {
                     "mode": "checkout",
@@ -229,6 +279,11 @@ def summarize_tool_evidence(
         allowed.update(SHELL_TOOLS)
     sequence = [str(record["tool"]) for record in records]
     successful = [str(record["tool"]) for record in records if record["success"]]
+    result_only_successful = [
+        str(record["tool"])
+        for record in records
+        if record["success"] and record.get("result_only")
+    ]
     failed = [str(record["tool"]) for record in records if not record["success"]]
     disallowed = [tool for tool in sequence if tool not in allowed]
     expected = expected_workspace.expanduser().resolve() if expected_workspace is not None else None
@@ -241,21 +296,34 @@ def summarize_tool_evidence(
     workspace_opened = False
     for record in records:
         tool = str(record.get("tool") or "unknown")
-        if tool == "open_workspace" and record.get("success"):
+        if tool == "open_workspace":
             raw_path = record.get("path")
             result_root = record.get("result_root")
             mode = record.get("mode")
             if expected is not None:
-                try:
-                    opened_path = Path(str(raw_path)).expanduser().resolve()
-                except (OSError, TypeError, ValueError):
-                    opened_path = Path()
-                try:
-                    returned_root = Path(str(result_root)).expanduser().resolve()
-                except (OSError, TypeError, ValueError):
-                    returned_root = Path()
-                if opened_path != expected or returned_root != expected or mode not in (None, "", "checkout"):
+                opened_path: Path | None = None
+                returned_root: Path | None = None
+                if not record.get("result_only"):
+                    try:
+                        opened_path = Path(str(raw_path)).expanduser().resolve()
+                    except (OSError, TypeError, ValueError):
+                        opened_path = None
+                if record.get("success"):
+                    try:
+                        returned_root = Path(str(result_root)).expanduser().resolve()
+                    except (OSError, TypeError, ValueError):
+                        returned_root = None
+                request_wrong = bool(
+                    not record.get("result_only")
+                    and (opened_path != expected or mode not in (None, "", "checkout"))
+                )
+                result_wrong = bool(record.get("success") and returned_root != expected)
+                if request_wrong or result_wrong:
                     wrong_workspace_open_count += 1
+                    if raw_path not in (None, "") and tool_path_is_sensitive(raw_path):
+                        sensitive_path_attempt_count += 1
+            if not record.get("success"):
+                continue
             active_workspace_id = str(record.get("result_workspace_id") or "")
             if not active_workspace_id:
                 wrong_workspace_open_count += 1
@@ -269,16 +337,25 @@ def summarize_tool_evidence(
             continue
         if workspace_opened and str(record.get("workspace_id") or "") != active_workspace_id:
             workspace_id_mismatch_count += 1
-        if tool_path_is_sensitive(record.get("path")):
+        selectors = record.get("selectors")
+        if not isinstance(selectors, list):
+            selectors = inspection_path_selectors(tool, record)
+        if any(tool_path_is_sensitive(value) for value in selectors):
             sensitive_path_attempt_count += 1
     return ToolEvidence(
         total=len(records),
         sequence=sequence,
         successful=successful,
+        result_only_successful=result_only_successful,
         failed=failed,
         disallowed=disallowed,
         attempted_open_workspace_count=attempted_open_workspace_count,
         open_workspace_count=successful.count("open_workspace"),
+        failed_open_workspace_count=sum(
+            1
+            for record in records
+            if record.get("tool") == "open_workspace" and not record.get("success")
+        ),
         inspection_count=sum(tool in INSPECTION_TOOLS for tool in successful),
         wrong_workspace_open_count=wrong_workspace_open_count,
         inspection_before_open_count=inspection_before_open_count,
@@ -302,6 +379,54 @@ DENIED_INSPECTION_PATH_PARTS = {
     "wallets",
 }
 
+DENIED_GLOB_CANDIDATES = {
+    ".codex-advisor",
+    ".env",
+    ".env.local",
+    ".git",
+    ".ssh",
+    "auth_openaichat.json",
+    "chat.har",
+    "har_and_cookies",
+    "secret.key",
+    "secret.pem",
+    "wallets",
+}
+
+
+def bounded_brace_expansions(pattern: str, limit: int = 32) -> list[str]:
+    expanded = [pattern]
+    while len(expanded) <= limit:
+        changed = False
+        next_values: list[str] = []
+        for value in expanded:
+            match = re.search(r"\{([^{}]+)\}", value)
+            if match is None:
+                next_values.append(value)
+                continue
+            choices = match.group(1).split(",")
+            if len(next_values) + len(choices) > limit:
+                return [pattern]
+            changed = True
+            next_values.extend(
+                value[:match.start()] + choice + value[match.end():]
+                for choice in choices
+            )
+        expanded = next_values
+        if not changed:
+            return expanded
+    return [pattern]
+
+
+def glob_selector_can_match_sensitive_name(pattern: str) -> bool:
+    for expanded in bounded_brace_expansions(pattern.lower()):
+        for segment in (item for item in expanded.split("/") if item not in ("", ".")):
+            if segment in {"*", "**", "?"}:
+                continue
+            if any(fnmatch.fnmatchcase(candidate, segment) for candidate in DENIED_GLOB_CANDIDATES):
+                return True
+    return False
+
 
 def tool_path_is_sensitive(raw_path: Any) -> bool:
     if raw_path in (None, ""):
@@ -309,7 +434,12 @@ def tool_path_is_sensitive(raw_path: Any) -> bool:
     if not isinstance(raw_path, str):
         return True
     normalized = raw_path.replace("\\", "/").strip()
-    if not normalized or normalized.startswith(("/", "~")):
+    if (
+        not normalized
+        or normalized.startswith(("/", "~"))
+        or re.match(r"^[A-Za-z]:", normalized) is not None
+        or re.match(r"^[A-Za-z][A-Za-z0-9+.-]*://", normalized) is not None
+    ):
         return True
     parts = [part.lower() for part in normalized.split("/") if part not in ("", ".")]
     if ".." in parts or any(part in DENIED_INSPECTION_PATH_PARTS for part in parts):
@@ -319,7 +449,19 @@ def tool_path_is_sensitive(raw_path: Any) -> bool:
         return True
     if name.startswith("auth_") and name.endswith(".json"):
         return True
-    return any(name.endswith(suffix) for suffix in safety.SENSITIVE_SUFFIXES)
+    if any(name.endswith(suffix) for suffix in safety.SENSITIVE_SUFFIXES):
+        return True
+    return glob_selector_can_match_sensitive_name(normalized)
+
+
+def inspection_path_selectors(tool: str, values: dict[str, Any]) -> list[Any]:
+    """Return every argument that can select a path for a read-only tool."""
+    keys = ["path"]
+    if tool == "glob":
+        keys.append("pattern")
+    elif tool == "grep":
+        keys.append("include")
+    return [values.get(key) for key in keys if values.get(key) not in (None, "")]
 
 
 def tool_result_has_error(value: Any, depth: int = 0) -> bool:
@@ -367,10 +509,11 @@ def remote_conversation_data(state_path: Path, timeout: int) -> tuple[dict[str, 
     if not auth:
         return {}, "ChatGPT HAR/auth is unavailable for per-conversation MCP verification"
     try:
-        data = advisor.get_json(
+        data = advisor.get_remote_json_with_backoff(
             f"https://chatgpt.com/backend-api/conversation/{conversation_id}",
             auth["headers"],
             60 if timeout <= 0 else min(timeout, 60),
+            operation="repo-aware tool evidence fetch",
         )
     except RuntimeError as exc:
         return {}, "could not verify per-conversation MCP activity: " + safety.redact_sensitive_text(str(exc))
@@ -521,6 +664,7 @@ def tool_records_from_conversation_data(
                     "tool": tool,
                     "success": result.get("success") is True,
                     "path": args.get("path"),
+                    "selectors": inspection_path_selectors(tool, args),
                     "mode": args.get("mode"),
                     "workspace_id": args.get("workspaceId"),
                     "result_workspace_id": payload.get("workspaceId"),
@@ -543,13 +687,12 @@ def tool_records_from_conversation_data(
         tool = tool_name_from_call_path(
             resource.get("resource_uri") if isinstance(resource, dict) else None
         )
-        if tool == "unknown":
-            continue
         records.append(
             {
                 "tool": tool,
                 "success": tool_result_succeeded(message),
                 "path": None,
+                "selectors": [],
                 "mode": None,
                 "workspace_id": None,
                 "result_workspace_id": None,
@@ -585,10 +728,141 @@ def final_text_from_conversation_data(data: dict[str, Any], prompt: str) -> str:
     sys.path.insert(0, str(Path(__file__).resolve().parent))
     import advisor  # noqa: PLC0415
 
-    return (
-        advisor.latest_finished_assistant_text_for_prompt_data(data, prompt)
-        or advisor.latest_finished_assistant_text(data)
-    ).strip()
+    # Recovery must stay anchored to the checkpointed user turn. A later turn
+    # in the same web conversation is not evidence that this turn completed.
+    return advisor.latest_finished_assistant_text_for_prompt_data(data, prompt).strip()
+
+
+def conversation_contains_exact_prompt(data: dict[str, Any], prompt: str) -> bool:
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    import advisor  # noqa: PLC0415
+
+    normalized = prompt.strip()
+    for item in advisor.transcript_from_conversation(data):
+        if item.get("role") == "user" and str(item.get("content") or "").strip() == normalized:
+            return True
+    return False
+
+
+def listed_project_conversations(project_id: str, timeout: int) -> tuple[list[dict[str, Any]], str]:
+    """Read recent project conversations without submitting a ChatGPT turn."""
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    import advisor  # noqa: PLC0415
+
+    auth = advisor.load_chatgpt_auth()
+    if not auth:
+        return [], "ChatGPT HAR/auth is unavailable for interrupted-run recovery"
+    items: list[dict[str, Any]] = []
+    cursor = ""
+    try:
+        max_pages = max(1, min(20, int(os.environ.get("ADVISOR_AGENT_RECOVERY_MAX_PAGES", "5"))))
+    except ValueError:
+        return [], "ADVISOR_AGENT_RECOVERY_MAX_PAGES must be an integer between 1 and 20"
+    for _page in range(max_pages):
+        query: dict[str, str | int] = {"limit": 50, "owned_only": "true"}
+        if cursor:
+            query["cursor"] = cursor
+        url = (
+            f"https://chatgpt.com/backend-api/gizmos/{project_id}/conversations?"
+            + urlencode(query)
+        )
+        try:
+            payload = advisor.get_remote_json_with_backoff(
+                url,
+                auth["headers"],
+                60 if timeout <= 0 else min(timeout, 60),
+                operation="interrupted agent conversation discovery",
+            )
+        except RuntimeError as exc:
+            return [], "could not list project conversations for recovery: " + safety.redact_sensitive_text(str(exc))
+        page_items = payload.get("items") if isinstance(payload, dict) else None
+        if not isinstance(page_items, list):
+            return [], "ChatGPT project conversation discovery returned no item list"
+        items.extend(item for item in page_items if isinstance(item, dict))
+        next_cursor = payload.get("cursor") if isinstance(payload, dict) else None
+        if not isinstance(next_cursor, str) or not next_cursor or next_cursor == cursor:
+            break
+        cursor = next_cursor
+    return items, ""
+
+
+def fetch_conversation_by_id(conversation_id: str, timeout: int) -> tuple[dict[str, Any], str]:
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    import advisor  # noqa: PLC0415
+
+    auth = advisor.load_chatgpt_auth()
+    if not auth:
+        return {}, "ChatGPT HAR/auth is unavailable for interrupted-run recovery"
+    try:
+        data = advisor.get_remote_json_with_backoff(
+            f"https://chatgpt.com/backend-api/conversation/{conversation_id}",
+            auth["headers"],
+            60 if timeout <= 0 else min(timeout, 60),
+            operation="interrupted agent conversation fetch",
+        )
+    except RuntimeError as exc:
+        return {}, "could not fetch the interrupted ChatGPT conversation: " + safety.redact_sensitive_text(str(exc))
+    return data, ""
+
+
+def discover_exact_remote_conversation(
+    project_id: str,
+    prompt: str,
+    timeout: int,
+) -> tuple[dict[str, Any], str, str]:
+    items, error = listed_project_conversations(project_id, timeout)
+    if error:
+        return {}, "", error
+    matches: list[tuple[str, dict[str, Any]]] = []
+    for item in items:
+        conversation_id = item.get("id") or item.get("conversation_id")
+        if not isinstance(conversation_id, str) or not conversation_id:
+            continue
+        if conversation_contains_exact_prompt(item, prompt):
+            matches.append((conversation_id, item))
+    unique = {conversation_id: data for conversation_id, data in matches}
+    if len(unique) > 1:
+        return {}, "", "multiple ChatGPT conversations matched the unique interrupted-run prompt; refusing ambiguous recovery"
+    if not unique:
+        return {}, "", "the submitted turn is not yet discoverable in the bound ChatGPT Project"
+    conversation_id, listed_data = next(iter(unique.items()))
+    data, fetch_error = fetch_conversation_by_id(conversation_id, timeout)
+    if fetch_error:
+        # The project listing already carried a conversation graph. It is safe
+        # to report the read failure as pending, but never to submit again.
+        return listed_data, conversation_id, fetch_error
+    if not conversation_contains_exact_prompt(data, prompt):
+        return {}, "", "the fetched ChatGPT conversation did not retain the exact interrupted-run prompt"
+    return data, conversation_id, ""
+
+
+def persist_recovered_conversation(
+    *,
+    state_path: Path,
+    project_id: str,
+    conversation_id: str,
+    data: dict[str, Any],
+) -> None:
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    import advisor  # noqa: PLC0415
+
+    transcript = advisor.transcript_from_conversation(data)
+    message_id = advisor.latest_finished_assistant_message_id(data) or advisor.latest_message_id(data, transcript)
+    conversation: dict[str, Any] = {"conversation_id": conversation_id}
+    if isinstance(message_id, str) and message_id:
+        conversation["message_id"] = message_id
+        conversation["parent_message_id"] = message_id
+    auth = advisor.load_chatgpt_auth()
+    if auth and auth.get("user_id"):
+        conversation["user_id"] = auth["user_id"]
+    advisor.write_transcript(state_path, data, transcript)
+    safety.atomic_write_json(
+        state_path,
+        {
+            "conversation": conversation,
+            "chatgpt_project_id": project_id,
+        },
+    )
 
 
 def remote_tool_records(
@@ -687,7 +961,18 @@ def validate_result(
     if evidence.disallowed:
         errors.append("disallowed DevSpace tools were observed: " + ", ".join(evidence.disallowed))
     if require_tool_activity:
-        if evidence.attempted_open_workspace_count != 1:
+        corroborated_single_open = bool(
+            corroborating_evidence is not None
+            and corroborating_evidence.attempted_open_workspace_count == 1
+            and corroborating_evidence.open_workspace_count == 1
+        )
+        graph_only_failed_open = bool(
+            evidence.attempted_open_workspace_count == 2
+            and evidence.open_workspace_count == 1
+            and evidence.failed_open_workspace_count == 1
+            and corroborated_single_open
+        )
+        if evidence.attempted_open_workspace_count != 1 and not graph_only_failed_open:
             errors.append(
                 "expected exactly one DevSpace open_workspace attempt in the current turn "
                 f"({evidence.attempted_open_workspace_count} observed)"
@@ -713,6 +998,11 @@ def validate_result(
         if corroborating_evidence is None:
             errors.append("private DevSpace workspace-id corroboration was unavailable")
         else:
+            if corroborating_evidence.attempted_open_workspace_count != 1:
+                errors.append(
+                    "expected one matching open_workspace attempt in the private DevSpace log "
+                    f"({corroborating_evidence.attempted_open_workspace_count} observed)"
+                )
             if corroborating_evidence.open_workspace_count != 1:
                 errors.append(
                     "expected one matching open_workspace record in the private DevSpace log "
@@ -737,7 +1027,7 @@ def validate_result(
                     f"({corroborating_evidence.inspection_count} observed, {min_inspection_calls} required)"
                 )
             remote_counts = Counter(
-                tool for tool in evidence.successful if tool in INSPECTION_TOOLS
+                tool for tool in evidence.result_only_successful if tool in INSPECTION_TOOLS
             )
             local_counts = Counter(
                 tool for tool in corroborating_evidence.successful if tool in INSPECTION_TOOLS
@@ -761,11 +1051,221 @@ def strip_completion_marker(output: str, marker: str) -> str:
     ).strip()
 
 
+def emit_resume_payload(payload: dict[str, Any], *, as_json: bool) -> int:
+    status = str(payload.get("status") or "failed")
+    if as_json:
+        print(json.dumps(payload, indent=2))
+    elif status == "ok":
+        response_path = Path(str(payload.get("response_path") or ""))
+        if response_path.is_file():
+            print(response_path.read_text(encoding="utf-8", errors="replace").strip())
+        print(f"\nAdvisor agent run recovered: {payload.get('run_dir', '')}", file=sys.stderr)
+    else:
+        detail = str(payload.get("resume_detail") or "interrupted run is not recoverable yet")
+        print(f"Advisor agent resume status: {status}: {detail}", file=sys.stderr)
+    if status == "ok":
+        return 0
+    if status in {"not-submitted", "remote-pending"}:
+        return 3
+    return 1
+
+
+def resume_agent_run(args: argparse.Namespace, request: dict[str, Any]) -> int:
+    raw_project = args.project_dir or Path(str(request.get("project_dir") or ""))
+    project = resolve_project(raw_project)
+    run_dir = validated_run_dir(project, args.resume_run_dir, create=False)
+    request_path = run_dir / "request.json"
+    request = read_json_object(request_path)
+    if not request:
+        raise RuntimeError("The interrupted advisor run has no readable request.json checkpoint.")
+    if Path(str(request.get("project_dir") or "")).expanduser().resolve() != project:
+        raise RuntimeError("The interrupted advisor request belongs to a different project directory.")
+
+    metadata_path = run_dir / "meta.json"
+    existing = read_json_object(metadata_path)
+    response_path = run_dir / "response.md"
+    if existing.get("status") == "ok" and response_path.is_file():
+        return emit_resume_payload(existing, as_json=args.json)
+
+    prompt = str(request.get("prompt") or "")
+    marker = str(request.get("marker") or "")
+    role = str(request.get("role") or "reviewer")
+    task = str(request.get("task") or "")
+    workspace = Path(str(request.get("workspace_dir") or "")).expanduser().resolve()
+    if not prompt or not marker or marker not in prompt:
+        raise RuntimeError("The interrupted advisor request lacks its exact prompt recovery marker.")
+    state_path = Path(str(request.get("state_path") or run_dir / "conversation.json")).expanduser().resolve()
+    try:
+        state_path.relative_to((project / ".codex-advisor").resolve())
+    except ValueError as exc:
+        raise RuntimeError("The interrupted advisor state path escaped the project's .codex-advisor directory.") from exc
+    journal_path = Path(str(request.get("journal_path") or run_dir / "turn-journal.json")).expanduser().resolve()
+    try:
+        journal_path.relative_to((project / ".codex-advisor").resolve())
+    except ValueError as exc:
+        raise RuntimeError("The interrupted advisor journal path escaped the project's .codex-advisor directory.") from exc
+    journal = read_json_object(journal_path)
+    saved_state = read_json_object(state_path)
+    saved_conversation = saved_state.get("conversation") if isinstance(saved_state.get("conversation"), dict) else {}
+    conversation_id = saved_conversation.get("conversation_id") if isinstance(saved_conversation, dict) else None
+
+    base_payload: dict[str, Any] = {
+        "schema_version": "1.1",
+        "created_utc": utc_now(),
+        "project_dir": str(project),
+        "workspace_dir": str(workspace),
+        "role": role,
+        "task": task,
+        "provider": str(request.get("provider") or "openai-compatible"),
+        "model": str(request.get("model") or DEFAULT_MODEL),
+        "thinking_effort": str(request.get("thinking_effort") or "max"),
+        "request_timeout_seconds": int(request.get("request_timeout_seconds") or 0),
+        "queue_timeout_seconds": float(request.get("queue_timeout_seconds") or 0),
+        "allow_shell": bool(request.get("allow_shell")),
+        "response_source": "interrupted-run-remote-recovery",
+        "response_path": str(response_path),
+        "run_dir": str(run_dir),
+        "resumed": True,
+        "journal_phase": str(journal.get("phase") or ""),
+    }
+
+    if not conversation_id and not journal_proves_submission(journal):
+        payload = {
+            **base_payload,
+            "status": "not-submitted",
+            "safe_to_submit": True,
+            "resume_detail": "the local journal proves no ChatGPT turn submission began",
+            "errors": [],
+        }
+        safety.atomic_write_json(metadata_path, payload)
+        return emit_resume_payload(payload, as_json=args.json)
+
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    import advisor  # noqa: PLC0415
+
+    project_id = str(request.get("chatgpt_project_id") or saved_state.get("chatgpt_project_id") or "")
+    if not project_id:
+        project_id = str(advisor.chatgpt_project_id(allow_create=False) or "")
+    if not project_id:
+        payload = {
+            **base_payload,
+            "status": "remote-pending",
+            "safe_to_submit": False,
+            "resume_detail": "the interrupted run has no bound ChatGPT Project id",
+            "errors": [],
+        }
+        safety.atomic_write_json(metadata_path, payload)
+        return emit_resume_payload(payload, as_json=args.json)
+
+    remote_error = ""
+    if isinstance(conversation_id, str) and conversation_id:
+        remote_data, remote_error = fetch_conversation_by_id(conversation_id, args.timeout)
+    else:
+        remote_data, conversation_id, remote_error = discover_exact_remote_conversation(
+            project_id,
+            prompt,
+            args.timeout,
+        )
+    if remote_error or not remote_data or not conversation_id:
+        payload = {
+            **base_payload,
+            "status": "remote-pending",
+            "safe_to_submit": False,
+            "resume_detail": remote_error or "the submitted ChatGPT turn is not yet available",
+            "errors": [],
+        }
+        safety.atomic_write_json(metadata_path, payload)
+        return emit_resume_payload(payload, as_json=args.json)
+    if not conversation_contains_exact_prompt(remote_data, prompt):
+        payload = {
+            **base_payload,
+            "status": "failed",
+            "safe_to_submit": False,
+            "resume_detail": "the recovered conversation did not contain the exact checkpointed prompt",
+            "errors": ["exact interrupted-run prompt not found"],
+        }
+        safety.atomic_write_json(metadata_path, payload)
+        return emit_resume_payload(payload, as_json=args.json)
+
+    output = final_text_from_conversation_data(remote_data, prompt)
+    if not output:
+        payload = {
+            **base_payload,
+            "status": "remote-pending",
+            "safe_to_submit": False,
+            "resume_detail": "the exact ChatGPT turn exists but has not produced a finished final response",
+            "errors": [],
+        }
+        safety.atomic_write_json(metadata_path, payload)
+        return emit_resume_payload(payload, as_json=args.json)
+
+    remote_records = tool_records_from_conversation_data(remote_data, prompt)
+    evidence = summarize_tool_evidence(
+        remote_records,
+        allow_shell=bool(request.get("allow_shell")),
+        expected_workspace=workspace,
+    )
+    log_path = Path(str(request.get("log_path") or "")).expanduser()
+    all_local_records = read_tool_records(log_path) if log_path.is_file() else []
+    workspace_id = successful_workspace_id(remote_records)
+    local_records = records_for_workspace(all_local_records, workspace_id)
+    local_evidence = summarize_tool_evidence(
+        local_records,
+        allow_shell=bool(request.get("allow_shell")),
+        expected_workspace=workspace,
+    )
+    errors = validate_result(
+        returncode=0,
+        output=output,
+        marker=marker,
+        evidence=evidence,
+        min_inspection_calls=int(request.get("min_inspection_calls") or 1),
+        require_tool_activity=bool(request.get("require_tool_activity", True)),
+        corroborating_evidence=local_evidence,
+    )
+    clean_output = strip_completion_marker(output, marker) if marker in output else output.strip()
+    persist_recovered_conversation(
+        state_path=state_path,
+        project_id=project_id,
+        conversation_id=conversation_id,
+        data=remote_data,
+    )
+    if clean_output:
+        safety.atomic_write_text(response_path, clean_output.rstrip() + "\n")
+    payload = {
+        **base_payload,
+        "status": "ok" if not errors else "failed",
+        "safe_to_submit": False,
+        "resume_detail": "completed remote response recovered and verified" if not errors else "remote response failed repo-aware evidence validation",
+        "tool_evidence": evidence.to_dict(),
+        "tool_evidence_scope": "chatgpt-conversation",
+        "project_log_attributed_evidence": local_evidence.to_dict(),
+        "project_log_attribution_scope": "matching-open-workspace-id",
+        "errors": errors,
+    }
+    safety.atomic_write_json(metadata_path, payload)
+    return emit_resume_payload(payload, as_json=args.json)
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--prompt", help="Repo-aware review task. Reads stdin when omitted.")
     parser.add_argument("--role", default="reviewer", help="Bounded advisor role name.")
     parser.add_argument("--project-dir", type=Path, help="Original project directory.")
+    parser.add_argument(
+        "--run-dir",
+        type=Path,
+        help="Internal orchestration option: preassign a private run directory under .codex-advisor.",
+    )
+    parser.add_argument(
+        "--resume-run-dir",
+        type=Path,
+        help="Recover one interrupted run using read-only ChatGPT requests; never submits a new turn.",
+    )
+    parser.add_argument(
+        "--recovery-token",
+        help="Internal orchestration option: unique marker embedded in the submitted prompt.",
+    )
     parser.add_argument("--provider", choices=["openai", "openai-compatible"], default=os.environ.get("ADVISOR_PROVIDER", "openai-compatible"))
     parser.add_argument("--base-url", default=os.environ.get("ADVISOR_BASE_URL", "http://127.0.0.1:8080/v1"))
     parser.add_argument("--model", default=os.environ.get("ADVISOR_MODEL"))
@@ -806,6 +1306,16 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     configure_stdio()
     args = parse_args()
+    if args.run_dir is not None and args.resume_run_dir is not None:
+        print("--run-dir and --resume-run-dir are mutually exclusive.", file=sys.stderr)
+        return 2
+    if args.resume_run_dir is not None:
+        request = read_json_object(args.resume_run_dir.expanduser().resolve() / "request.json")
+        try:
+            return resume_agent_run(args, request)
+        except RuntimeError as exc:
+            print(f"Advisor agent resume failed: {exc}", file=sys.stderr)
+            return 2
     project = resolve_project(args.project_dir)
     task = safety.redact_sensitive_text(
         safety.sanitize_text(args.prompt if args.prompt is not None else sys.stdin.read())
@@ -821,6 +1331,13 @@ def main() -> int:
         return 2
     if args.queue_timeout < 0:
         print("--queue-timeout cannot be negative.", file=sys.stderr)
+        return 2
+    if args.provider != "openai-compatible" or not concurrency.local_http_url(args.base_url):
+        print(
+            "Repo-aware advisor mode requires a loopback OpenAI-compatible endpoint; "
+            "refusing to send repository-derived prompts to a remote API.",
+            file=sys.stderr,
+        )
         return 2
     effective_timeout = concurrency.effective_agent_timeout(args.timeout)
     if effective_timeout != args.timeout:
@@ -838,10 +1355,30 @@ def main() -> int:
         )
         return 2
 
-    run_dir = private_run_dir(project, args.role)
+    try:
+        run_dir = (
+            validated_run_dir(project, args.run_dir, create=True)
+            if args.run_dir is not None
+            else private_run_dir(project, args.role)
+        )
+        marker = validate_recovery_marker(args.recovery_token)
+    except RuntimeError as exc:
+        print(f"Advisor agent setup failed: {exc}", file=sys.stderr)
+        return 2
     response_path = run_dir / "response.md"
     metadata_path = run_dir / "meta.json"
-    marker = f"ADVISOR-AGENT-{uuid.uuid4().hex.upper()}-COMPLETE"
+    request_path = run_dir / "request.json"
+    journal_path = run_dir / "turn-journal.json"
+    existing_request = read_json_object(request_path)
+    existing_journal = read_json_object(journal_path)
+    if existing_request and journal_proves_submission(existing_journal):
+        print(
+            "This run directory may already have submitted a ChatGPT turn. "
+            "Use --resume-run-dir so recovery remains GET-only.",
+            file=sys.stderr,
+        )
+        return 2
+    state_path = conversation_state_path(project, run_dir, args.conversation_key)
     started = time.monotonic()
 
     if args.dry_run:
@@ -864,13 +1401,23 @@ def main() -> int:
     state: dict[str, Any] = {}
     log_path: Path | None = None
     before_count = 0
-    state_path: Path | None = None
     try:
         state = connector_status(project)
         if not state.get("connector_ready"):
             raise RuntimeError("The registered DevSpace connector is not ready for this project.")
         workspace, agent_status = refresh_agent_workspace(project)
         validate_workspace_for_connector(workspace, state)
+        sanitized = agent_status.get("sanitized_workspace")
+        sanitized = sanitized if isinstance(sanitized, dict) else {}
+        state = advisor_agent_connect.pin_connector_workspace(
+            project,
+            state,
+            workspace,
+            generation=str(sanitized.get("generation_id") or ""),
+            fingerprint=str(sanitized.get("source_fingerprint") or ""),
+        )
+        if not state.get("connector_ready") or not state.get("readonly_exact_root_ready"):
+            raise RuntimeError("The live connector did not retain the exact refreshed review snapshot pin.")
         log_path = activity_monitor.discover_log_path(project)
         if log_path is None:
             raise RuntimeError("Could not validate the private DevSpace tool log for this project.")
@@ -885,10 +1432,12 @@ def main() -> int:
         total=0,
         sequence=[],
         successful=[],
+        result_only_successful=[],
         failed=[],
         disallowed=[],
         attempted_open_workspace_count=0,
         open_workspace_count=0,
+        failed_open_workspace_count=0,
         inspection_count=0,
         wrong_workspace_open_count=0,
         inspection_before_open_count=0,
@@ -902,8 +1451,36 @@ def main() -> int:
         marker=marker,
         allow_shell=args.allow_shell,
     )
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    import advisor  # noqa: PLC0415
+
+    project_id = advisor.chatgpt_project_id(allow_create=False)
+    request_payload = {
+        "schema_version": "1.0",
+        "created_utc": utc_now(),
+        "status": "ready-to-submit" if not errors else "preflight-failed",
+        "project_dir": str(project),
+        "workspace_dir": str(workspace),
+        "role": args.role,
+        "task": task,
+        "marker": marker,
+        "prompt": prompt,
+        "state_path": str(state_path),
+        "journal_path": str(journal_path),
+        "log_path": str(log_path) if log_path is not None else "",
+        "log_start_record_count": before_count,
+        "chatgpt_project_id": project_id or "",
+        "provider": args.provider,
+        "model": args.model or DEFAULT_MODEL,
+        "thinking_effort": args.thinking_effort or "max",
+        "request_timeout_seconds": args.timeout,
+        "queue_timeout_seconds": args.queue_timeout,
+        "allow_shell": args.allow_shell,
+        "min_inspection_calls": args.min_inspection_calls,
+        "require_tool_activity": not args.no_require_tool_activity,
+    }
+    safety.atomic_write_json(request_path, request_payload)
     if not errors:
-        state_path = conversation_state_path(project, run_dir, args.conversation_key)
         env = os.environ.copy()
         env["ADVISOR_PROJECT_DIR"] = str(project)
         env["ADVISOR_PROVIDER"] = args.provider
@@ -912,6 +1489,7 @@ def main() -> int:
         env["ADVISOR_QUEUE_TIMEOUT"] = str(args.queue_timeout)
         env["ADVISOR_STATE_PATH"] = str(state_path)
         env["ADVISOR_RESPONSE_PATH"] = str(response_path)
+        env["ADVISOR_TURN_JOURNAL_PATH"] = str(journal_path)
         env["ADVISOR_AUTO_CREATE_PROJECT"] = "false"
         if args.model:
             env["ADVISOR_MODEL"] = args.model
@@ -1036,6 +1614,13 @@ def main() -> int:
         "chatgpt_attachment_mark_error": attachment_mark_error,
     }
     safety.atomic_write_json(metadata_path, payload)
+    request_payload.update(
+        {
+            "status": "completed" if not errors else "failed",
+            "completed_utc": utc_now(),
+        }
+    )
+    safety.atomic_write_json(request_path, request_payload)
 
     if args.json:
         print(json.dumps(payload, indent=2))

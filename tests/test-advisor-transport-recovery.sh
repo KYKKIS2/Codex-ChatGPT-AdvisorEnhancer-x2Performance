@@ -8,6 +8,7 @@ trap 'rm -rf "$PROJECT"' EXIT
 
 PYTHONPATH="$SCRIPTS" python3 - "$PROJECT" <<'PY'
 import contextlib
+import http.client
 import json
 import os
 import sys
@@ -95,6 +96,7 @@ base_env = {
     "ADVISOR_AUTO_CREATE_PROJECT": "false",
     "ADVISOR_VALIDATE_MODEL": "false",
     "ADVISOR_CONVERSATION_KEY": None,
+    "ADVISOR_TURN_JOURNAL_PATH": str(project / ".codex-advisor" / "turn-journal.json"),
 }
 
 
@@ -176,6 +178,7 @@ with patched_env(**base_env):
 
 
 with patched_env(**base_env):
+    advisor.remove_state_files(advisor.default_state_path())
     prompt = "embedded prompt"
     embedded = conversation_data(prompt, "embedded final")
     with patched(
@@ -209,6 +212,42 @@ agent_final["mapping"]["a2"] = {
 agent_final["current_node"] = "a2"
 if advisor.latest_finished_assistant_text_for_prompt_data(agent_final, "agent prompt") != "REVIEWER REPORT\nFinal findings.":
     raise SystemExit("Final agent response with end_turn=true was not recovered.")
+
+
+repeated_messages = [
+    {"id": "old-user", "role": "user", "content": "same prompt"},
+    {
+        "id": "old-answer",
+        "role": "assistant",
+        "content": "stale answer",
+        "status": "finished_successfully",
+        "end_turn": True,
+    },
+]
+if advisor.latest_assistant_text_after_prompt_messages(
+    repeated_messages,
+    "same prompt",
+    "old-answer",
+):
+    raise SystemExit("Repeated-prompt recovery reused an answer from before the turn parent.")
+repeated_messages.extend(
+    [
+        {"id": "new-user", "role": "user", "content": "same prompt"},
+        {
+            "id": "new-answer",
+            "role": "assistant",
+            "content": "current answer",
+            "status": "finished_successfully",
+            "end_turn": True,
+        },
+    ]
+)
+if advisor.latest_assistant_text_after_prompt_messages(
+    repeated_messages,
+    "same prompt",
+    "old-answer",
+) != "current answer":
+    raise SystemExit("Repeated-prompt recovery did not select the answer after the turn parent.")
 
 
 agent_state = project / ".codex-advisor" / "agent.conversation.json"
@@ -271,6 +310,211 @@ if unbounded_fetches["status"] != 0:
     raise SystemExit("Unfinished conversation evidence should avoid a redundant stream-status request.")
 
 
+legacy_state = project / ".codex-advisor" / "agent-legacy-end-turn.conversation.json"
+legacy_progress = conversation_data("legacy prompt", "Final-looking progress", conv_id="conv-agent")
+legacy_final = json.loads(json.dumps(legacy_progress))
+legacy_final["mapping"]["a2"] = {
+    "id": "a2",
+    "parent": "a1",
+    "message": {
+        "id": "a2",
+        "author": {"role": "assistant"},
+        "content": {"parts": ["Actual final response"]},
+        "status": "finished_successfully",
+        "end_turn": True,
+    },
+}
+legacy_final["current_node"] = "a2"
+legacy_fetches = {"count": 0, "status": 0}
+
+
+def legacy_get_json(url, *_args, **_kwargs):
+    if url.endswith("/stream_status"):
+        legacy_fetches["status"] += 1
+        return {"status": "IS_STREAMING"}
+    legacy_fetches["count"] += 1
+    return legacy_progress if legacy_fetches["count"] == 1 else legacy_final
+
+
+with patched_env(
+    ADVISOR_FINAL_FETCH_TIMEOUT=None,
+    ADVISOR_FINAL_FETCH_POLL_SECONDS="0.5",
+):
+    with patched(
+        advisor,
+        get_json=legacy_get_json,
+        load_chatgpt_auth=lambda: {"headers": {"Authorization": "Bearer fake"}, "user_id": "fake"},
+        time=type("FakeTime", (), {"monotonic": staticmethod(__import__("time").monotonic), "sleep": staticmethod(lambda _seconds: None)}),
+    ):
+        result = advisor.fetch_remote_final_text(legacy_state, agent_conv.copy(), "legacy prompt", 0)
+if result != "Actual final response" or legacy_fetches["status"] != 1:
+    raise SystemExit(
+        "A missing end_turn response was accepted while the remote stream was active: "
+        f"result={result!r} fetches={legacy_fetches!r}"
+    )
+
+
+class UnknownStatusClock:
+    now = 0.0
+
+    @classmethod
+    def monotonic(cls):
+        return cls.now
+
+    @classmethod
+    def sleep(cls, seconds):
+        cls.now += seconds
+
+
+def unknown_status_get_json(url, *_args, **_kwargs):
+    if url.endswith("/stream_status"):
+        return {"status": "NEW_UNDOCUMENTED_STATUS"}
+    return legacy_progress
+
+
+unknown_state = project / ".codex-advisor" / "agent-unknown-status.conversation.json"
+with patched_env(
+    ADVISOR_FINAL_FETCH_TIMEOUT=None,
+    ADVISOR_FINAL_FETCH_UNKNOWN_STATUS_TIMEOUT="2",
+    ADVISOR_FINAL_FETCH_POLL_SECONDS="0.5",
+    ADVISOR_FINAL_FETCH_MAX_POLLS=None,
+):
+    with patched(
+        advisor,
+        get_json=unknown_status_get_json,
+        load_chatgpt_auth=lambda: {"headers": {"Authorization": "Bearer fake"}, "user_id": "fake"},
+        time=UnknownStatusClock,
+    ):
+        result = advisor.fetch_remote_final_text(
+            unknown_state,
+            agent_conv.copy(),
+            "legacy prompt",
+            0,
+        )
+if result or UnknownStatusClock.now < 2:
+    raise SystemExit(
+        "A missing-end_turn response was accepted when stream completion was unknown: "
+        f"result={result!r} time={UnknownStatusClock.now}"
+    )
+
+with patched_env(**base_env):
+    legacy_call_state = advisor.default_state_path()
+    legacy_call_state.parent.mkdir(parents=True, exist_ok=True)
+    legacy_call_state.write_text(
+        json.dumps({"conversation": {"conversation_id": "conv-agent"}}),
+        encoding="utf-8",
+    )
+    legacy_call_fetches = {"count": 0}
+
+    def sync_legacy_call(path, conversation, *_args, **kwargs):
+        if kwargs.get("expected_prompt"):
+            advisor.write_transcript(path, legacy_progress, advisor.transcript_from_conversation(legacy_progress))
+        return conversation
+
+    with patched(
+        advisor,
+        post_json=lambda *_args, **_kwargs: fake_chat_response(
+            "Final-looking progress",
+            conv_id="conv-agent",
+        ),
+        sync_remote_conversation=sync_legacy_call,
+        remote_conversation_stream_status=lambda *_args, **_kwargs: "IS_STREAMING",
+        fetch_remote_final_text=lambda *_args, **_kwargs: legacy_call_fetches.__setitem__(
+            "count", legacy_call_fetches["count"] + 1
+        ) or "Actual final response",
+        load_chatgpt_auth=lambda: {"headers": {"Authorization": "Bearer fake"}, "user_id": "fake"},
+        response_needs_remote_recovery=lambda *_args, **_kwargs: False,
+        assert_resolved_model_route=lambda *_args, **_kwargs: None,
+        assert_pro_model_route=lambda *_args, **_kwargs: None,
+    ):
+        result = advisor.call_compatible("legacy prompt", "gpt-5-6-pro", 1)
+if result != "Actual final response" or legacy_call_fetches["count"] != 1:
+    raise SystemExit(
+        "call_compatible accepted a missing-end_turn transcript while streaming: "
+        f"result={result!r} fetches={legacy_call_fetches!r}"
+    )
+advisor.remove_state_files(legacy_call_state)
+
+
+invisible_state = project / ".codex-advisor" / "agent-invisible.conversation.json"
+invisible_fetches = {"count": 0}
+invisible_turn = conversation_data("different prompt", "different answer", conv_id="conv-agent")
+
+
+def invisible_get_json(url, *_args, **_kwargs):
+    if url.endswith("/stream_status"):
+        return {"status": "NOT_STREAMING"}
+    invisible_fetches["count"] += 1
+    return invisible_turn if invisible_fetches["count"] <= 3 else agent_final
+
+
+with patched_env(
+    ADVISOR_FINAL_FETCH_TIMEOUT=None,
+    ADVISOR_FINAL_FETCH_MAX_POLLS="2",
+    ADVISOR_FINAL_FETCH_POLL_SECONDS="0.5",
+):
+    with patched(
+        advisor,
+        get_json=invisible_get_json,
+        load_chatgpt_auth=lambda: {"headers": {"Authorization": "Bearer fake"}, "user_id": "fake"},
+        time=type("FakeTime", (), {"monotonic": staticmethod(__import__("time").monotonic), "sleep": staticmethod(lambda _seconds: None)}),
+    ):
+        result = advisor.fetch_remote_final_text(invisible_state, agent_conv.copy(), "agent prompt", 0)
+if result != "REVIEWER REPORT\nFinal findings." or invisible_fetches["count"] != 4:
+    raise SystemExit(
+        "Unlimited final fetch still stopped at the inactive-poll ceiling: "
+        f"result={result!r} fetches={invisible_fetches!r}"
+    )
+
+
+class AcceptanceClock:
+    now = 0.0
+
+    @classmethod
+    def monotonic(cls):
+        return cls.now
+
+    @classmethod
+    def sleep(cls, seconds):
+        cls.now += seconds
+
+
+never_visible_state = project / ".codex-advisor" / "agent-never-visible.conversation.json"
+never_visible_fetches = {"count": 0}
+
+
+def never_visible_get_json(url, *_args, **_kwargs):
+    if url.endswith("/stream_status"):
+        return {"status": "NOT_STREAMING"}
+    never_visible_fetches["count"] += 1
+    return invisible_turn
+
+
+with patched_env(
+    ADVISOR_FINAL_FETCH_TIMEOUT=None,
+    ADVISOR_FINAL_FETCH_ACCEPTANCE_TIMEOUT="2",
+    ADVISOR_FINAL_FETCH_MAX_POLLS=None,
+    ADVISOR_FINAL_FETCH_POLL_SECONDS="0.5",
+):
+    with patched(
+        advisor,
+        get_json=never_visible_get_json,
+        load_chatgpt_auth=lambda: {"headers": {"Authorization": "Bearer fake"}, "user_id": "fake"},
+        time=AcceptanceClock,
+    ):
+        result = advisor.fetch_remote_final_text(
+            never_visible_state,
+            agent_conv.copy(),
+            "agent prompt",
+            0,
+        )
+if result or never_visible_fetches["count"] > 6 or AcceptanceClock.now < 2:
+    raise SystemExit(
+        "Unlimited final fetch did not bound discovery of an unaccepted prompt: "
+        f"result={result!r} fetches={never_visible_fetches!r} time={AcceptanceClock.now}"
+    )
+
+
 rate_limit_calls = {"count": 0, "recorded": 0}
 rate_limit_sleeps = []
 
@@ -317,6 +561,44 @@ if rate_limit_calls["recorded"] != 2 or rate_limit_sleeps != [0.25, 0.25]:
     raise SystemExit(
         f"Rate-limit recovery did not back off and record throttling: "
         f"calls={rate_limit_calls!r} sleeps={rate_limit_sleeps!r}"
+    )
+
+
+transient_calls = {"count": 0}
+transient_sleeps = []
+
+
+def transient_get_json(*_args, **_kwargs):
+    transient_calls["count"] += 1
+    if transient_calls["count"] <= 2:
+        raise RuntimeError("connection reset during test fetch")
+    return {"ok": "recovered"}
+
+
+with patched_env(ADVISOR_REMOTE_GET_MAX_TRANSIENT_RETRIES="3"):
+    with patched(
+        advisor,
+        get_json=transient_get_json,
+        transient_get_backoff_seconds=lambda _attempt: 0.1,
+        time=type(
+            "FakeTime",
+            (),
+            {
+                "monotonic": staticmethod(__import__("time").monotonic),
+                "sleep": staticmethod(transient_sleeps.append),
+            },
+        ),
+    ):
+        transient_result = advisor.get_remote_json_with_backoff(
+            "https://chatgpt.com/backend-api/conversation/test",
+            {"Authorization": "Bearer fake"},
+            0,
+            operation="transient test fetch",
+        )
+if transient_result != {"ok": "recovered"} or transient_sleeps != [0.1, 0.1]:
+    raise SystemExit(
+        "Transient remote GET recovery did not retry cleanly: "
+        f"result={transient_result!r} calls={transient_calls!r} sleeps={transient_sleeps!r}"
     )
 
 
@@ -367,6 +649,54 @@ else:
 advisor.remove_state_files(state)
 
 
+class FakePostResponse:
+    def __init__(self, value=None, error=None):
+        self.value = value
+        self.error = error
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args):
+        return False
+
+    def read(self):
+        if self.error is not None:
+            raise self.error
+        return self.value
+
+
+post_faults = (
+    ("incomplete-read", FakePostResponse(error=http.client.IncompleteRead(b"{"))),
+    ("timeout", FakePostResponse(error=TimeoutError("timed out"))),
+    ("connection-reset", FakePostResponse(error=ConnectionResetError("reset"))),
+    ("invalid-utf8", FakePostResponse(value=b"\xff")),
+    ("invalid-json", FakePostResponse(value=b"not-json")),
+)
+for label, fake_response in post_faults:
+    post_calls = {"count": 0}
+
+    def open_fault(*_args, **_kwargs):
+        post_calls["count"] += 1
+        return fake_response
+
+    with patched(advisor, open_url=open_fault):
+        try:
+            advisor.post_json(
+                "http://127.0.0.1:8080/v1/chat/completions",
+                {"model": "test"},
+                {"Content-Type": "application/json"},
+                1,
+            )
+        except advisor.AmbiguousSubmissionError as exc:
+            if not getattr(exc, "submission_outcome_unknown", False):
+                raise SystemExit(f"{label} lost its ambiguous-submission marker")
+        else:
+            raise SystemExit(f"{label} POST response failure was accepted")
+    if post_calls["count"] != 1:
+        raise SystemExit(f"{label} performed more than one POST attempt")
+
+
 pro_ambiguous = conversation_data(
     "pro prompt",
     "pro answer",
@@ -413,27 +743,99 @@ with patched_env(**base_env):
             raise SystemExit(f"Ambiguous failure performed an unsafe retry: {calls['count']}")
         if not state_path.exists():
             raise SystemExit("Ambiguous failure removed conversation state.")
+        journal = json.loads((project / ".codex-advisor" / "turn-journal.json").read_text(encoding="utf-8"))
+        if journal.get("phase") != "submission-outcome-unknown" or journal.get("prompt_sha256") is None:
+            raise SystemExit(f"Ambiguous submission journal was not durable: {journal!r}")
+        if "ambiguous prompt" in json.dumps(journal):
+            raise SystemExit("Turn journal stored raw prompt content")
+
+    calls.update({"count": 0, "fetch": 0, "recorded": 0})
+
+    def post_rate_limited(*_args, **_kwargs):
+        calls["count"] += 1
+        raise advisor.RateLimitError("HTTP 429 test submission", retry_after=1.0)
+
+    original_record = advisor.concurrency.record_remote_rate_limit
+    advisor.concurrency.record_remote_rate_limit = (
+        lambda _retry_after=None: calls.__setitem__("recorded", calls["recorded"] + 1)
+    )
+    try:
+        with patched(
+            advisor,
+            post_json=post_rate_limited,
+            sync_remote_conversation=lambda *a, **k: a[1],
+            fetch_remote_final_text=lambda *a, **k: calls.__setitem__("fetch", calls["fetch"] + 1) or "",
+            load_chatgpt_auth=lambda: {"headers": {"Authorization": "Bearer fake"}, "user_id": "fake"},
+        ):
+            try:
+                advisor.call_compatible("rate-limited prompt", "gpt-5-5-thinking", 1)
+            except advisor.RateLimitError:
+                pass
+            else:
+                raise SystemExit("Rate-limited turn submission did not fail closed.")
+    finally:
+        advisor.concurrency.record_remote_rate_limit = original_record
+    if calls["count"] != 1 or calls["fetch"] != 0 or calls["recorded"] != 1:
+        raise SystemExit(f"Rate-limited POST used an unsafe retry/recovery path: {calls!r}")
 
     calls["count"] = 0
 
-    def post_missing_then_recover(*_args, **_kwargs):
+    def post_missing(*_args, **_kwargs):
         calls["count"] += 1
-        if calls["count"] == 1:
-            raise RuntimeError("HTTP 404 from local adapter: conversation_not_found")
-        return fake_chat_response("fresh recovered", conv_id="new-conv")
+        raise RuntimeError("HTTP 404 from local adapter: conversation_not_found")
 
     with patched(
         advisor,
-        post_json=post_missing_then_recover,
+        post_json=post_missing,
         sync_remote_conversation=lambda *a, **k: a[1],
         fetch_remote_final_text=lambda *a, **k: "",
         load_chatgpt_auth=lambda: {"headers": {"Authorization": "Bearer fake"}, "user_id": "fake"},
     ):
+        try:
+            advisor.call_compatible("missing prompt", "gpt-5-5-thinking", 1)
+        except RuntimeError as exc:
+            if "conversation_not_found" not in str(exc):
+                raise
+        else:
+            raise SystemExit("A POST-side 404 was retried instead of failing closed.")
+    if calls["count"] != 1 or not state_path.exists():
+        raise SystemExit("A POST-side 404 repeated the turn or cleared ambiguous state.")
+
+    sync_calls = {"count": 0}
+
+    def clear_stale_before_submission(path, conversation, *_args, **_kwargs):
+        sync_calls["count"] += 1
+        if sync_calls["count"] == 1:
+            advisor.remove_state_files(path)
+            return None
+        return conversation
+
+    calls["count"] = 0
+
+    def post_after_preflight_clear(*_args, **_kwargs):
+        calls["count"] += 1
+        return fake_chat_response(
+            "",
+            conv_id="new-conv",
+            extra={
+                "debug_conversation": conversation_data(
+                    "missing prompt",
+                    "fresh recovered",
+                    conv_id="new-conv",
+                )
+            },
+        )
+
+    with patched(
+        advisor,
+        post_json=post_after_preflight_clear,
+        sync_remote_conversation=clear_stale_before_submission,
+        fetch_remote_final_text=lambda *a, **k: "",
+        load_chatgpt_auth=lambda: {"headers": {"Authorization": "Bearer fake"}, "user_id": "fake"},
+    ):
         result = advisor.call_compatible("missing prompt", "gpt-5-5-thinking", 1)
-        if result != "fresh recovered":
-            raise SystemExit(f"Missing conversation retry did not return fresh response: {result!r}")
-        if calls["count"] != 2:
-            raise SystemExit(f"Missing conversation retry did not call post twice: {calls['count']}")
+    if result != "fresh recovered" or calls["count"] != 1:
+        raise SystemExit("Pre-submission stale-state reconciliation did not use exactly one POST.")
 
 print("Advisor transport recovery tests passed.")
 PY
