@@ -52,6 +52,19 @@ def sanitize_text(text: str | bytes | None) -> str:
     return str(text).encode("utf-8", errors="replace").decode("utf-8")
 
 
+def prompt_protection_enabled() -> bool:
+    """Return whether prompt-only transport should apply legacy redaction."""
+    return os.environ.get("ADVISOR_PROMPT_PROTECTION", "").strip().lower() in {
+        "1", "true", "yes", "on",
+    }
+
+
+def prepare_prompt_text(text: str | bytes | None) -> str:
+    """Prepare deliberate prompt-only input without changing it by default."""
+    value = sanitize_text(text)
+    return redact_sensitive_text(value) if prompt_protection_enabled() else value
+
+
 def truncate(text: str | bytes | None, limit: int) -> str:
     value = sanitize_text(text)
     if len(value) <= limit:
@@ -121,7 +134,13 @@ def is_sensitive_path(project_dir: Path, path: Path) -> bool:
     return any(name.endswith(suffix) for suffix in SENSITIVE_SUFFIXES)
 
 
-def resolve_input_file(project_dir: Path, raw: str, allow_outside_project: bool = False) -> Path:
+def resolve_input_file(
+    project_dir: Path,
+    raw: str,
+    allow_outside_project: bool = False,
+    *,
+    allow_sensitive: bool = False,
+) -> Path:
     raw_path = Path(raw)
     path = raw_path.resolve() if raw_path.is_absolute() else (project_dir / raw_path).resolve()
     try:
@@ -131,7 +150,7 @@ def resolve_input_file(project_dir: Path, raw: str, allow_outside_project: bool 
         in_project = False
     if not in_project and not allow_outside_project:
         raise RuntimeError(f"Refusing to include file outside the project: {path}")
-    if is_sensitive_path(project_dir, path):
+    if not allow_sensitive and is_sensitive_path(project_dir, path):
         raise RuntimeError(f"Refusing to include advisor state, HAR/cookie/auth, env, or key material: {path}")
     if not path.exists():
         raise RuntimeError(f"Context file does not exist: {path}")
@@ -147,13 +166,44 @@ def read_limited_text(path: Path, limit: int | None = None, redact: bool = True)
     return truncate(text, limit) if limit is not None else text
 
 
-def read_context_file(project_dir: Path, raw: str, limit: int | None = None, allow_outside_project: bool = False) -> tuple[str, str]:
-    path = resolve_input_file(project_dir, raw, allow_outside_project)
+def read_context_file(
+    project_dir: Path,
+    raw: str,
+    limit: int | None = None,
+    allow_outside_project: bool = False,
+    *,
+    redact: bool = True,
+    allow_sensitive: bool = False,
+) -> tuple[str, str]:
+    path = resolve_input_file(
+        project_dir,
+        raw,
+        allow_outside_project,
+        allow_sensitive=allow_sensitive,
+    )
     try:
         label = str(path.relative_to(project_dir.resolve()))
     except ValueError:
         label = str(path)
-    return label, read_limited_text(path, limit)
+    return label, read_limited_text(path, limit, redact=redact)
+
+
+def read_prompt_context_file(
+    project_dir: Path,
+    raw: str,
+    limit: int | None = None,
+    allow_outside_project: bool = False,
+) -> tuple[str, str]:
+    """Read an explicitly selected prompt-only context file verbatim by default."""
+    protect = prompt_protection_enabled()
+    return read_context_file(
+        project_dir,
+        raw,
+        limit,
+        allow_outside_project=allow_outside_project or not protect,
+        redact=protect,
+        allow_sensitive=not protect,
+    )
 
 
 def ensure_private_dir(path: Path) -> None:

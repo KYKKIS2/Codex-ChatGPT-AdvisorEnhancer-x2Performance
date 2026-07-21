@@ -30,7 +30,7 @@ git -C "$PROJECT" mv .env.rename .env.renamed
 git -C "$PROJECT" rm .env.delete >/dev/null
 printf 'RENAMED_TOKEN=renamed-secret-that-must-not-leak-2\n' > "$PROJECT/.env.renamed"
 
-CONTEXT_JSON="$(python3 "$SCRIPTS/context_pack.py" \
+CONTEXT_JSON="$(ADVISOR_PROMPT_PROTECTION=true python3 "$SCRIPTS/context_pack.py" \
   --project-dir "$PROJECT" \
   --prompt "Check diff redaction. api_key=prompt-secret-value-1234567890" \
   --draft "password=draft-secret-value-1234567890" \
@@ -56,7 +56,7 @@ OUTSIDE="$(mktemp -d)"
 printf 'outside secret\n' > "$OUTSIDE/outside.txt"
 ln -s "$OUTSIDE/outside.txt" "$PROJECT/link-outside"
 set +e
-python3 "$SCRIPTS/critique_final.py" \
+ADVISOR_PROMPT_PROTECTION=true python3 "$SCRIPTS/critique_final.py" \
   --project-dir "$PROJECT" \
   --dry-run \
   --draft "Draft." \
@@ -69,7 +69,7 @@ if [[ "$status" -eq 0 ]]; then
 fi
 
 set +e
-python3 "$SCRIPTS/critique_final.py" \
+ADVISOR_PROMPT_PROTECTION=true python3 "$SCRIPTS/critique_final.py" \
   --project-dir "$PROJECT" \
   --dry-run \
   --draft "Draft." \
@@ -111,7 +111,7 @@ if statuses[:3] != ["skipped", "skipped", "skipped"] or statuses[-1:] != ["compl
     raise SystemExit(f"Unexpected verifier command statuses: {statuses!r}")
 PY
 
-PYTHONPATH="$SCRIPTS" python3 - "$PROJECT" <<'PY'
+PYTHONPATH="$SCRIPTS" ADVISOR_PROMPT_PROTECTION=true python3 - "$PROJECT" <<'PY'
 import subprocess
 import sys
 from pathlib import Path

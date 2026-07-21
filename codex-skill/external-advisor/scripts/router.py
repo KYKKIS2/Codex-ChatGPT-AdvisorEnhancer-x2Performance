@@ -17,17 +17,25 @@ from pathlib import Path
 from typing import Any
 
 import advisor_safety as safety
-from advisor import select_request_model, select_request_thinking_effort
+from advisor import (
+    effective_request_timeout,
+    select_request_model,
+    select_request_thinking_effort,
+    subprocess_timeout,
+)
 
 
-SECURITY_TERMS = {
-    "auth", "authentication", "authorization", "cookie", "token", "secret", "password",
-    "credential", "api key", "private key", "oauth", "jwt", "session", "csrf", "xss",
-    "sql injection", "sandbox", "permission", "privacy", "security", "exploit",
+SECURITY_TOPIC_TERMS = {
+    "auth", "authentication", "authorization", "cookie", "cookies", "token", "tokens",
+    "secret", "secrets", "password", "passwords", "credential", "credentials", "api key",
+    "api keys", "private key", "private keys", "oauth", "jwt", "session", "sessions", "csrf",
+    "xss", "sql injection", "sandbox", "sandboxes", "permission", "permissions", "privacy",
+    "security", "exploit", "exploits",
 }
 
 ARCHITECTURE_TERMS = {
-    "architecture", "architect", "design", "refactor", "system", "scalability",
+    "architecture", "architect", "design", "plan", "planning", "review", "critique",
+    "refactor", "system", "scalability",
     "maintainability", "tradeoff", "trade-off", "roadmap", "strategy", "approach",
     "direction", "workflow", "pipeline", "orchestration", "integration",
 }
@@ -72,8 +80,12 @@ def sanitize_text(text: str) -> str:
 
 
 def contains_any(text: str, terms: set[str]) -> list[str]:
-    lowered = text.lower()
-    return sorted(term for term in terms if term in lowered)
+    matches: list[str] = []
+    for term in terms:
+        escaped = re.escape(term).replace(r"\ ", r"\s+")
+        if re.search(rf"(?<!\w){escaped}(?!\w)", text, flags=re.IGNORECASE):
+            matches.append(term)
+    return sorted(matches)
 
 
 def split_csv(value: str | None) -> list[str]:
@@ -215,20 +227,7 @@ def route_task(args: argparse.Namespace, prompt: str) -> RouteDecision:
     ]).strip()
     words = re.findall(r"\w+", text)
     reasons: list[str] = []
-    security_hits = contains_any(text, SECURITY_TERMS)
-
-    if security_hits and not args.allow_sensitive_advisor:
-        reasons.append("security/privacy terms: " + ", ".join(security_hits[:6]))
-        return RouteDecision(
-            "no-advisor",
-            "none",
-            None,
-            [],
-            False,
-            0.9,
-            reasons,
-            "Sensitive/security-related task. Handle locally or rerun with --allow-sensitive-advisor after redacting context.",
-        )
+    security_hits = contains_any(text, SECURITY_TOPIC_TERMS)
 
     explicit = args.force_route
     if explicit:
@@ -248,7 +247,7 @@ def route_task(args: argparse.Namespace, prompt: str) -> RouteDecision:
         return RouteDecision("verifier", "verifier-loop", "verification", ["verifier"], False, 0.88, reasons)
 
     if security_hits:
-        reasons.append("security/privacy terms allowed by --allow-sensitive-advisor: " + ", ".join(security_hits[:6]))
+        reasons.append("security/privacy topic terms: " + ", ".join(security_hits[:6]))
         return RouteDecision("conclave", "conclave", "security", ["security", "critic", "verifier"], False, 0.9, reasons)
 
     model_hits = contains_any(text, MODEL_CHOICE_TERMS)
@@ -484,6 +483,32 @@ def build_context_pack(args: argparse.Namespace, prompt: str) -> Path | None:
     return md_path if md_path.exists() else None
 
 
+def route_execution_timeout(args: argparse.Namespace, decision: RouteDecision) -> float | None:
+    execution_timeout = subprocess_timeout(args.timeout, 30)
+    if decision.command_kind == "agent-conclave":
+        role_waves = max(
+            1,
+            (len(decision.roles) + args.agent_max_workers - 1)
+            // args.agent_max_workers,
+        )
+        synthesis_wave = 0 if args.no_synthesis else 1
+        return None if args.agent_queue_timeout <= 0 or args.agent_timeout <= 0 else (
+            (role_waves + synthesis_wave)
+            * (args.agent_queue_timeout + args.agent_timeout)
+            + 90
+        )
+    if decision.command_kind == "agent-mode":
+        return None if args.agent_queue_timeout <= 0 or args.agent_timeout <= 0 else (
+            args.agent_queue_timeout + args.agent_timeout + 60
+        )
+    if decision.command_kind == "conclave":
+        synthesis_wave = 0 if args.no_synthesis or len(decision.roles) == 1 else 1
+        return None if args.timeout <= 0 else (
+            (max(1, len(decision.roles)) + synthesis_wave) * args.timeout + 90
+        )
+    return execution_timeout
+
+
 def execute_route(args: argparse.Namespace, prompt: str, decision: RouteDecision) -> int:
     if decision.route == "no-advisor":
         print("Router selected no-advisor.")
@@ -516,7 +541,7 @@ def execute_route(args: argparse.Namespace, prompt: str, decision: RouteDecision
         blocks = []
         for path in context_files:
             try:
-                label, content = safety.read_context_file(
+                label, content = safety.read_prompt_context_file(
                     args.project_dir,
                     path,
                     allow_outside_project=args.allow_outside_project_context,
@@ -527,26 +552,7 @@ def execute_route(args: argparse.Namespace, prompt: str, decision: RouteDecision
         prompt = f"{prompt.strip()}\n\n--- Advisor context pack ---\n" + "\n\n---\n\n".join(blocks)
     if args.error_output:
         prompt = f"{prompt.strip()}\n\n--- Error output / failed evidence ---\n{args.error_output.strip()}"
-    execution_timeout: float | None = args.timeout + 30
-    if decision.command_kind == "agent-conclave":
-        role_waves = max(
-            1,
-            (len(decision.roles) + args.agent_max_workers - 1)
-            // args.agent_max_workers,
-        )
-        synthesis_wave = 0 if args.no_synthesis else 1
-        execution_timeout = None if args.agent_queue_timeout <= 0 or args.agent_timeout <= 0 else (
-            (role_waves + synthesis_wave)
-            * (args.agent_queue_timeout + args.agent_timeout)
-            + 90
-        )
-    elif decision.command_kind == "agent-mode":
-        execution_timeout = None if args.agent_queue_timeout <= 0 or args.agent_timeout <= 0 else (
-            args.agent_queue_timeout + args.agent_timeout + 60
-        )
-    elif decision.command_kind == "conclave":
-        synthesis_wave = 0 if args.no_synthesis or len(decision.roles) == 1 else 1
-        execution_timeout = (max(1, len(decision.roles)) + synthesis_wave) * args.timeout + 90
+    execution_timeout = route_execution_timeout(args, decision)
     started = time.monotonic()
     completed = subprocess.run(
         command,
@@ -625,8 +631,12 @@ def parse_args() -> argparse.Namespace:
         help="Maximum repo-aware specialist subprocesses launched together; transient g4f workers isolate active calls.",
     )
     parser.add_argument("--project-dir", type=Path, help="Project directory. Defaults to the nearest Git repo root or current directory.")
-    parser.add_argument("--allow-sensitive-advisor", action="store_true", help="Allow advisor routing for security/privacy/auth/token tasks after caller redaction.")
-    parser.add_argument("--allow-outside-project-context", action="store_true", help="Allow context/draft/error files outside the project directory.")
+    parser.add_argument(
+        "--allow-sensitive-advisor",
+        action="store_true",
+        help="Deprecated compatibility flag; security/privacy topic words no longer block advisor routing.",
+    )
+    parser.add_argument("--allow-outside-project-context", action="store_true", help="Legacy prompt-protection override; verbatim prompt-only mode already permits explicit outside context files.")
     parser.add_argument("--trace-id", default=os.environ.get("ADVISOR_TRACE_ID"))
     parser.add_argument("--task-id", default=os.environ.get("ADVISOR_TASK_ID"))
     parser.add_argument("--no-sync", action="store_true")
@@ -667,9 +677,13 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     configure_stdio()
     args = parse_args()
+    args.timeout = effective_request_timeout(args.timeout, args.thinking_effort)
     args.thinking_effort = select_request_thinking_effort(args.thinking_effort)
     args.model = select_request_model(args.thinking_effort, args.model)
     args.project_dir = resolve_project_dir(args.project_dir)
+    if args.timeout < 0:
+        print("--timeout cannot be negative; use 0 to wait without a completion deadline.", file=sys.stderr)
+        return 2
     if args.agent_max_workers < 1:
         print("--agent-max-workers must be at least 1.", file=sys.stderr)
         return 2
@@ -684,25 +698,25 @@ def main() -> int:
         return 2
     args.trace_id = args.trace_id or str(uuid.uuid4())
     args.task_id = args.task_id or str(uuid.uuid4())
-    prompt = safety.redact_sensitive_text(
-        sanitize_text(args.prompt if args.prompt is not None else sys.stdin.read())
+    prompt = safety.prepare_prompt_text(
+        args.prompt if args.prompt is not None else sys.stdin.read()
     )
     if args.draft_file:
-        _, args.draft = safety.read_context_file(
+        _, args.draft = safety.read_prompt_context_file(
             args.project_dir,
             args.draft_file,
             allow_outside_project=args.allow_outside_project_context,
         )
     if args.error_file:
-        _, args.error_output = safety.read_context_file(
+        _, args.error_output = safety.read_prompt_context_file(
             args.project_dir,
             args.error_file,
             allow_outside_project=args.allow_outside_project_context,
         )
     if args.draft:
-        args.draft = safety.redact_sensitive_text(args.draft)
+        args.draft = safety.prepare_prompt_text(args.draft)
     if args.error_output:
-        args.error_output = safety.redact_sensitive_text(args.error_output)
+        args.error_output = safety.prepare_prompt_text(args.error_output)
     if not prompt.strip():
         print("Provide --prompt or pipe text on stdin.", file=sys.stderr)
         return 2

@@ -36,8 +36,10 @@ assert_route() {
 
 assert_route "no-advisor" "" --prompt "fix typo in README"
 assert_route "single-advisor" "" --prompt "Decide the architecture for advisor memory"
-assert_route "no-advisor" "" --prompt "Review security and privacy risks for token storage"
+assert_route "conclave" "" --prompt "Review security and privacy risks for token storage"
 assert_route "conclave" "" --allow-sensitive-advisor --prompt "Review security and privacy risks for token storage"
+assert_route "single-advisor" "" --prompt "Prepare-goal planning review for a Shopify theme using the owner's authoritative annotated PDF requirements."
+assert_route "no-advisor" "" --prompt "Give a concise recommendation for a world-class homepage."
 assert_route "verifier" "verifier-loop" --failed-tests --prompt "pytest failed after the patch"
 assert_route "conclave" "" --prompt "Which model or framework should I use for training?"
 assert_route "single-advisor" "" --before-final --draft "Draft answer" --prompt "Review before final"

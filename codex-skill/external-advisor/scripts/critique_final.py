@@ -10,7 +10,12 @@ import sys
 from pathlib import Path
 
 import advisor_safety as safety
-from advisor import select_request_model, select_request_thinking_effort
+from advisor import (
+    effective_request_timeout,
+    select_request_model,
+    select_request_thinking_effort,
+    subprocess_timeout,
+)
 
 
 def configure_stdio() -> None:
@@ -48,7 +53,7 @@ def build_prompt(args: argparse.Namespace) -> str:
     if args.prompt:
         blocks.append(f"Original user request:\n{args.prompt.strip()}")
     for path in args.context_file:
-        label, content = safety.read_context_file(
+        label, content = safety.read_prompt_context_file(
             args.project_dir,
             path,
             allow_outside_project=args.allow_outside_project,
@@ -84,7 +89,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-output-tokens", type=int, default=int(os.environ.get("ADVISOR_MAX_OUTPUT_TOKENS", "1200")))
     parser.add_argument("--timeout", type=int, default=int(os.environ.get("ADVISOR_TIMEOUT", "300")))
     parser.add_argument("--project-dir", type=Path, help="Project directory. Defaults to the nearest Git repo root or current directory.")
-    parser.add_argument("--allow-outside-project", action="store_true", help="Allow context/draft files outside the project directory.")
+    parser.add_argument("--allow-outside-project", action="store_true", help="Legacy prompt-protection override; verbatim prompt-only mode already permits explicit outside context files.")
     parser.add_argument("--machine-json", action="store_true", help="Request machine-readable JSON critique.")
     parser.add_argument("--no-sync", action="store_true", help="Skip remote transcript sync.")
     parser.add_argument("--dry-run", action="store_true", help="Print the generated prompt without calling the model.")
@@ -94,19 +99,23 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     configure_stdio()
     args = parse_args()
+    args.timeout = effective_request_timeout(args.timeout, args.thinking_effort)
     args.thinking_effort = select_request_thinking_effort(args.thinking_effort)
     args.model = select_request_model(args.thinking_effort, args.model)
     args.project_dir = resolve_project_dir(args.project_dir)
+    if args.timeout < 0:
+        print("--timeout cannot be negative; use 0 to wait without a completion deadline.", file=sys.stderr)
+        return 2
     if args.draft_file:
-        _, args.draft = safety.read_context_file(
+        _, args.draft = safety.read_prompt_context_file(
             args.project_dir,
             args.draft_file,
             allow_outside_project=args.allow_outside_project,
         )
     elif args.draft is None:
-        args.draft = safety.redact_sensitive_text(sanitize_text(sys.stdin.read()))
+        args.draft = safety.prepare_prompt_text(sys.stdin.read())
     else:
-        args.draft = safety.redact_sensitive_text(sanitize_text(args.draft))
+        args.draft = safety.prepare_prompt_text(args.draft)
     if not args.draft.strip():
         print("Provide --draft, --draft-file, or pipe a draft on stdin.", file=sys.stderr)
         return 2
@@ -149,7 +158,7 @@ def main() -> int:
         text=True,
         encoding="utf-8",
         errors="replace",
-        timeout=args.timeout + 30,
+        timeout=subprocess_timeout(args.timeout, 30),
     )
     return completed.returncode
 

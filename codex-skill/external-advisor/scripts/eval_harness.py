@@ -16,7 +16,12 @@ from pathlib import Path
 from typing import Any
 
 import advisor_safety as safety
-from advisor import select_request_model, select_request_thinking_effort
+from advisor import (
+    effective_request_timeout,
+    select_request_model,
+    select_request_thinking_effort,
+    subprocess_timeout,
+)
 
 
 STRATEGIES = ("codex-only", "single-advisor", "conclave", "critic-verifier")
@@ -145,7 +150,7 @@ def run_command(args: argparse.Namespace, command: list[str], prompt: str) -> tu
             encoding="utf-8",
             errors="replace",
             capture_output=True,
-            timeout=args.timeout + 30,
+            timeout=subprocess_timeout(args.timeout, 30),
         )
         output = (completed.stdout + "\n" + completed.stderr).strip()
         return "completed", completed.returncode, time.monotonic() - started, output
@@ -304,9 +309,13 @@ def resolve_project_dir(project_dir: Path | None) -> Path:
 def main() -> int:
     configure_stdio()
     args = parse_args()
+    args.timeout = effective_request_timeout(args.timeout, args.thinking_effort)
     args.thinking_effort = select_request_thinking_effort(args.thinking_effort)
     args.model = select_request_model(args.thinking_effort, args.model)
     args.project_dir = resolve_project_dir(args.project_dir)
+    if args.timeout < 0:
+        print("--timeout cannot be negative; use 0 to wait without a completion deadline.", file=sys.stderr)
+        return 2
     strategies = list(STRATEGIES) if args.strategy == "all" else [args.strategy]
     results: list[EvalResult] = []
     for category, index, task in select_tasks(args.limit_per_category):

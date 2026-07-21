@@ -204,6 +204,32 @@ def is_pro_request(value: str | None) -> bool:
     return value is not None and value.strip().lower() in (PRO_STANDARD_ALIASES | PRO_EXTENDED_ALIASES)
 
 
+def cli_option_was_supplied(name: str, argv: list[str] | None = None) -> bool:
+    values = sys.argv[1:] if argv is None else argv
+    return any(value == name or value.startswith(f"{name}=") for value in values)
+
+
+def effective_request_timeout(
+    timeout: int,
+    thinking_effort: str | None,
+    *,
+    timeout_explicit: bool | None = None,
+) -> int:
+    """Use an unlimited completion wait for implicit Pro Extended deadlines."""
+    if timeout_explicit is None:
+        timeout_explicit = "ADVISOR_TIMEOUT" in os.environ or cli_option_was_supplied("--timeout")
+    if is_pro_extended_request(thinking_effort) and not timeout_explicit:
+        return 0
+    return timeout
+
+
+def subprocess_timeout(timeout: int | float, grace_seconds: int | float = 0) -> float | None:
+    """Translate the advisor's zero timeout into subprocess.run's None."""
+    if timeout <= 0:
+        return None
+    return float(timeout + grace_seconds)
+
+
 def allow_non_default_route() -> bool:
     return bool_env(ALLOW_NON_DEFAULT_ROUTE_ENV, False)
 
@@ -1922,7 +1948,7 @@ def build_prompt(prompt: str, context_files: list[str]) -> str:
     blocks = [prompt.strip()]
     project_dir = advisor_project_dir()
     for path in context_files:
-        label, content = safety.read_context_file(
+        label, content = safety.read_prompt_context_file(
             project_dir,
             path,
             allow_outside_project=allow_outside_project_context(),
@@ -2282,7 +2308,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--timeout", type=int, default=int(os.environ.get("ADVISOR_TIMEOUT", "300")))
     parser.add_argument("--save", help="Optional file path to write the guidance.")
-    parser.add_argument("--allow-outside-project", action="store_true", help="Allow context files outside the project directory.")
+    parser.add_argument("--allow-outside-project", action="store_true", help="Legacy prompt-protection override; verbatim prompt-only mode already permits explicit outside context files.")
     activity = parser.add_mutually_exclusive_group()
     activity.add_argument(
         "--live-activity",
@@ -2319,6 +2345,7 @@ def write_guidance_outputs(args: argparse.Namespace, guidance: str) -> list[Path
 def main() -> int:
     configure_stdio()
     args = parse_args()
+    args.timeout = effective_request_timeout(args.timeout, args.thinking_effort)
     if args.timeout < 0:
         print("--timeout cannot be negative; use 0 to wait without a completion deadline.", file=sys.stderr)
         return 2
@@ -2335,9 +2362,7 @@ def main() -> int:
         os.environ["ADVISOR_THINKING_EFFORT"] = args.thinking_effort
     args.model = select_request_model(args.thinking_effort, args.model)
     prompt = args.prompt if args.prompt is not None else sys.stdin.read()
-    prompt = safety.redact_sensitive_text(
-        sanitize_text(build_prompt(prompt, args.context_file))
-    )
+    prompt = safety.prepare_prompt_text(build_prompt(prompt, args.context_file))
     if not prompt.strip():
         print("Provide --prompt or pipe text on stdin.", file=sys.stderr)
         return 2

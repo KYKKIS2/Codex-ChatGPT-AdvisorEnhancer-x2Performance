@@ -28,8 +28,10 @@ function Assert-Route {
 try {
     Assert-Route "no-advisor" @("--prompt", "fix typo in README")
     Assert-Route "single-advisor" @("--prompt", "Decide the architecture for advisor memory")
-    Assert-Route "no-advisor" @("--prompt", "Review security and privacy risks for token storage")
+    Assert-Route "conclave" @("--prompt", "Review security and privacy risks for token storage")
     Assert-Route "conclave" @("--allow-sensitive-advisor", "--prompt", "Review security and privacy risks for token storage")
+    Assert-Route "single-advisor" @("--prompt", "Prepare-goal planning review for a Shopify theme using the owner's authoritative annotated PDF requirements.")
+    Assert-Route "no-advisor" @("--prompt", "Give a concise recommendation for a world-class homepage.")
     Assert-Route "verifier" @("--failed-tests", "--prompt", "pytest failed after the patch") "verifier-loop"
     Assert-Route "conclave" @("--prompt", "Which model or framework should I use for training?")
     Assert-Route "single-advisor" @("--before-final", "--draft", "Draft answer", "--prompt", "Review before final")

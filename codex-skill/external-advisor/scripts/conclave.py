@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Any
 
 import advisor_safety as safety
+from advisor import effective_request_timeout, subprocess_timeout
 
 
 ROLE_PROMPTS = {
@@ -370,7 +371,7 @@ def build_shared_context(args: argparse.Namespace) -> str:
         f"User task:\n{args.prompt.strip()}",
     ]
     for path in args.context_file:
-        label, content = safety.read_context_file(
+        label, content = safety.read_prompt_context_file(
             args.project_dir,
             path,
             allow_outside_project=args.allow_outside_project,
@@ -482,7 +483,7 @@ def run_advisor_role(args: argparse.Namespace, role: str, shared_context: str) -
             errors="replace",
             input=prompt,
             capture_output=True,
-            timeout=args.timeout + 10,
+            timeout=subprocess_timeout(args.timeout, 10),
         )
     except Exception as exc:
         return RoleResult(role, False, str(exc), time.monotonic() - started)
@@ -532,6 +533,23 @@ def run_synthesizer(args: argparse.Namespace, shared_context: str, role_results:
     synth_args = argparse.Namespace(**vars(args))
     synth_args.max_output_tokens = max(args.max_output_tokens, 1800)
     return run_advisor_role(synth_args, "synthesizer", prompt)
+
+
+def synthesis_for_results(
+    args: argparse.Namespace,
+    shared_context: str,
+    role_results: list[RoleResult],
+) -> RoleResult:
+    if args.no_synthesis:
+        return RoleResult("synthesizer", True, "Synthesis skipped.", 0.0)
+    if not any(result.ok for result in role_results):
+        return RoleResult(
+            "synthesizer",
+            False,
+            "Synthesis skipped because no specialist completed successfully.",
+            0.0,
+        )
+    return run_synthesizer(args, shared_context, role_results)
 
 
 def severity_score(value: str) -> float:
@@ -729,7 +747,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-output-tokens", type=int, default=int(os.environ.get("ADVISOR_MAX_OUTPUT_TOKENS", "1200")))
     parser.add_argument("--timeout", type=int, default=int(os.environ.get("ADVISOR_TIMEOUT", "300")))
     parser.add_argument("--project-dir", type=Path, help="Project directory. Defaults to the nearest Git repo root or current directory.")
-    parser.add_argument("--allow-outside-project", action="store_true", help="Allow context files outside the project directory.")
+    parser.add_argument("--allow-outside-project", action="store_true", help="Legacy prompt-protection override; verbatim prompt-only mode already permits explicit outside context files.")
     parser.add_argument("--parallel", action="store_true", help="Run specialist roles concurrently.")
     parser.add_argument("--max-workers", type=int, default=3)
     parser.add_argument("--no-synthesis", action="store_true", help="Skip the synthesizer advisor.")
@@ -742,15 +760,19 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     configure_stdio()
     args = parse_args()
+    args.timeout = effective_request_timeout(args.timeout, args.thinking_effort)
     args.thinking_effort = select_request_thinking_effort(args.thinking_effort)
     args.model = select_request_model(args.thinking_effort, args.model)
     args.project_dir = resolve_project_dir(args.project_dir)
+    if args.timeout < 0:
+        print("--timeout cannot be negative; use 0 to wait without a completion deadline.", file=sys.stderr)
+        return 2
     if args.machine_json:
         args.output_format = "json"
     args.trace_id = args.trace_id or str(uuid.uuid4())
     args.task_id = args.task_id or str(uuid.uuid4())
-    prompt = safety.redact_sensitive_text(
-        sanitize_text(args.prompt if args.prompt is not None else sys.stdin.read())
+    prompt = safety.prepare_prompt_text(
+        args.prompt if args.prompt is not None else sys.stdin.read()
     )
     if not prompt.strip():
         print("Provide --prompt or pipe text on stdin.", file=sys.stderr)
@@ -768,10 +790,7 @@ def main() -> int:
     started = time.monotonic()
     role_results = run_roles(args, roles, shared_context)
     ranking = rank_role_results(role_results)
-    if args.no_synthesis:
-        synthesis = RoleResult("synthesizer", True, "Synthesis skipped.", 0.0)
-    else:
-        synthesis = run_synthesizer(args, shared_context, role_results)
+    synthesis = synthesis_for_results(args, shared_context, role_results)
 
     payload = {
         "schema_version": "1.0",
@@ -783,6 +802,7 @@ def main() -> int:
         "provider": args.provider,
         "model": args.model,
         "reasoning_effort": args.reasoning_effort,
+        "timeout_seconds": args.timeout,
         "output_format": args.output_format,
         "prompt": prompt.strip(),
         "elapsed_seconds": time.monotonic() - started,

@@ -18,7 +18,12 @@ from pathlib import Path
 from typing import Any
 
 import advisor_safety as safety
-from advisor import select_request_model, select_request_thinking_effort
+from advisor import (
+    effective_request_timeout,
+    select_request_model,
+    select_request_thinking_effort,
+    subprocess_timeout,
+)
 
 
 PYTHON_COMMANDS = {"python", "python3", "py", "python.exe", "python3.exe"}
@@ -106,7 +111,7 @@ def build_checklist_prompt(args: argparse.Namespace, prompt: str) -> str:
     if args.draft:
         blocks.append(f"Codex draft/current plan:\n{args.draft.strip()}")
     for path in args.context_file:
-        label, content = safety.read_context_file(
+        label, content = safety.read_prompt_context_file(
             args.project_dir,
             path,
             allow_outside_project=args.allow_outside_project,
@@ -218,7 +223,7 @@ def run_conclave_verifier(args: argparse.Namespace, phase: str, prompt: str) -> 
         encoding="utf-8",
         errors="replace",
         capture_output=True,
-        timeout=args.timeout + 30,
+        timeout=subprocess_timeout(args.timeout, 30),
     )
     output = (completed.stdout + "\n" + completed.stderr).strip()
     path = find_conclave_run(args.project_dir, args.trace_id, task_id)
@@ -321,11 +326,11 @@ def command_is_safe(command: str) -> tuple[bool, str, list[str]]:
 def run_command(args: argparse.Namespace, command: str) -> CommandResult:
     safe, reason, argv = command_is_safe(command)
     if not safe and not args.allow_unsafe_commands:
-        return CommandResult(safety.redact_sensitive_text(command), "skipped", None, 0.0, "", "", reason)
+        return CommandResult(safety.prepare_prompt_text(command), "skipped", None, 0.0, "", "", reason)
     if not argv:
         argv, parse_error = parse_command(command)
         if parse_error:
-            return CommandResult(safety.redact_sensitive_text(command), "skipped", None, 0.0, "", "", parse_error)
+            return CommandResult(safety.prepare_prompt_text(command), "skipped", None, 0.0, "", "", parse_error)
     started = time.monotonic()
     try:
         completed = subprocess.run(
@@ -338,32 +343,32 @@ def run_command(args: argparse.Namespace, command: str) -> CommandResult:
             timeout=args.command_timeout,
         )
         return CommandResult(
-            safety.redact_sensitive_text(command),
+            safety.prepare_prompt_text(command),
             "completed",
             completed.returncode,
             time.monotonic() - started,
-            truncate(safety.redact_sensitive_text(completed.stdout), args.output_chars),
-            truncate(safety.redact_sensitive_text(completed.stderr), args.output_chars),
+            truncate(safety.prepare_prompt_text(completed.stdout), args.output_chars),
+            truncate(safety.prepare_prompt_text(completed.stderr), args.output_chars),
             reason,
         )
     except subprocess.TimeoutExpired as exc:
         return CommandResult(
-            safety.redact_sensitive_text(command),
+            safety.prepare_prompt_text(command),
             "timeout",
             None,
             time.monotonic() - started,
-            truncate(safety.redact_sensitive_text(exc.stdout), args.output_chars),
-            truncate(safety.redact_sensitive_text(exc.stderr), args.output_chars),
+            truncate(safety.prepare_prompt_text(exc.stdout), args.output_chars),
+            truncate(safety.prepare_prompt_text(exc.stderr), args.output_chars),
             f"Timed out after {args.command_timeout}s.",
         )
     except Exception as exc:
         return CommandResult(
-            safety.redact_sensitive_text(command),
+            safety.prepare_prompt_text(command),
             "error",
             None,
             time.monotonic() - started,
             "",
-            safety.redact_sensitive_text(str(exc)),
+            safety.prepare_prompt_text(str(exc)),
             reason,
         )
 
@@ -488,7 +493,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--command-timeout", type=int, default=120)
     parser.add_argument("--output-chars", type=int, default=6000)
     parser.add_argument("--project-dir", type=Path, help="Project directory. Defaults to the nearest Git repo root or current directory.")
-    parser.add_argument("--allow-outside-project", action="store_true", help="Allow context/draft files outside the project directory.")
+    parser.add_argument("--allow-outside-project", action="store_true", help="Legacy prompt-protection override; verbatim prompt-only mode already permits explicit outside context files.")
     parser.add_argument("--trace-id", default=os.environ.get("ADVISOR_TRACE_ID"))
     parser.add_argument("--task-id", default=os.environ.get("ADVISOR_TASK_ID"))
     parser.add_argument("--no-sync", action="store_true")
@@ -499,21 +504,25 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     configure_stdio()
     args = parse_args()
+    args.timeout = effective_request_timeout(args.timeout, args.thinking_effort)
     args.thinking_effort = select_request_thinking_effort(args.thinking_effort)
     args.model = select_request_model(args.thinking_effort, args.model)
     args.project_dir = resolve_project_dir(args.project_dir)
+    if args.timeout < 0:
+        print("--timeout cannot be negative; use 0 to wait without a completion deadline.", file=sys.stderr)
+        return 2
     args.trace_id = args.trace_id or str(uuid.uuid4())
     args.task_id = args.task_id or str(uuid.uuid4())
     if args.draft_file:
-        _, args.draft = safety.read_context_file(
+        _, args.draft = safety.read_prompt_context_file(
             args.project_dir,
             args.draft_file,
             allow_outside_project=args.allow_outside_project,
         )
     elif args.draft:
-        args.draft = safety.redact_sensitive_text(sanitize_text(args.draft))
-    prompt = safety.redact_sensitive_text(
-        sanitize_text(args.prompt if args.prompt is not None else sys.stdin.read())
+        args.draft = safety.prepare_prompt_text(args.draft)
+    prompt = safety.prepare_prompt_text(
+        args.prompt if args.prompt is not None else sys.stdin.read()
     )
     if not prompt.strip():
         print("Provide --prompt or pipe text on stdin.", file=sys.stderr)
