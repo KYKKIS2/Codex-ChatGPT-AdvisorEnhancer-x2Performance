@@ -34,14 +34,35 @@ assert_route() {
   echo "Route OK: $expected"
 }
 
+assert_route_mode() {
+  local expected_route="$1"
+  local expected_mode="$2"
+  shift 2
+  local data route mode reasons
+  data="$(python3 "$ROUTER" --project-dir "$PROJECT" --json "$@")"
+  route="$(printf '%s' "$data" | python3 -c 'import json,sys; print(json.load(sys.stdin)["route"])')"
+  mode="$(printf '%s' "$data" | python3 -c 'import json,sys; print(json.load(sys.stdin)["mode"])')"
+  reasons="$(printf '%s' "$data" | python3 -c 'import json,sys; print(" ".join(json.load(sys.stdin)["reasons"]))')"
+  if [[ "$route" != "$expected_route" || "$mode" != "$expected_mode" ]]; then
+    echo "Expected route/mode '$expected_route/$expected_mode' but got '$route/$mode' for args: $*" >&2
+    exit 1
+  fi
+  if [[ "$reasons" == *"security/privacy topic terms"* ]]; then
+    echo "Prompt topic words unexpectedly selected a security route: $reasons" >&2
+    exit 1
+  fi
+  echo "Route mode OK: $expected_route/$expected_mode"
+}
+
 assert_route "no-advisor" "" --prompt "fix typo in README"
 assert_route "single-advisor" "" --prompt "Decide the architecture for advisor memory"
-assert_route "conclave" "" --prompt "Review security and privacy risks for token storage"
-assert_route "conclave" "" --allow-sensitive-advisor --prompt "Review security and privacy risks for token storage"
+assert_route "single-advisor" "" --prompt "Review security and privacy risks for token storage"
+assert_route "single-advisor" "" --allow-sensitive-advisor --prompt "Review security and privacy risks for token storage"
 assert_route "single-advisor" "" --prompt "Prepare-goal planning review for a Shopify theme using the owner's authoritative annotated PDF requirements."
 assert_route "no-advisor" "" --prompt "Give a concise recommendation for a world-class homepage."
 assert_route "verifier" "verifier-loop" --failed-tests --prompt "pytest failed after the patch"
 assert_route "conclave" "" --prompt "Which model or framework should I use for training?"
+assert_route_mode "conclave" "model-choice" --prompt-only --prompt "Review sequence model training with ordered event tokens and a frozen HGB residual Transformer comparison."
 assert_route "single-advisor" "" --before-final --draft "Draft answer" --prompt "Review before final"
 assert_route "machine-json-verifier" "verifier-loop" --machine-verify --prompt "Verify this patch"
 assert_route "single-advisor" "advisor" --agent-allowed-root "$PROJECT" --agent-bridge-executable "$FAKE_BIN/devspace" --prompt "Decide the architecture for advisor memory"

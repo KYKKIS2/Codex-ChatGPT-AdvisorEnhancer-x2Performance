@@ -18,7 +18,12 @@ from pathlib import Path
 from typing import Any
 
 import advisor_safety as safety
-from advisor import effective_request_timeout, subprocess_timeout
+from advisor import (
+    effective_request_timeout,
+    select_request_model,
+    select_request_thinking_effort,
+    subprocess_timeout,
+)
 
 
 ROLE_PROMPTS = {
@@ -88,16 +93,6 @@ Return:
 - concrete next action
 - confidence and why""",
 }
-PRO_STANDARD_ALIASES = {"pro", "pro standard", "pro-standard", "pro_standard"}
-PRO_EXTENDED_ALIASES = {"pro extended", "pro-extended", "pro_extended"}
-DEFAULT_MODEL = "gpt-5-6-thinking"
-SAFE_NON_THINKING_MODEL = "gpt-5-5"
-DEFAULT_CHATGPT_THINKING_EFFORT = "max"
-DEFAULT_PRO_EXTENDED_MODEL = "gpt-5-6-pro"
-ALLOW_NON_DEFAULT_ROUTE_ENV = "ADVISOR_ALLOW_NON_DEFAULT_ROUTE"
-LEGACY_THINKING_MODELS = {"gpt-5-5-thinking", "gpt-5.5-thinking", "gpt-5_5-thinking"}
-
-
 MODE_ROLES = {
     "general": ["planner", "critic", "implementer"],
     "architecture": ["architect", "critic", "implementer", "security"],
@@ -161,104 +156,6 @@ def configure_stdio() -> None:
     for stream in (sys.stdout, sys.stderr):
         if hasattr(stream, "reconfigure"):
             stream.reconfigure(encoding="utf-8", errors="replace")
-
-
-def is_pro_extended_request(value: str | None) -> bool:
-    return value is not None and value.strip().lower() in PRO_EXTENDED_ALIASES
-
-
-def is_pro_request(value: str | None) -> bool:
-    return value is not None and value.strip().lower() in (PRO_STANDARD_ALIASES | PRO_EXTENDED_ALIASES)
-
-
-def default_model_for(thinking_effort: str | None) -> str:
-    if is_pro_request(thinking_effort):
-        return os.environ.get("ADVISOR_PRO_EXTENDED_MODEL", DEFAULT_PRO_EXTENDED_MODEL)
-    return DEFAULT_MODEL
-
-
-def allow_non_default_route() -> bool:
-    return bool_env(ALLOW_NON_DEFAULT_ROUTE_ENV, False)
-
-
-def select_request_thinking_effort(thinking_effort: str | None) -> str | None:
-    if is_pro_request(thinking_effort) or allow_non_default_route():
-        return thinking_effort
-    if thinking_effort is not None and thinking_effort.strip().lower() not in {
-        "extended",
-        "high",
-        "reasoning high",
-        "reasoning-high",
-        "reasoning_high",
-    }:
-        print(
-            "Advisor forcing non-Pro ADVISOR_THINKING_EFFORT to "
-            f"{DEFAULT_CHATGPT_THINKING_EFFORT!r} instead of {thinking_effort!r}. "
-            "Use ADVISOR_THINKING_EFFORT=pro-extended for Pro, or set "
-            f"{ALLOW_NON_DEFAULT_ROUTE_ENV}=true only for deliberate diagnostics.",
-            file=sys.stderr,
-        )
-    return DEFAULT_CHATGPT_THINKING_EFFORT
-
-
-def bool_env(name: str, default: bool = False) -> bool:
-    value = os.environ.get(name)
-    if value is None:
-        return default
-    return value.lower() in ("1", "true", "yes", "on")
-
-
-def select_request_model(thinking_effort: str | None, model: str | None) -> str:
-    if not is_pro_request(thinking_effort):
-        if isinstance(model, str):
-            model = model.strip() or None
-        if isinstance(model, str) and model.lower() == "default":
-            print(
-                "Advisor ignoring ADVISOR_MODEL='default' and selecting the configured safe model "
-                "for the requested thinking mode.",
-                file=sys.stderr,
-            )
-            model = None
-        if not allow_non_default_route():
-            if model is not None and model != DEFAULT_MODEL:
-                print(
-                    "Advisor ignoring non-Pro ADVISOR_MODEL="
-                    f"{model!r} and using {DEFAULT_MODEL!r} with "
-                    f"thinking_effort={DEFAULT_CHATGPT_THINKING_EFFORT!r}. "
-                    f"Set {ALLOW_NON_DEFAULT_ROUTE_ENV}=true only for deliberate diagnostics.",
-                    file=sys.stderr,
-                )
-            return DEFAULT_MODEL
-        selected = model or DEFAULT_MODEL
-        explicit_no_thinking = thinking_effort is not None and thinking_effort.strip().lower() in {"", "none", "off", "default", "instant"}
-        if (
-            selected in LEGACY_THINKING_MODELS
-            and explicit_no_thinking
-            and not bool_env("ADVISOR_ALLOW_LEGACY_THINKING_MODEL", False)
-        ):
-            print(
-                f"Advisor replacing legacy Thinking model {selected!r} with {SAFE_NON_THINKING_MODEL!r}; "
-                "current ChatGPT metadata resolves that legacy route to gpt-5-3-mini unless "
-                "thinking_effort is extended/max.",
-                file=sys.stderr,
-            )
-            return SAFE_NON_THINKING_MODEL
-        return selected
-    pro_model = default_model_for(thinking_effort)
-    if model is None or model == pro_model:
-        return pro_model
-    if bool_env("ADVISOR_ALLOW_PRO_MODEL_OVERRIDE", False):
-        return model
-    if model in {DEFAULT_MODEL, *LEGACY_THINKING_MODELS}:
-        print(
-            f"Advisor Pro/Pro Extended overriding normal/legacy model {model!r} with {pro_model!r}.",
-            file=sys.stderr,
-        )
-        return pro_model
-    raise RuntimeError(
-        f"Refusing Pro/Pro Extended with model {model!r}; expected {pro_model!r}. "
-        "Use ADVISOR_PRO_EXTENDED_MODEL to update the ChatGPT Pro slug."
-    )
 
 
 def read_text(path: str) -> str:

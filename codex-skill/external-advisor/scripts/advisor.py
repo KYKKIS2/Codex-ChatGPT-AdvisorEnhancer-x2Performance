@@ -215,10 +215,11 @@ def effective_request_timeout(
     *,
     timeout_explicit: bool | None = None,
 ) -> int:
-    """Use an unlimited completion wait for implicit Pro Extended deadlines."""
+    """Use an unlimited completion wait unless the operator supplied a deadline."""
+    del thinking_effort
     if timeout_explicit is None:
         timeout_explicit = "ADVISOR_TIMEOUT" in os.environ or cli_option_was_supplied("--timeout")
-    if is_pro_extended_request(thinking_effort) and not timeout_explicit:
+    if not timeout_explicit:
         return 0
     return timeout
 
@@ -244,16 +245,17 @@ def select_request_thinking_effort(thinking_effort: str | None) -> str | None:
     if is_pro_request(thinking_effort) or allow_non_default_route():
         return thinking_effort
 
-    normalized_effort = normalize_thinking_effort(thinking_effort)
-    if thinking_effort is not None and normalized_effort != DEFAULT_CHATGPT_THINKING_EFFORT:
+    requested_effort = normalize_thinking_effort(thinking_effort)
+    selected_effort = normalize_thinking_effort(DEFAULT_CHATGPT_THINKING_EFFORT)
+    if thinking_effort is not None and requested_effort != selected_effort:
         print(
             "Advisor forcing non-Pro ADVISOR_THINKING_EFFORT to "
-            f"{DEFAULT_CHATGPT_THINKING_EFFORT!r} instead of {thinking_effort!r}. "
+            f"{selected_effort!r} instead of {thinking_effort!r}. "
             "Use ADVISOR_THINKING_EFFORT=pro-extended for Pro, or set "
             f"{ALLOW_NON_DEFAULT_ROUTE_ENV}=true only for deliberate diagnostics.",
             file=sys.stderr,
         )
-    return DEFAULT_CHATGPT_THINKING_EFFORT
+    return selected_effort
 
 
 def configured_thinking_effort(reasoning_effort: str | None) -> str | None:

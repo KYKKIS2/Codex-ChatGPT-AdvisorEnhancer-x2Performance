@@ -1277,7 +1277,7 @@ def test_advisor_main_coordination(root: Path) -> None:
 
     @contextlib.contextmanager
     def fake_coordinated_call(configured: str, state: Path, *, request_timeout: float):
-        if configured != original_base_url or state != state_path or request_timeout != 7:
+        if configured != original_base_url or state != state_path or request_timeout != 0:
             raise AssertionError("advisor main passed incorrect coordination inputs")
         events.append("enter")
         try:
@@ -1288,6 +1288,8 @@ def test_advisor_main_coordination(root: Path) -> None:
     def fake_call(_prompt: str, _model: str | None, _timeout: int) -> str:
         if os.environ.get("ADVISOR_BASE_URL") != worker_url:
             raise AssertionError("advisor call did not use its leased worker URL")
+        if _timeout != 0:
+            raise AssertionError("advisor main imposed a deadline on an implicit prompt-only call")
         events.append("call")
         return "coordinated guidance"
 
@@ -1316,11 +1318,13 @@ def test_advisor_main_coordination(root: Path) -> None:
     old = {name: getattr(advisor, name) for name in replacements}
     old_coordinated_call = concurrency.coordinated_call
     old_base = os.environ.get("ADVISOR_BASE_URL")
+    old_timeout = os.environ.get("ADVISOR_TIMEOUT")
     try:
         for name, value in replacements.items():
             setattr(advisor, name, value)
         concurrency.coordinated_call = fake_coordinated_call
         os.environ["ADVISOR_BASE_URL"] = original_base_url
+        os.environ.pop("ADVISOR_TIMEOUT", None)
         if advisor.main() != 0:
             raise AssertionError("advisor main returned failure")
     finally:
@@ -1331,6 +1335,10 @@ def test_advisor_main_coordination(root: Path) -> None:
             os.environ.pop("ADVISOR_BASE_URL", None)
         else:
             os.environ["ADVISOR_BASE_URL"] = old_base
+        if old_timeout is None:
+            os.environ.pop("ADVISOR_TIMEOUT", None)
+        else:
+            os.environ["ADVISOR_TIMEOUT"] = old_timeout
     if events != ["enter", "call", "write", "exit"]:
         raise AssertionError(f"advisor main coordination order changed: {events!r}")
     if not lease.success or lease.failure:

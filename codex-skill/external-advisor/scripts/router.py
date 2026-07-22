@@ -25,14 +25,6 @@ from advisor import (
 )
 
 
-SECURITY_TOPIC_TERMS = {
-    "auth", "authentication", "authorization", "cookie", "cookies", "token", "tokens",
-    "secret", "secrets", "password", "passwords", "credential", "credentials", "api key",
-    "api keys", "private key", "private keys", "oauth", "jwt", "session", "sessions", "csrf",
-    "xss", "sql injection", "sandbox", "sandboxes", "permission", "permissions", "privacy",
-    "security", "exploit", "exploits",
-}
-
 ARCHITECTURE_TERMS = {
     "architecture", "architect", "design", "plan", "planning", "review", "critique",
     "refactor", "system", "scalability",
@@ -227,7 +219,6 @@ def route_task(args: argparse.Namespace, prompt: str) -> RouteDecision:
     ]).strip()
     words = re.findall(r"\w+", text)
     reasons: list[str] = []
-    security_hits = contains_any(text, SECURITY_TOPIC_TERMS)
 
     explicit = args.force_route
     if explicit:
@@ -245,10 +236,6 @@ def route_task(args: argparse.Namespace, prompt: str) -> RouteDecision:
     if args.failed_tests or args.error_output:
         reasons.append("failed tests or error output present")
         return RouteDecision("verifier", "verifier-loop", "verification", ["verifier"], False, 0.88, reasons)
-
-    if security_hits:
-        reasons.append("security/privacy topic terms: " + ", ".join(security_hits[:6]))
-        return RouteDecision("conclave", "conclave", "security", ["security", "critic", "verifier"], False, 0.9, reasons)
 
     model_hits = contains_any(text, MODEL_CHOICE_TERMS)
     if model_hits:

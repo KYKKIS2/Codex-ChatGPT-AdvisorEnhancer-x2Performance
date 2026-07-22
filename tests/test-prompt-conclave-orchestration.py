@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
+import io
 import json
 import os
 import subprocess
@@ -26,12 +28,30 @@ def assert_timeout_policy() -> None:
         raise AssertionError("implicit Pro Extended timeout was not made unlimited")
     if advisor.effective_request_timeout(300, "pro-extended", timeout_explicit=True) != 300:
         raise AssertionError("explicit Pro Extended operator deadline was not preserved")
-    if advisor.effective_request_timeout(300, "max", timeout_explicit=False) != 300:
-        raise AssertionError("normal advisor timeout changed unexpectedly")
+    if advisor.effective_request_timeout(300, "max", timeout_explicit=False) != 0:
+        raise AssertionError("implicit normal advisor timeout was not made unlimited")
+    if advisor.effective_request_timeout(300, "max", timeout_explicit=True) != 300:
+        raise AssertionError("explicit normal advisor operator deadline was not preserved")
     if advisor.subprocess_timeout(0, 30) is not None:
         raise AssertionError("unlimited advisor timeout became a subprocess deadline")
     if advisor.subprocess_timeout(7, 10) != 17:
         raise AssertionError("bounded advisor subprocess grace calculation changed")
+
+
+def assert_effort_selection_is_shared_and_quiet() -> None:
+    advisor_stderr = io.StringIO()
+    with contextlib.redirect_stderr(advisor_stderr):
+        advisor_effort = advisor.select_request_thinking_effort("max")
+    conclave_stderr = io.StringIO()
+    with contextlib.redirect_stderr(conclave_stderr):
+        conclave_effort = conclave.select_request_thinking_effort("max")
+    if advisor_effort != "max" or conclave_effort != "max":
+        raise AssertionError("normal max effort was not preserved")
+    if advisor_stderr.getvalue() or conclave_stderr.getvalue():
+        raise AssertionError(
+            "normal max effort emitted a contradictory downgrade warning: "
+            f"{advisor_stderr.getvalue()!r} {conclave_stderr.getvalue()!r}"
+        )
 
 
 def base_args(project: Path, timeout: int) -> argparse.Namespace:
@@ -100,6 +120,51 @@ def assert_router_timeout_propagation() -> None:
         raise AssertionError("router bounded conclave timeout calculation changed unexpectedly")
 
 
+def assert_router_max_ml_prompt_regression() -> None:
+    env = os.environ.copy()
+    env["ADVISOR_THINKING_EFFORT"] = "max"
+    env.pop("ADVISOR_TIMEOUT", None)
+    prompt = (
+        "Review sequence model training with ordered per-event tokens and a frozen "
+        "HGB residual Transformer comparison."
+    )
+    with tempfile.TemporaryDirectory() as directory:
+        completed = subprocess.run(
+            [
+                sys.executable,
+                str(SCRIPTS / "router.py"),
+                "--project-dir",
+                directory,
+                "--prompt-only",
+                "--json",
+                "--prompt",
+                prompt,
+            ],
+            env=env,
+            text=True,
+            capture_output=True,
+            timeout=10,
+            check=False,
+        )
+    if completed.returncode != 0:
+        raise AssertionError(
+            f"offline max/router probe failed: {completed.stdout!r} {completed.stderr!r}"
+        )
+    payload = json.loads(completed.stdout)
+    if payload.get("route") != "conclave" or payload.get("mode") != "model-choice":
+        raise AssertionError(
+            "ML token prompt selected the wrong route: "
+            f"{payload.get('route')!r}/{payload.get('mode')!r}"
+        )
+    if any("security/privacy topic terms" in reason for reason in payload.get("reasons", [])):
+        raise AssertionError("ML token prompt was classified as a security topic")
+    command = payload.get("command_preview", [])
+    if "--timeout" not in command or command[command.index("--timeout") + 1] != "0":
+        raise AssertionError(f"implicit max route did not preserve timeout 0: {command!r}")
+    if "instead of 'max'" in completed.stderr:
+        raise AssertionError(f"max route emitted the stale no-op warning: {completed.stderr!r}")
+
+
 def assert_failed_roles_skip_synthesis() -> None:
     args = argparse.Namespace(no_synthesis=False)
     failures = [
@@ -121,9 +186,14 @@ def assert_failed_roles_skip_synthesis() -> None:
 
 
 def assert_conclave_cli_timeout_resolution() -> None:
-    env = os.environ.copy()
-    env["ADVISOR_THINKING_EFFORT"] = "pro-extended"
-    env.pop("ADVISOR_TIMEOUT", None)
+    for effort in ("max", "pro-extended"):
+        env = os.environ.copy()
+        env["ADVISOR_THINKING_EFFORT"] = effort
+        env.pop("ADVISOR_TIMEOUT", None)
+        assert_conclave_cli_timeout_cases(env, effort)
+
+
+def assert_conclave_cli_timeout_cases(env: dict[str, str], effort: str) -> None:
     for explicit, expected in (([], 0), (["--timeout", "7"], 7)):
         with tempfile.TemporaryDirectory() as directory:
             project = Path(directory)
@@ -158,15 +228,17 @@ def assert_conclave_cli_timeout_resolution() -> None:
             payload = json.loads(paths[0].read_text(encoding="utf-8"))
             if payload.get("timeout_seconds") != expected:
                 raise AssertionError(
-                    "conclave CLI resolved the wrong timeout: "
+                    f"conclave CLI resolved the wrong {effort} timeout: "
                     f"{payload.get('timeout_seconds')!r} != {expected!r}"
                 )
 
 
 def main() -> None:
     assert_timeout_policy()
+    assert_effort_selection_is_shared_and_quiet()
     assert_child_timeout_propagation()
     assert_router_timeout_propagation()
+    assert_router_max_ml_prompt_regression()
     assert_failed_roles_skip_synthesis()
     assert_conclave_cli_timeout_resolution()
     print("Prompt-only conclave orchestration tests passed.")

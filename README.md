@@ -302,11 +302,12 @@ python3 ~/.codex/skills/external-advisor/scripts/router.py \
   --prompt "What is the safest architecture for this change?"
 ```
 
-The router does not block a prompt merely because it discusses authentication,
-tokens, privacy, security, or other sensitive topics. Those words select an
-appropriate review lane. Prompt-only calls transmit the prompt, generated
-context-pack data, and explicitly selected context verbatim, including selected
-paths outside the project, because Codex controls that bounded payload. Set
+The router does not block or specially route a prompt merely because it
+discusses authentication, tokens, privacy, security, or other topic words.
+Normal task-shape signals choose the lane; use an explicit forced route when a
+security-specialist conclave is actually wanted. Prompt-only calls transmit the
+prompt, generated context-pack data, and explicitly selected context verbatim,
+including selected paths outside the project, because Codex controls that bounded payload. Set
 `ADVISOR_PROMPT_PROTECTION=true` only when legacy value redaction and protected
 prompt-context filtering are deliberately wanted. Repo-aware calls keep their
 mandatory sanitized-workspace, secret-scan, and denied-path controls because
@@ -349,13 +350,14 @@ python3 ~/.codex/skills/external-advisor/scripts/advisor.py \
   --prompt "Perform a deep architecture and failure-mode review."
 ```
 
-When neither `--timeout` nor `ADVISOR_TIMEOUT` is supplied, Pro Extended uses
-`--timeout 0`: prompt acceptance remains bounded, but completion may take as
-long as ChatGPT needs. An explicit positive timeout remains an operator
-deadline. Router and prompt-only conclave subprocesses preserve this unlimited
-setting instead of converting it into a short local kill deadline. The same
-rule applies to verifier, before-final critique, and evaluation subprocesses. A
-conclave also skips synthesis when no specialist completed successfully.
+When neither `--timeout` nor `ADVISOR_TIMEOUT` is supplied, every prompt-only
+lane uses `--timeout 0`: prompt acceptance remains bounded, but completion may
+take as long as ChatGPT needs. This applies to normal `max`, Pro Extended,
+router, conclave, verifier, before-final critique, and evaluation calls. An
+explicit positive timeout remains an operator deadline, and each wrapper layer
+preserves the selected policy instead of introducing its own local kill
+deadline. A conclave also skips synthesis when no specialist completed
+successfully.
 
 The current wrapper maps that request to the detected ChatGPT web Pro model
 slug and its required private effort metadata. Pro calls can take several
