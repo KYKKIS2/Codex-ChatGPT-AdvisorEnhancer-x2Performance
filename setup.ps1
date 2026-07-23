@@ -10,7 +10,6 @@ $Vendor = Join-Path $Root "vendor"
 $G4f = Join-Path $Vendor "gpt4free"
 $Venv = Join-Path $G4f ".venv"
 $Py = Join-Path $Venv "Scripts\python.exe"
-$Patch = Join-Path $Root "patches\gpt4free-advisor.patch"
 $RuntimePatch = Join-Path $Root "patches\apply_gpt4free_runtime_patch.py"
 $DevSpacePatch = Join-Path $Root "codex-skill\external-advisor\scripts\devspace_readonly_patch.py"
 $SkillsSource = Join-Path $Root "codex-skill"
@@ -32,7 +31,6 @@ $RequiredFiles = @(
     (Join-Path $Root "tests\test-eval-harness.ps1"),
     (Join-Path $Root "tests\test-advisor-concurrency.ps1"),
     (Join-Path $Root "tests\test-advisor-concurrency.py"),
-    (Join-Path $Root "patches\gpt4free-advisor.patch"),
     $RuntimePatch,
     $DevSpacePatch,
     (Join-Path $Root "codex-skill\external-advisor\SKILL.md"),
@@ -66,12 +64,17 @@ if (-not (Test-Path $G4f)) {
     $currentRef = (git -C $G4f rev-parse HEAD).Trim()
     $status = @(git -C $G4f status --porcelain --untracked-files=all)
     $unexpected = @()
+    $meaningfulVendorChanges = 0
     foreach ($line in $status) {
         if ([string]::IsNullOrWhiteSpace($line) -or $line.Length -lt 4) { continue }
         $changedPath = $line.Substring(3)
         if ($changedPath.Contains(" -> ")) {
             $changedPath = ($changedPath -split " -> ")[-1]
         }
+        if ($changedPath -like ".venv/*" -or $changedPath -like "har_and_cookies/*") {
+            continue
+        }
+        $meaningfulVendorChanges += 1
         if ($ExpectedVendorChanges -notcontains $changedPath) {
             $unexpected += $changedPath
         }
@@ -79,7 +82,7 @@ if (-not (Test-Path $G4f)) {
     if ($unexpected.Count -gt 0 -and -not $AllowUnverifiedVendor) {
         throw "Refusing vendor\gpt4free with unexpected local changes: $($unexpected -join ', ')"
     }
-    if ($currentRef -ne $Gpt4FreeRef -and $status.Count -gt 0 -and -not $AllowUnverifiedVendor) {
+    if ($currentRef -ne $Gpt4FreeRef -and $meaningfulVendorChanges -gt 0 -and -not $AllowUnverifiedVendor) {
         throw "Refusing dirty vendor\gpt4free at unexpected revision $currentRef; expected $Gpt4FreeRef."
     }
     if ($currentRef -ne $Gpt4FreeRef) {
@@ -100,25 +103,21 @@ try {
         python -m venv $Venv
     }
     & $Py -m pip install --upgrade pip
+    if ($LASTEXITCODE -ne 0) { throw "pip upgrade failed." }
     & $Py -m pip install -r requirements.txt
+    if ($LASTEXITCODE -ne 0) { throw "gpt4free requirements install failed." }
     & $Py -m pip install python-multipart a2wsgi Brotli pycryptodome python-dotenv
-
-    $hasTemporary = Select-String -Path "g4f\api\stubs.py" -Pattern "temporary: Optional\[bool\]" -Quiet
-    $hasHarFallback = Select-String -Path "g4f\Provider\openai\har_file.py" -Pattern "using generated proof token fallback" -Quiet
-    if (-not ($hasTemporary -and $hasHarFallback)) {
-        git apply --check --recount $Patch
-        git apply --recount $Patch
-    } else {
-        Write-Host "gpt4free base advisor patch already applied."
-    }
+    if ($LASTEXITCODE -ne 0) { throw "gpt4free supplemental dependency install failed." }
 
     & python $RuntimePatch $G4f
+    if ($LASTEXITCODE -ne 0) { throw "gpt4free advisor runtime patch failed." }
     & $Py -m py_compile `
         "g4f\api\stubs.py" `
         "g4f\Provider\openai\har_file.py" `
         "g4f\Provider\openai\models.py" `
         "g4f\Provider\needs_auth\OpenaiChat.py" `
         "g4f\providers\any_model_map.py"
+    if ($LASTEXITCODE -ne 0) { throw "gpt4free patched file compile check failed." }
 
     $HarDirectory = Join-Path $G4f "har_and_cookies"
     New-Item -ItemType Directory -Force -Path $HarDirectory | Out-Null
@@ -136,7 +135,7 @@ try {
         $acl.AddAccessRule($rule)
         Set-Acl -Path $HarDirectory -AclObject $acl
     } catch {
-        Write-Warning "Could not enforce owner-only ACL on $HarDirectory: $_"
+        Write-Warning "Could not enforce owner-only ACL on ${HarDirectory}: $_"
     }
 }
 finally {
@@ -154,6 +153,7 @@ if ($null -eq $DevSpaceCommand -or $InstalledDevSpaceVersion -ne $DevSpaceVersio
         throw "npm is required to install DevSpace $DevSpaceVersion for repo-aware advisor mode."
     }
     npm install --global "@waishnav/devspace@$DevSpaceVersion"
+    if ($LASTEXITCODE -ne 0) { throw "DevSpace install failed." }
     $DevSpaceCommand = Get-Command devspace -ErrorAction Stop
 }
 $InstalledDevSpaceVersion = (& $DevSpaceCommand.Source --version | Select-Object -Last 1).Trim()
@@ -161,6 +161,7 @@ if ($InstalledDevSpaceVersion -ne $DevSpaceVersion) {
     throw "DevSpace version verification failed: expected $DevSpaceVersion, got $InstalledDevSpaceVersion."
 }
 & python $DevSpacePatch --executable $DevSpaceCommand.Source
+if ($LASTEXITCODE -ne 0) { throw "DevSpace read-only patch failed." }
 
 New-Item -ItemType Directory -Force -Path $SkillsDest | Out-Null
 $BackupRoot = Join-Path $CodexHome ("skill-backups\" + (Get-Date).ToUniversalTime().ToString("yyyyMMddTHHmmssZ"))

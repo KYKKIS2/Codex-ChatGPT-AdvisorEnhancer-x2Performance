@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
 import shutil
 import stat
 import sys
@@ -125,7 +126,13 @@ def resolve_dist(executable: str) -> Path:
     resolved = shutil.which(executable) or executable
     path = Path(resolved).expanduser().resolve()
     candidates = [path.parent] if path.name == "cli.js" else []
+    if path.suffix.lower() in {".ps1", ".cmd", ".bat"} and path.is_file():
+        wrapper_text = path.read_text(encoding="utf-8", errors="ignore")
+        for match in re.finditer(r"node_modules[/\\]@waishnav[/\\]devspace[/\\]dist[/\\]cli\.js", wrapper_text):
+            candidate = (path.parent / match.group(0)).parent
+            candidates.append(candidate)
     candidates.extend(parent / "dist" for parent in path.parents)
+    candidates.append(path.parent / "node_modules" / "@waishnav" / "devspace" / "dist")
     for candidate in candidates:
         if (candidate / "cli.js").is_file() and (candidate / "config.js").is_file() and (candidate / "server.js").is_file():
             return candidate

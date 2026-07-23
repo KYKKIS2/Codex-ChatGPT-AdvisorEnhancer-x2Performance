@@ -11,7 +11,6 @@ VENDOR="$ROOT/vendor"
 G4F="$VENDOR/gpt4free"
 VENV="$G4F/.venv"
 PY="$VENV/bin/python"
-PATCH="$ROOT/patches/gpt4free-advisor.patch"
 RUNTIME_PATCH="$ROOT/patches/apply_gpt4free_runtime_patch.py"
 DEVSPACE_PATCH="$ROOT/codex-skill/external-advisor/scripts/devspace_readonly_patch.py"
 SKILLS_SOURCE="$ROOT/codex-skill"
@@ -37,7 +36,6 @@ REQUIRED_EXECUTABLES=(
   "$ROOT/tests/test-agent-conclave.sh"
 )
 REQUIRED_CORE_FILES=(
-  "$PATCH"
   "$RUNTIME_PATCH"
   "$ROOT/codex-skill/external-advisor/SKILL.md"
   "$ROOT/codex-skill/external-advisor/scripts/activity_monitor.py"
@@ -100,8 +98,13 @@ elif [[ -d "$G4F/.git" ]]; then
       sed -E 's/^.* -> //'
   )
   unexpected_vendor_changes=()
+  meaningful_vendor_changes=()
   for changed_path in "${vendor_changes[@]}"; do
     [[ -n "$changed_path" ]] || continue
+    if [[ "$changed_path" == .venv/* || "$changed_path" == har_and_cookies/* ]]; then
+      continue
+    fi
+    meaningful_vendor_changes+=("$changed_path")
     if ! vendor_path_is_expected "$changed_path"; then
       unexpected_vendor_changes+=("$changed_path")
     fi
@@ -112,7 +115,7 @@ elif [[ -d "$G4F/.git" ]]; then
     echo "Remove the changes or set ADVISOR_ALLOW_UNVERIFIED_VENDOR=true for a deliberate diagnostic." >&2
     exit 1
   fi
-  if [[ "$current_ref" != "$GPT4FREE_REF" && ${#vendor_changes[@]} -gt 0 && "$ADVISOR_ALLOW_UNVERIFIED_VENDOR" != "true" ]]; then
+  if [[ "$current_ref" != "$GPT4FREE_REF" && ${#meaningful_vendor_changes[@]} -gt 0 && "$ADVISOR_ALLOW_UNVERIFIED_VENDOR" != "true" ]]; then
     echo "Refusing dirty vendor/gpt4free at unexpected revision $current_ref; expected $GPT4FREE_REF." >&2
     exit 1
   fi
@@ -138,13 +141,6 @@ fi
 "$PY" -m pip install --upgrade pip
 "$PY" -m pip install -r requirements.txt
 "$PY" -m pip install python-multipart a2wsgi Brotli pycryptodome python-dotenv
-
-if grep -q 'temporary: Optional\[bool\]' g4f/api/stubs.py && grep -q 'using generated proof token fallback' g4f/Provider/openai/har_file.py; then
-  echo "gpt4free base advisor patch already applied."
-else
-  git apply --check --recount "$PATCH"
-  git apply --recount "$PATCH"
-fi
 
 python3 "$RUNTIME_PATCH" "$G4F"
 "$PY" -m py_compile \
