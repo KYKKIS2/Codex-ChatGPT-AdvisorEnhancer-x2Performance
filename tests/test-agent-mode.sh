@@ -109,8 +109,107 @@ printf 'safe\n' > "$PROJECT/README.md"
 git -C "$PROJECT" add README.md
 git -C "$PROJECT" commit -m "initial" >/dev/null
 
+PYTHONPATH="$SCRIPTS" python3 - "$PROJECT" "$OUTSIDE" <<'PY'
+import os
+import shlex
+import stat
+import subprocess
+import sys
+from pathlib import Path
+
+import agent_mode
+
+project = Path(sys.argv[1])
+outside = Path(sys.argv[2])
+marker = outside / "unsafe-git-helper-ran"
+helper = outside / "unsafe-git-helper.sh"
+helper.write_text(
+    "#!/bin/sh\n"
+    f": > {shlex.quote(str(marker))}\n"
+    "exit 0\n",
+    encoding="utf-8",
+)
+helper.chmod(stat.S_IRUSR | stat.S_IWUSR | stat.S_IXUSR)
+subprocess.run(
+    ["git", "-C", str(project), "config", "core.fsmonitor", str(helper)],
+    check=True,
+)
+if agent_mode.git_source_provenance(project).get("available"):
+    raise SystemExit("hardened Git provenance accepted command-bearing config")
+if agent_mode.check_worktree(project).available:
+    raise SystemExit("hardened Git worktree check accepted command-bearing config")
+if marker.exists():
+    raise SystemExit("repository core.fsmonitor executed before sandboxing")
+subprocess.run(
+    ["git", "-C", str(project), "config", "--unset", "core.fsmonitor"],
+    check=True,
+)
+if not agent_mode.git_source_provenance(project).get("available"):
+    raise SystemExit("hardened Git provenance did not recover after unsafe config removal")
+subprocess.run(
+    ["git", "-C", str(project), "config", "filter.evil.process", str(helper)],
+    check=True,
+)
+if agent_mode.git_source_provenance(project).get("available"):
+    raise SystemExit("hardened Git provenance accepted a command-bearing filter")
+if marker.exists():
+    raise SystemExit("repository filter process executed before sandboxing")
+subprocess.run(
+    ["git", "-C", str(project), "config", "--unset", "filter.evil.process"],
+    check=True,
+)
+
+escaped_project = str(project).replace("\\", "\\\\").replace(" ", "\\040")
+escaped_nested = str(project / "nested-mount").replace("\\", "\\\\").replace(" ", "\\040")
+mountinfo = (
+    f"1 0 0:1 / {escaped_project} rw - ext4 /dev/test rw\n"
+    f"2 1 0:2 / {escaped_nested} rw - tmpfs tmpfs rw\n"
+)
+try:
+    agent_mode.verify_source_tree_boundary(project, mountinfo_text=mountinfo)
+except RuntimeError as exc:
+    if "descendant mount point" not in str(exc):
+        raise
+else:
+    raise SystemExit("source boundary accepted a descendant mount")
+
+outside_target = outside / "hardlink-target"
+outside_target.write_text("outside\n", encoding="utf-8")
+hardlink = project / "hardlink-fixture"
+os.link(outside_target, hardlink)
+scan = agent_mode.scan_project_secrets(project)
+if scan.ok or not any("hardlinked regular file" in error for error in scan.errors):
+    raise SystemExit("secret preflight accepted a hardlinked source")
+plan = agent_mode.build_sanitized_copy_plan(
+    project,
+    max_content_bytes=agent_mode.DEFAULT_SECRET_SCAN_MAX_BYTES,
+)
+if not any("hardlinked regular file" in error for error in plan.errors):
+    raise SystemExit("sanitized copy accepted a hardlinked source")
+hardlink.unlink()
+
+os.environ[agent_mode.SANITIZED_MAX_ENTRIES_ENV] = "1"
+plan = agent_mode.build_sanitized_copy_plan(
+    project,
+    max_content_bytes=agent_mode.DEFAULT_SECRET_SCAN_MAX_BYTES,
+)
+if not any("max entry limit" in error for error in plan.errors):
+    raise SystemExit("sanitized copy ignored its entry limit")
+os.environ.pop(agent_mode.SANITIZED_MAX_ENTRIES_ENV)
+
+os.environ[agent_mode.SANITIZED_MAX_TOTAL_BYTES_ENV] = "1"
+plan = agent_mode.build_sanitized_copy_plan(
+    project,
+    max_content_bytes=agent_mode.DEFAULT_SECRET_SCAN_MAX_BYTES,
+)
+if not any("aggregate byte limit" in error for error in plan.errors):
+    raise SystemExit("sanitized copy ignored its aggregate byte limit")
+os.environ.pop(agent_mode.SANITIZED_MAX_TOTAL_BYTES_ENV)
+PY
+
 cat > "$FAKE_BIN/fake_devspace_server.py" <<'PY'
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import json
 import os
 
 
@@ -118,8 +217,30 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path == "/mcp":
             self.send_response(401)
-            self.send_header("WWW-Authenticate", 'Bearer resource_metadata="http://127.0.0.1/.well-known/oauth-protected-resource"')
+            metadata = (
+                f"http://127.0.0.1:{self.server.server_port}"
+                "/.well-known/oauth-protected-resource/mcp"
+            )
+            self.send_header(
+                "WWW-Authenticate",
+                f'Bearer resource_metadata="{metadata}"',
+            )
             self.end_headers()
+            return
+        if self.path == "/.well-known/oauth-protected-resource/mcp":
+            body = json.dumps(
+                {
+                    "resource": f"http://127.0.0.1:{self.server.server_port}/mcp",
+                    "authorization_servers": [
+                        f"http://127.0.0.1:{self.server.server_port}/"
+                    ],
+                }
+            ).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
             return
         self.send_response(404)
         self.end_headers()
@@ -326,18 +447,23 @@ from pathlib import Path
 
 import agent_mode
 
-scan = agent_mode.scan_project_secrets(Path(sys.argv[1]))
-if not any(
-    finding.path == "special-source-fifo" and finding.kind == "special"
-    for finding in scan.findings
-):
+project = Path(sys.argv[1])
+scan = agent_mode.scan_project_secrets(project)
+if scan.ok or not any("unsupported entry" in error for error in scan.errors):
     raise SystemExit("secret preflight did not reject a non-regular source entry")
+(project / "special-source-fifo").unlink()
 PY
 python3 - "$PROJECT/large-secret-fixture.txt" <<'PY'
 import sys
 from pathlib import Path
 
 Path(sys.argv[1]).write_text("x" * 262145, encoding="utf-8")
+PY
+python3 - "$PROJECT/large-source-fixture.py" <<'PY'
+import sys
+from pathlib import Path
+
+Path(sys.argv[1]).write_text("# safe source fixture\n" + ("value = 1\n" * 30000), encoding="utf-8")
 PY
 python3 "$SCRIPTS/agent_mode.py" \
   --print-handoff \
@@ -393,6 +519,10 @@ if [[ -e "$sanitized_dir/large-secret-fixture.txt" ]]; then
   echo "Sanitized workspace copied an unscanned oversized text file." >&2
   exit 1
 fi
+if ! cmp -s "$PROJECT/large-source-fixture.py" "$sanitized_dir/large-source-fixture.py"; then
+  echo "Sanitized workspace omitted or changed inspectable large Python source." >&2
+  exit 1
+fi
 if [[ -e "$sanitized_dir/binary-secret-fixture.bin" ]]; then
   echo "Sanitized workspace copied an uninspectable binary file." >&2
   exit 1
@@ -441,7 +571,6 @@ for expected in (
     "binary-secret-fixture.bin",
     "ADVISOR_SANITIZED_WORKSPACE.md",
     "SANITIZED_WORKSPACE_MANIFEST.json",
-    "special-source-fifo",
 ):
     if expected not in skipped:
         raise SystemExit(f"private sanitization audit did not record the omission for {expected}")
@@ -641,14 +770,49 @@ PY
 PYTHONPATH="$SCRIPTS" python3 - <<'PY'
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import json
+import tempfile
+from pathlib import Path
 
+import advisor_agent
 import advisor_agent_connect
 
 
 class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
-        self.send_response(401)
-        self.send_header("WWW-Authenticate", "Bearer")
+        if self.path == "/mcp":
+            metadata = (
+                f"http://127.0.0.1:{self.server.server_port}"
+                "/.well-known/oauth-protected-resource/mcp"
+            )
+            self.send_response(401)
+            self.send_header(
+                "WWW-Authenticate",
+                f'Bearer resource_metadata="{metadata}"',
+            )
+            self.end_headers()
+            return
+        if self.path == "/.well-known/oauth-protected-resource/mcp":
+            body = json.dumps(
+                {
+                    "resource": f"http://127.0.0.1:{self.server.server_port}/mcp",
+                    "authorization_servers": [
+                        f"http://127.0.0.1:{self.server.server_port}/"
+                    ],
+                }
+            ).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+        if self.path == "/bare":
+            self.send_response(401)
+            self.send_header("WWW-Authenticate", "Bearer")
+            self.end_headers()
+            return
+        self.send_response(404)
         self.end_headers()
 
     def log_message(self, *_args):
@@ -660,13 +824,31 @@ thread = threading.Thread(target=server.serve_forever, daemon=True)
 thread.start()
 try:
     live = advisor_agent_connect.probe_mcp_url(f"http://127.0.0.1:{server.server_port}/mcp")
+    bare = advisor_agent_connect.probe_mcp_url(f"http://127.0.0.1:{server.server_port}/bare")
     stale = advisor_agent_connect.probe_mcp_url("https://advisor-stale.invalid/mcp", timeout=0.5)
 finally:
     server.shutdown()
 if not live["ready"]:
     raise SystemExit(f"live MCP challenge was not accepted: {live}")
+if bare["ready"]:
+    raise SystemExit("bare Bearer challenge was accepted without OAuth metadata")
 if stale["ready"]:
     raise SystemExit("stale public URL was accepted as connector-ready")
+
+with tempfile.TemporaryDirectory() as directory:
+    log = Path(directory) / "devspace.log"
+    record = {
+        "event": "tool_call",
+        "tool": "read",
+        "success": True,
+        "workspaceId": "ws-test",
+        "path": "README.md",
+    }
+    advisor_agent.MAX_PRIVATE_TOOL_LOG_BYTES = 256
+    log.write_bytes(b"x" * 1024 + b"\n" + json.dumps(record).encode("utf-8") + b"\n")
+    records = advisor_agent.read_tool_records(log)
+    if len(records) != 1 or records[0]["tool"] != "read":
+        raise SystemExit("bounded private tool-log reader lost the complete tail record")
 PY
 
 python3 "$SCRIPTS/advisor_agent_setup.py" \
@@ -790,6 +972,19 @@ python3 "$SCRIPTS/advisor_agent_connect.py" \
   --task "Review via connected advisor." >/tmp/advisor-agent-connect-prepare.txt
 grep -q "chatgpt_connector_url: https://manual-devspace.trycloudflare.com/mcp" /tmp/advisor-agent-connect-prepare.txt
 grep -q "Advisor Agent-Mode Handoff" /tmp/advisor-agent-connect-prepare.txt
+
+ADVISOR_AGENT_SECRET_SCAN_MAX_FILES=0 \
+python3 "$SCRIPTS/advisor_agent_connect.py" \
+  prepare \
+  --project-dir "$PROJECT" \
+  --allowed-root "$PROJECT" \
+  --bridge-executable "$FAKE_BIN/devspace" \
+  --config-path "$CONFIG" \
+  --sanitized-workspace off \
+  --no-secret-scan \
+  --public-base-url "https://manual-devspace.trycloudflare.com" \
+  >/tmp/advisor-agent-connect-no-secret-scan.txt
+grep -q "workspace_mode: project_or_worktree" /tmp/advisor-agent-connect-no-secret-scan.txt
 
 if python3 "$SCRIPTS/advisor_agent_connect.py" \
   prepare \

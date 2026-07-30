@@ -25,7 +25,7 @@ from pathlib import Path
 from typing import Any, Callable
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlparse, urlunparse
-from urllib.request import Request, urlopen
+from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 import advisor_concurrency as concurrency
 import advisor_safety as safety
@@ -38,6 +38,24 @@ DEFAULT_CONNECT_TIMEOUT = 30
 HTTPS_URL_RE = re.compile(r"https://[^\s\"'<>]+")
 QUICK_TUNNEL_URL_RE = re.compile(r"https://[A-Za-z0-9-]+\.trycloudflare\.com(?:/[^\s\"'<>]*)?")
 VALID_TUNNEL_MODES = {"auto", "configured", "off"}
+RESOURCE_METADATA_RE = re.compile(
+    r'\bresource_metadata\s*=\s*"([^"\r\n]{1,2048})"',
+    re.IGNORECASE,
+)
+MAX_OAUTH_METADATA_BYTES = 64 * 1024
+
+
+class NoRedirectHandler(HTTPRedirectHandler):
+    def redirect_request(
+        self,
+        req: Request,
+        fp: Any,
+        code: int,
+        msg: str,
+        headers: Any,
+        newurl: str,
+    ) -> None:
+        return None
 
 
 def configure_stdio() -> None:
@@ -214,6 +232,8 @@ def probe_mcp_url(url: str, *, timeout: float = 5.0) -> dict[str, Any]:
         "ready": False,
         "status": 0,
         "oauth_challenge": False,
+        "metadata_valid": False,
+        "metadata_url": "",
         "checked_utc": utc_now(),
         "error": "",
     }
@@ -222,11 +242,13 @@ def probe_mcp_url(url: str, *, timeout: float = 5.0) -> dict[str, Any]:
         method="GET",
         headers={"Accept": "application/json, text/event-stream"},
     )
+    challenge = ""
+    client = build_opener(NoRedirectHandler())
     try:
         response = (
             concurrency.open_loopback_url(request, timeout=timeout)
             if concurrency.loopback_url_candidate(url)
-            else urlopen(request, timeout=timeout)
+            else client.open(request, timeout=timeout)
         )
         with response:
             result["status"] = int(getattr(response, "status", 0) or 0)
@@ -242,9 +264,91 @@ def probe_mcp_url(url: str, *, timeout: float = 5.0) -> dict[str, Any]:
         reason = getattr(exc, "reason", exc)
         result["error"] = safety.truncate(safety.redact_sensitive_text(str(reason)), 240)
         return result
-    result["ready"] = result["status"] == 401 and result["oauth_challenge"]
+    metadata_match = RESOURCE_METADATA_RE.search(challenge)
+    if result["status"] == 401 and result["oauth_challenge"] and metadata_match:
+        metadata_url = metadata_match.group(1)
+        result["metadata_url"] = metadata_url
+        try:
+            requested = urlparse(url)
+            metadata = urlparse(metadata_url)
+            requested_port = requested.port or (
+                443 if requested.scheme == "https" else 80
+            )
+            metadata_port = metadata.port or (
+                443 if metadata.scheme == "https" else 80
+            )
+            same_origin = (
+                metadata.scheme == requested.scheme
+                and metadata.hostname == requested.hostname
+                and metadata_port == requested_port
+                and metadata.username is None
+                and metadata.password is None
+                and not metadata.fragment
+                and metadata.path.startswith(
+                    "/.well-known/oauth-protected-resource"
+                )
+            )
+        except ValueError:
+            same_origin = False
+        if same_origin:
+            metadata_request = Request(
+                metadata_url,
+                method="GET",
+                headers={"Accept": "application/json"},
+            )
+            try:
+                metadata_response = (
+                    concurrency.open_loopback_url(metadata_request, timeout=timeout)
+                    if concurrency.loopback_url_candidate(metadata_url)
+                    else client.open(metadata_request, timeout=timeout)
+                )
+                with metadata_response:
+                    body = metadata_response.read(MAX_OAUTH_METADATA_BYTES + 1)
+                    content_type = str(
+                        metadata_response.headers.get("Content-Type") or ""
+                    ).lower()
+                    if (
+                        int(getattr(metadata_response, "status", 0) or 0) == 200
+                        and len(body) <= MAX_OAUTH_METADATA_BYTES
+                        and "json" in content_type
+                    ):
+                        parsed = json.loads(body.decode("utf-8"))
+                        servers = (
+                            parsed.get("authorization_servers")
+                            if isinstance(parsed, dict)
+                            else None
+                        )
+                        result["metadata_valid"] = bool(
+                            isinstance(parsed, dict)
+                            and parsed.get("resource") == url
+                            and isinstance(servers, list)
+                            and servers
+                            and all(
+                                isinstance(server, str)
+                                and urlparse(server).scheme in {"http", "https"}
+                                for server in servers
+                            )
+                        )
+            except (
+                HTTPError,
+                URLError,
+                OSError,
+                RuntimeError,
+                TimeoutError,
+                UnicodeError,
+                json.JSONDecodeError,
+            ):
+                result["metadata_valid"] = False
+    result["ready"] = bool(
+        result["status"] == 401
+        and result["oauth_challenge"]
+        and result["metadata_valid"]
+    )
     if not result["ready"] and not result["error"]:
-        result["error"] = "endpoint did not return the expected OAuth Bearer challenge"
+        result["error"] = (
+            "endpoint did not return a same-origin OAuth Bearer challenge and "
+            "valid protected-resource metadata"
+        )
     return result
 
 
@@ -305,7 +409,18 @@ def configure_allowed_roots(args: argparse.Namespace, *, dry_run: bool = False) 
     if agent_mode.path_is_same_or_child(config_path, project, case_insensitive=case_insensitive):
         errors.append("agent config path must live outside the project being exposed")
 
-    scan = agent_mode.scan_project_secrets(project, allow_sensitive_project=args.allow_sensitive_project)
+    if args.no_secret_scan:
+        scan = agent_mode.SecretScanResult(
+            True,
+            str(project),
+            allow_sensitive_project=args.allow_sensitive_project,
+        )
+        scan.warnings.append("secret preflight scan disabled by explicit configuration")
+    else:
+        scan = agent_mode.scan_project_secrets(
+            project,
+            allow_sensitive_project=args.allow_sensitive_project,
+        )
     warnings.extend(scan.warnings)
     sanitized = None
     sanitized_mode = (args.sanitized_workspace or agent_mode.DEFAULT_SANITIZED_WORKSPACE_MODE).strip().lower()
@@ -494,6 +609,21 @@ def start_logged_process(
         )
 
 
+def minimal_process_environment() -> dict[str, str]:
+    environment = {
+        "PATH": os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin"),
+        "HOME": str(Path.home()),
+        "LANG": "C.UTF-8",
+        "LC_ALL": "C.UTF-8",
+        "NO_COLOR": "1",
+    }
+    for name in ("USER", "LOGNAME", "XDG_CONFIG_HOME", "XDG_DATA_HOME"):
+        value = os.environ.get(name)
+        if value:
+            environment[name] = value
+    return environment
+
+
 def start_quick_tunnel(
     args: argparse.Namespace,
     *,
@@ -510,7 +640,13 @@ def start_quick_tunnel(
         )
     command = [executable, "tunnel", "--no-autoupdate", "--url", local_origin]
     safety.atomic_write_text(log_path, "")
-    proc = start_logged_process(command, cwd=cwd, env=os.environ.copy(), log_path=log_path, label="cloudflared start")
+    proc = start_logged_process(
+        command,
+        cwd=cwd,
+        env=minimal_process_environment(),
+        log_path=log_path,
+        label="cloudflared start",
+    )
     try:
         if on_started is not None:
             on_started(proc)
@@ -531,22 +667,28 @@ def exposure_root_for_status(status: agent_mode.AgentModeStatus) -> Path:
 
 
 def verify_devspace_readonly_mode(executable: str) -> None:
-    patcher = Path(__file__).resolve().with_name("devspace_readonly_patch.py")
-    completed = subprocess.run(
-        [sys.executable, str(patcher), "--check", "--executable", executable],
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        capture_output=True,
-        timeout=15,
-    )
-    if completed.returncode != 0:
-        details = safety.redact_sensitive_text(completed.stderr.strip() or completed.stdout.strip())
-        raise RuntimeError(
-            "DevSpace does not have the required read-only advisor tool mode. "
-            "Rerun this repository's setup script before serving the connector."
-            + (f" Diagnostic: {details}" if details else "")
+    for patch_name in (
+        "devspace_readonly_patch.py",
+        "devspace_secure_origin_patch.py",
+    ):
+        patcher = Path(__file__).resolve().with_name(patch_name)
+        completed = subprocess.run(
+            [sys.executable, str(patcher), "--check", "--executable", executable],
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            capture_output=True,
+            timeout=15,
         )
+        if completed.returncode != 0:
+            details = safety.redact_sensitive_text(
+                completed.stderr.strip() or completed.stdout.strip()
+            )
+            raise RuntimeError(
+                "DevSpace does not have the required advisor security patches. "
+                "Rerun this repository's setup script before serving the connector."
+                + (f" Diagnostic: {details}" if details else "")
+            )
 
 
 def start_devspace_process(
@@ -561,7 +703,7 @@ def start_devspace_process(
     command = command_for_devspace(args, status)
     if not args.allow_unpatched_devspace:
         verify_devspace_readonly_mode(args.bridge_executable)
-    env = os.environ.copy()
+    env = minimal_process_environment()
     env["DEVSPACE_PUBLIC_BASE_URL"] = base_url
     env["DEVSPACE_ALLOWED_ROOTS"] = str(exposure_root_for_status(status))
     env["HOST"] = str(runtime["host"])

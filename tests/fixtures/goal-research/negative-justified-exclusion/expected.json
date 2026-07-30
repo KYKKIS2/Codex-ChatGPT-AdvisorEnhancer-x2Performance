@@ -1,0 +1,7 @@
+{
+  "justified_exclusion": {
+    "field_family": "display_label",
+    "classification": "excluded_with_justification",
+    "critical": false
+  }
+}

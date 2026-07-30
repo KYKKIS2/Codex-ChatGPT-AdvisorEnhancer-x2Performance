@@ -13,6 +13,8 @@ Prompt-only advisor calls do not have implicit access to the local repository, f
 
 Repo-aware advisor agent-mode is the preferred default for non-trivial critique, planning, architecture, and broad repo-analysis requests when a safe allowed root and a registered, live DevSpace-compatible MCP bridge are configured. `advisor_agent.py` runs the review in an isolated ChatGPT conversation, requires bounded read-only repository inspection, and verifies that exact conversation's MCP calls before accepting the answer. It does not replace Codex verification, and Codex remains the default implementer.
 
+For a broad multi-iteration implementation goal where the main risk is goal drift, proxy success, missing information, stale evidence, or repeated failed ideas, explicitly use `scripts/goal_research.py`. It is a foreground, event-sourced research-and-delivery controller. Codex remains the only editor and local command runner; repo-aware roles remain read-only. Do not substitute it for a routine one-shot review, and do not expect `router.py` to select it automatically in v1.
+
 If local `.codex-advisor` state has been deliberately synced to a ChatGPT web conversation that already has an enabled DevSpace/MCP connector for the project, continuing that exact conversation through the local g4f/OpenAI-compatible adapter can be repo-aware, like typing into the same ChatGPT web chat. Codex may then ask the advisor to use the connected DevSpace repo tools for targeted inspection. This only applies to the same saved conversation id with the connector still enabled, the tunnel/DevSpace bridge still running, and connector auth still valid. Do not assume repo access for a new chat, a different conversation key, a temporary advisor call, a disabled connector, or a dead tunnel.
 
 ## Decision
@@ -33,12 +35,13 @@ Skip the advisor for routine code edits, implementation work, direct debugging, 
 
 For repo-aware critique, prefer `scripts/router.py --execute`. The router selects `agent-mode` for a single repo-aware reviewer and upgrades multi-role conclave decisions to `agent-conclave` only after the current connector has completed one successful fail-closed ChatGPT MCP turn. Local tunnel readiness alone does not prove that the URL was added to ChatGPT. Fresh or rotated connectors therefore stay on prompt-only lanes until a direct `advisor_agent.py` call verifies the attachment; `--force-route agent-mode` can bootstrap that diagnostic. Agent routes also require a narrow allowed root, a trusted bridge, a connector-ready runtime, and either a clean secret preflight or a generated sanitized review workspace. If a safety or readiness check fails, or if `--prompt-only`/`ADVISOR_AGENT_MODE=off` is set, the router falls back to the existing prompt-only advisor, conclave, or verifier path.
 
-The four primary lanes are:
+The five explicit lanes are:
 
 - `scripts/advisor.py`: one prompt-only reasoning pass; it sees only supplied context.
 - `scripts/conclave.py`: multiple prompt-only specialist passes plus synthesis.
 - `scripts/advisor_agent.py`: one repo-aware read-only specialist using the registered MCP connector.
 - `scripts/agent_conclave.py`: multiple isolated repo-aware specialists, followed by prompt-only synthesis. Role subprocesses may launch concurrently, while the machine-wide remote FIFO admits two ChatGPT turns by default; each admitted role receives one disposable g4f worker.
+- `scripts/goal_research.py`: a bounded multi-iteration goal controller with durable goal fidelity, competing hypotheses, Codex receipts, fresh current-snapshot post-change audits, and a blind completion audit.
 
 Use `scripts/conclave.py` instead of `scripts/advisor.py` when the task would benefit from multiple specialist viewpoints, such as:
 
@@ -51,11 +54,80 @@ Use `scripts/conclave.py` instead of `scripts/advisor.py` when the task would be
 
 Use `scripts/agent_conclave.py` for hard architecture, security, broad code-review, or high-impact strategy tasks where independent specialists should inspect the repository. Each role must prove its own `open_workspace` plus read/search activity from its exact ChatGPT conversation. When ChatGPT retains a read/search result but omits its request node, the wrapper additionally requires a matching private DevSpace record under the unique workspace id returned by that conversation's open call. An unmatched failed graph-only open request is tolerated only when that private workspace-attributed log proves exactly one real successful open and every normal safety check passes. An uncorrelated shared log window is observability only and is never accepted as role evidence.
 
+Use `scripts/goal_research.py` only after Codex has written a versioned goal contract with explicit clauses, acceptance dimensions, allowed scope, budgets, and stopping conditions. The controller runs a goal-fidelity steward; independent cartographer, falsifier, verifier, and clean-room remapper roles; at most two justified temporary specialists; one claim-ID challenge; and one prompt-only synthesis. It keeps at most three active explanations and emits one hypothesis-scoped packet. A temporary specialist is permitted only when one extra read-only repository inspection can resolve a current unknown; it cannot select another specialist. The controller then waits for Codex implementation and a separate local-verification receipt before the stable post-change auditor inspects a fresh current snapshot. An accepted iteration is not goal completion. Completion also requires a fresh clause/acceptance trace, no critical contradiction, and a blind repo-aware final audit.
+
+Goal-research grounding and audits require the same generated sanitized workspace and exact MCP evidence as `advisor_agent.py`; they never fall back silently to prompt-only advice. The controller never runs project commands, changes source, commits, resets, reverts, or grants waivers. A non-invariant waiver must be part of a frozen goal version and contain an actual explicit user decision; hard invariants cannot be waived.
+
 Use `scripts/router.py` when Codex needs to decide the path from the task shape. It chooses among no-advisor, agent-mode, agent-conclave, single-advisor, conclave, verifier loop, and machine-json verifier loop.
 
 Router prompt classification never treats the mere presence of authentication, token, privacy, or security topic words as sensitive data, and those words do not select a special lane. Normal task-shape signals choose the route; force a security mode explicitly when a security-specialist conclave is actually needed. Boundary-aware term matching prevents fragments such as `auth` in `authoritative` or `rl` in `world` from changing the route. Prompt-only calls transmit the prompt, generated context-pack data, and explicitly selected context verbatim, including selected paths outside the project, because Codex controls that bounded payload. `ADVISOR_PROMPT_PROTECTION=true` restores legacy prompt redaction and protected-context filtering as an opt-in diagnostic. Repo-aware calls always retain sanitized-workspace, secret-scan, and denied-path controls because the remote agent can discover files beyond the explicit prompt.
 
-Use `scripts/advisor_agent_connect.py serve --project-dir .` when the user wants Codex to automate the local side of repo-aware ChatGPT agent-mode. The connect helper validates/writes the generated sanitized workspace root in the user-level config, verifies the pinned DevSpace read-only patch, starts DevSpace plus an optional managed Cloudflare quick tunnel, checks both local and public MCP readiness, prints the exact `https://.../mcp` ChatGPT connector URL, and prints the review handoff. It records managed child processes before readiness, so an interrupted startup can be recovered with the normal lifecycle commands. It never edits ChatGPT account settings; the user still pastes the printed URL into ChatGPT Settings -> Apps & Connectors -> Developer Mode -> Create app/connector. Use `scripts/advisor_agent_connect.py status --project-dir .` to verify readiness and `scripts/advisor_agent_connect.py stop --project-dir .` to stop both managed processes.
+Use `scripts/advisor_agent_connect.py serve --project-dir .` when the user wants Codex to automate the local side of repo-aware ChatGPT agent-mode. The connect helper validates/writes the generated sanitized workspace root in the user-level config, verifies both pinned DevSpace security patches, starts DevSpace with a minimal environment plus an optional managed Cloudflare quick tunnel, and requires a same-origin OAuth challenge with valid protected-resource metadata before reporting local/public readiness. It prints the exact `https://.../mcp` ChatGPT connector URL and review handoff. It records managed child processes before readiness, so an interrupted startup can be recovered with the normal lifecycle commands. It never edits ChatGPT account settings; the user still pastes the printed URL into ChatGPT Settings -> Apps & Connectors -> Developer Mode -> Create app/connector. Use `scripts/advisor_agent_connect.py status --project-dir .` to verify readiness and `scripts/advisor_agent_connect.py stop --project-dir .` to stop both managed processes.
+
+When the user explicitly requests a permanent custom-domain connector with
+write and shell access to an original checkout, use
+`scripts/advisor_domain_mcp.py` and follow
+`references/cloudflare-domain-mcp.md`. This is a separate high-trust Linux operator mode:
+Cloudflare Access Managed OAuth and origin-side JWT validation are mandatory,
+the selected original checkout is pinned at `/workspace`, the gateway and
+DevSpace run in separate Bubblewrap namespaces, and each `bash` tool call runs
+in another short-lived network-isolated Bubblewrap namespace. The shell cannot
+see the service sockets, manager state, gateway configuration, or credential.
+Recognized sensitive path names are masked, Git metadata is read-only, and dirty
+checkout state requires explicit `--allow-dirty-checkout`. Tracked
+modifications and non-ignored untracked contents are hash-pinned. Ignored data
+and model trees remain live and visible without byte hashing, while descendant
+mounts, hardlinks, special files, unsafe Git configuration, or a checkout-local
+runtime fail closed.
+The complete checkout receives a native metadata-only boundary pass. Sensitive
+names are masked outside intentionally exposed bulk artifact/data/model/output
+roots, virtual environments, and `node_modules`; those bulk roots are not
+content-hashed or enumerated for secret-name masking. Local Git configuration
+and hooks are hidden. This is still an
+original-checkout mode, not a sanitized copy: confidential content under
+ordinary filenames and reachable Git history can remain visible. It has no
+DevSpace owner password.
+Before starting, require a current `audit-cloudflare` pass proving one restricted
+Cloudflare IdP, account membership, phishing-resistant MFA, one exact ChatGPT
+redirect URI, disabled localhost/loopback clients, an active zone with one
+proxied CNAME, one active connector across complete paginated API inventories,
+an explicit loopback-only cloudflared diagnostics endpoint proving that exact
+local connector, the exact named-tunnel Unix origin with a final deny catch-all
+and tunnel-side Access validation, and short Access/OAuth sessions. The audit
+must match a root-owned local marker containing only the exact tunnel UUID and
+expires after 24 hours.
+Cloudflare authenticates the exact allowed account member, while ChatGPT holds
+the resulting connector grant. Knowing the URL or allowed email is
+insufficient, but anyone sharing the authorized ChatGPT account shares the
+connector's authority because the MCP cannot distinguish humans behind one
+ChatGPT login.
+Never use an unprivileged loopback TCP origin for this mode. Starts are bounded
+and non-persistent: the manager installs a one-shot expiry timer, applies
+CPU/memory/process/file-size and filesystem-reserve ceilings, pins runtime
+hashes and the exact Git state, and defaults to a 60-minute window. The
+permanent connector exposes `exec_command` plus `write_stdin` as its only shell
+execution path; the upstream synchronous `bash` tool is disabled so long
+builds, tests, and training cannot be killed by its request timeout. A running
+command continues in the same repository, CUDA, network, and resource sandbox
+until it exits or the connector window ends. Exact retries
+reuse the active or five-minute retained completion across MCP reconnects.
+Reuse one `executionKey` for retries and use distinct keys for intentional
+identical parallel runs; `allowConcurrentDuplicate=true` is an explicit
+unprotected bypass. The gateway allows eight authenticated MCP operations in
+parallel by default (`--max-concurrent` accepts 1 through 64), and the same
+value caps active asynchronous process sessions. Every operation stays within
+the same exact `/workspace` boundary. Finite tool operations retain their slot
+until the upstream operation ends even if the client disconnects. Long-lived
+MCP GET event streams use separate bounded capacity and are terminated at the
+origin when their client disconnects, so reconnects cannot exhaust command
+capacity. The
+free-space guard and per-file limit are reactive protections, not a hard
+aggregate quota for direct writes to the original checkout. Keep the ChatGPT
+app on **Any changes** / ask-before-writes so
+the destructive `write`, `edit`, `bash`, and process annotations trigger approval. Never
+route normal advisor agents or conclaves through this full surface
+automatically; their generated sanitized read-only connector and MCP evidence
+rules remain unchanged.
 
 Use `scripts/advisor_agent_setup.py --auto --project-dir .` only when you want to write the allowed-root config without starting DevSpace. If the project contains blocked local files, setup can generate a sanitized workspace under `~/.codex/advisor-agent/workspaces/` and record that generated root too. Use `scripts/agent_mode.py --doctor` to validate local agent-mode readiness without launching DevSpace, opening a tunnel, invoking `npx`, contacting ChatGPT, or writing credentials. Use `scripts/agent_mode.py --print-handoff` to generate only the review-first ChatGPT handoff. The handoff tells ChatGPT to open the pinned path in checkout mode, inspect and review only, avoid secrets, and stay within the sanitized snapshot; worktree and base-ref opens are unavailable.
 
@@ -73,11 +145,13 @@ Use `scripts/eval_harness.py` to compare Codex-only, single-advisor, conclave, a
 
 ## Workflow
 
+For an explicit goal-research run, use its own lifecycle instead of the automatic router: initialize offline, call `advance` one guarded phase at a time, stop at `WAITING_FOR_CODEX`, record the packet-bound Codex receipt, run and record local verification, then continue through post-audit and epistemic refresh. Keep `.codex-advisor/` ignored. Run state is private under `.codex-advisor/goal-research-runs/<run-id>/`; `events.jsonl` is authoritative and `status.json` plus `report.md` are replaceable projections. Use `resume` after interruption. A possibly submitted turn is GET-reconciled in its original checkpoint; after an explicit blocked result, a safe retry uses a new numbered immutable checkpoint and preserves the failed attempt. Do not delete or hand-edit run events or immutable artifacts.
+
 1. For non-trivial repo-analysis or architecture critique, first prefer `scripts/router.py --execute` so configured agent-mode can be selected. If agent-mode is unavailable or unsafe, fall back to prompt-only advisor context.
 2. Gather the smallest useful context: the user's request, draft answer or plan, and only the files or snippets needed for critique. State clearly in the prompt when the advisor has not been given repo files and should reason only from the supplied summary.
 3. Do not send secrets, credentials, private keys, wallet keys, tokens, `.env` values, HAR contents, cookies, customer data, or unrelated private files. Context packs filter common sensitive paths and redact obvious secret-looking values, but Codex is still responsible for choosing safe context.
 4. Repo-aware agent-mode has a stronger local safety gate because the bridge can inspect files directly. The default is always a generated content-hashed review snapshot under `~/.codex/advisor-agent/workspaces/`; the original checkout is not exposed by the normal route. All `.codex-advisor` state is excluded because it can contain prompts, transcripts, conversation ids, response fragments, or route logs. The exposed manifest contains only counts, hashes, and provenance; detailed omitted/redacted path lists stay in a mode-`0600` private manifest outside the exact MCP root. Before every turn, the wrapper atomically pins DevSpace to the exact current snapshot; historical generations and staging directories remain outside the MCP-readable boundary. If snapshot creation, pinning, or validation fails, fall back to prompt-only.
-5. Treat sanitized workspaces as incomplete review copies. They omit `.git`, dependency/cache/build directories, `.env*`, HAR/cookie/auth files, key material, wallet/seed files, browser profiles, advisor state, symlinks, FIFOs/sockets/devices and other non-regular entries, binary files, archives, databases, oversized files, and text that cannot be safely redacted. Secret-looking text is redacted when the post-redaction scan succeeds. This is not a general PII or customer-data classifier; obtain data-owner approval for repositories with customer records or unusual confidential data. Each published generation is planned under its generation lock, checked with repeated full source-tree and Git-provenance scans, hash-verified, recorded in a complete omission/redaction manifest, and made read-only. Codex must verify final facts and apply edits in the original checkout.
+5. Treat sanitized workspaces as incomplete review copies. They omit `.git`, dependency/cache/build directories, `.env*`, HAR/cookie/auth files, key material, wallet/seed files, browser profiles, advisor state, symlinks, FIFOs/sockets/devices and other non-regular entries, binary files, archives, databases, oversized files, and text that cannot be safely redacted. Python source receives a separate 1 MiB inspection ceiling so large modules remain auditable without admitting similarly sized logs or generated outputs. Secret-looking text is redacted when the post-redaction scan succeeds. This is not a general PII or customer-data classifier; obtain data-owner approval for repositories with customer records or unusual confidential data. Each published generation is planned under its generation lock, checked with repeated full source-tree and Git-provenance scans, hash-verified, recorded in a complete omission/redaction manifest, and made read-only. Codex must verify final facts and apply edits in the original checkout.
 6. Repo-aware agent calls are mechanically review-only. The patched DevSpace server verifies that its runtime registration set is exactly workspace-open, read, grep, glob, and list; it advertises checkout mode only and rejects worktree/base-ref opens. Shell and mutation tools are unavailable; `--allow-shell` is rejected.
 7. Repo-aware agent calls default to `--timeout 0 --queue-timeout 0`: after the current prompt or stream is observed within the bounded acceptance-discovery window, the wrapper stays open until ChatGPT produces a real final end-of-turn response and waits as long as necessary for same-conversation coordination. A turn that never becomes observable fails closed instead of retaining locks forever. Positive timeout values are explicit operator limits. Keep the command in the foreground and let the open request wait; do not repeatedly poll ChatGPT.
 8. If using a local OpenAI-compatible server, set `ADVISOR_PROVIDER=openai-compatible`, `ADVISOR_BASE_URL`, and `ADVISOR_MODEL`. Set `ADVISOR_API_KEY` only when that compatible endpoint requires a token; `OPENAI_API_KEY` is not forwarded to arbitrary compatible endpoints by default.
@@ -147,6 +221,23 @@ python $HOME\.codex\skills\external-advisor\scripts\router.py --execute --prompt
 python $HOME\.codex\skills\external-advisor\scripts\router.py --execute --agent-sanitized-workspace always --prompt "Review this architecture decision through a sanitized copy."
 python $HOME\.codex\skills\external-advisor\scripts\router.py --prompt-only --prompt "Review this with prompt-only critique."
 ```
+
+Foreground goal-research lifecycle:
+
+```powershell
+python $HOME\.codex\skills\external-advisor\scripts\goal_research.py init --project-dir . --goal-file .codex-advisor\goal.json --run-id my-goal --json
+python $HOME\.codex\skills\external-advisor\scripts\goal_research.py advance --project-dir . --run-dir my-goal --json
+python $HOME\.codex\skills\external-advisor\scripts\goal_research.py receipt-template --project-dir . --run-dir my-goal --kind codex
+python $HOME\.codex\skills\external-advisor\scripts\goal_research.py record-codex --project-dir . --run-dir my-goal --receipt-file .codex-advisor\codex-receipt.json --json
+python $HOME\.codex\skills\external-advisor\scripts\goal_research.py receipt-template --project-dir . --run-dir my-goal --kind verification
+python $HOME\.codex\skills\external-advisor\scripts\goal_research.py record-verification --project-dir . --run-dir my-goal --receipt-file .codex-advisor\verification-receipt.json --json
+python $HOME\.codex\skills\external-advisor\scripts\goal_research.py status --project-dir . --run-dir my-goal --json
+python $HOME\.codex\skills\external-advisor\scripts\goal_research.py resume --project-dir . --run-dir my-goal --json
+```
+
+One `advance` call performs at most one bounded phase. Exit code `3` means a checkpointed remote turn is still pending, `4` means Codex implementation or local verification is required, and `5` means the run stopped visibly blocked. Default timeout and queue timeout are `0`; keep the foreground call open until the real final turn unless the operator deliberately supplies a positive deadline. Use `--dry-run` for an offline description of the next phase.
+
+Repo-aware goal-research roles do not create a replacement chat on every iteration. Cartographer, falsifier, verifier, selected specialists, and the post-change auditor each reuse one project-local conversation key for the lifetime of that goal run, so they retain role-specific context while remaining independent from one another. Chat memory is orientation only and cannot satisfy an evidence gate: every iteration must reopen the exact current sanitized snapshot and return fresh snapshot-bound MCP evidence. Clean-room remappers and final-blind auditors deliberately receive no persistent key and start fresh chats. Do not collapse all roles into one conversation or reuse a role chat across unrelated goal runs. Structured outputs use closed vocabularies and fail closed on unknown aliases. The post-change auditor must explicitly retain or resolve every prior contradiction, and a resolution needs fresh current-snapshot claim evidence.
 
 For ChatGPT web Intelligence/thinking choices, set the private ChatGPT field explicitly with `ADVISOR_THINKING_EFFORT` or `--thinking-effort`. Examples: `extended`, `max`, `pro-extended`, `extra-high`, or `high`. This is separate from `ADVISOR_REASONING_EFFORT`; the advisor maps these values to ChatGPT's private web `thinking_effort` field and defaults normal advisor calls to `max`.
 

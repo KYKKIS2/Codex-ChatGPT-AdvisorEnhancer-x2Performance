@@ -12,6 +12,7 @@ $Venv = Join-Path $G4f ".venv"
 $Py = Join-Path $Venv "Scripts\python.exe"
 $RuntimePatch = Join-Path $Root "patches\apply_gpt4free_runtime_patch.py"
 $DevSpacePatch = Join-Path $Root "codex-skill\external-advisor\scripts\devspace_readonly_patch.py"
+$DevSpaceSecurePatch = Join-Path $Root "codex-skill\external-advisor\scripts\devspace_secure_origin_patch.py"
 $SkillsSource = Join-Path $Root "codex-skill"
 $CodexHome = if ([string]::IsNullOrWhiteSpace($env:CODEX_HOME)) { Join-Path $HOME ".codex" } else { $env:CODEX_HOME }
 $SkillsDest = Join-Path $CodexHome "skills"
@@ -33,6 +34,7 @@ $RequiredFiles = @(
     (Join-Path $Root "tests\test-advisor-concurrency.py"),
     $RuntimePatch,
     $DevSpacePatch,
+    $DevSpaceSecurePatch,
     (Join-Path $Root "codex-skill\external-advisor\SKILL.md"),
     (Join-Path $Root "codex-skill\external-advisor\scripts\advisor.py"),
     (Join-Path $Root "codex-skill\external-advisor\scripts\advisor_concurrency.py"),
@@ -40,6 +42,14 @@ $RequiredFiles = @(
     (Join-Path $Root "codex-skill\external-advisor\scripts\agent_mode.py"),
     (Join-Path $Root "codex-skill\external-advisor\scripts\advisor_agent.py"),
     (Join-Path $Root "codex-skill\external-advisor\scripts\agent_conclave.py"),
+    (Join-Path $Root "codex-skill\external-advisor\scripts\goal_research.py"),
+    (Join-Path $Root "codex-skill\external-advisor\scripts\goal_research_roles.py"),
+    (Join-Path $Root "codex-skill\external-advisor\scripts\goal_research_state.py"),
+    (Join-Path $Root "docs\cloudflare-domain-mcp.md"),
+    (Join-Path $Root "codex-skill\external-advisor\scripts\advisor_domain_mcp.py"),
+    (Join-Path $Root "codex-skill\external-advisor\scripts\cloudflare_access_gateway.mjs"),
+    (Join-Path $Root "codex-skill\external-advisor\scripts\devspace_secure_server.mjs"),
+    (Join-Path $Root "codex-skill\external-advisor\scripts\devspace_shell_sandbox.py"),
     (Join-Path $Root "codex-skill\external-advisor\scripts\router.py")
 )
 foreach ($RequiredFile in $RequiredFiles) {
@@ -162,6 +172,8 @@ if ($InstalledDevSpaceVersion -ne $DevSpaceVersion) {
 }
 & python $DevSpacePatch --executable $DevSpaceCommand.Source
 if ($LASTEXITCODE -ne 0) { throw "DevSpace read-only patch failed." }
+& python $DevSpaceSecurePatch --executable $DevSpaceCommand.Source
+if ($LASTEXITCODE -ne 0) { throw "DevSpace secure-origin patch failed." }
 
 New-Item -ItemType Directory -Force -Path $SkillsDest | Out-Null
 $BackupRoot = Join-Path $CodexHome ("skill-backups\" + (Get-Date).ToUniversalTime().ToString("yyyyMMddTHHmmssZ"))
@@ -175,15 +187,29 @@ try {
         New-Item -ItemType Directory -Force -Path $stage | Out-Null
         Copy-Item -Recurse -Force -Path (Join-Path $_.FullName "*") -Destination $stage
         if ($_.Name -eq "external-advisor") {
+            $ReferencesDir = Join-Path $stage "references"
+            New-Item -ItemType Directory -Force -Path $ReferencesDir | Out-Null
+            Copy-Item -Force `
+                -Path (Join-Path $Root "docs\cloudflare-domain-mcp.md") `
+                -Destination (Join-Path $ReferencesDir "cloudflare-domain-mcp.md")
             foreach ($requiredName in @(
                 "SKILL.md",
+                "references\cloudflare-domain-mcp.md",
                 "scripts\advisor.py",
                 "scripts\advisor_concurrency.py",
                 "scripts\advisor_safety.py",
                 "scripts\router.py",
                 "scripts\advisor_agent.py",
                 "scripts\agent_conclave.py",
-                "scripts\devspace_readonly_patch.py"
+                "scripts\goal_research.py",
+                "scripts\goal_research_roles.py",
+                "scripts\goal_research_state.py",
+                "scripts\devspace_readonly_patch.py",
+                "scripts\devspace_secure_origin_patch.py",
+                "scripts\advisor_domain_mcp.py",
+                "scripts\cloudflare_access_gateway.mjs",
+                "scripts\devspace_secure_server.mjs",
+                "scripts\devspace_shell_sandbox.py"
             )) {
                 if (-not (Test-Path (Join-Path $stage $requiredName))) {
                     Remove-Item -Recurse -Force $stage

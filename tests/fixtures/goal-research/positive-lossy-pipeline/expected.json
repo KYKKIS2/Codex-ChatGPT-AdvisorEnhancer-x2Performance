@@ -1,0 +1,20 @@
+{
+  "critical_boundaries": [
+    {
+      "path": "pipeline.py",
+      "symbol": "encode_event",
+      "field_families": ["wallet_identity", "event_time"],
+      "failure_layer": "pipeline_preservation"
+    },
+    {
+      "path": "pipeline.py",
+      "symbol": "mean_pool",
+      "field_families": ["event_order"],
+      "failure_layer": "representation_distinguishability"
+    }
+  ],
+  "required_probe_terms": [
+    "identity ablation",
+    "order-destruction control"
+  ]
+}

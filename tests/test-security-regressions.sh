@@ -162,7 +162,7 @@ if other == state:
     raise SystemExit("Distinct unsafe conversation keys collided after sanitization.")
 PY
 
-PYTHONPATH="$SCRIPTS" OPENAI_API_KEY="sk-test-openai-key-that-must-not-be-forwarded" python3 - <<'PY'
+PYTHONPATH="$SCRIPTS" OPENAI_API_KEY="fake-openai-key-that-must-not-be-forwarded" python3 - <<'PY'
 import os
 import advisor
 

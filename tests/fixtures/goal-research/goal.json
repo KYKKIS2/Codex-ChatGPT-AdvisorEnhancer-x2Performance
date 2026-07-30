@@ -1,0 +1,71 @@
+{
+  "schema_version": "1.0",
+  "goal_id": "fixture-information-use",
+  "version": 1,
+  "objective": "Preserve and measurably use goal-relevant identity, time, and order information.",
+  "clauses": [
+    {
+      "id": "preserve-information",
+      "text": "Goal-relevant identity, time, and event order survive the complete processing path.",
+      "critical": true
+    },
+    {
+      "id": "prove-utilization",
+      "text": "Evaluation distinguishes carrying information from actually using it.",
+      "critical": true
+    }
+  ],
+  "non_goals": [
+    "Do not build a production model."
+  ],
+  "constraints": [
+    "Keep the fixture deterministic and offline."
+  ],
+  "allowed_scope": [
+    "pipeline.py",
+    "test_pipeline.py"
+  ],
+  "acceptance_dimensions": [
+    {
+      "id": "information-path",
+      "description": "Every goal-relevant information family has an explained end-to-end path.",
+      "kind": "hard_invariant",
+      "required": true,
+      "goal_clause_ids": [
+        "preserve-information"
+      ],
+      "evidence_requirements": [
+        "Repository-grounded path evidence"
+      ]
+    },
+    {
+      "id": "utilization-control",
+      "description": "A discriminating control tests whether outputs use the information.",
+      "kind": "qualitative",
+      "required": true,
+      "goal_clause_ids": [
+        "prove-utilization"
+      ],
+      "evidence_requirements": [
+        "Local control result and independent audit"
+      ]
+    }
+  ],
+  "budgets": {
+    "max_iterations": 2,
+    "max_advisor_turns": 30,
+    "max_specialists_per_iteration": 2,
+    "max_active_hypotheses": 3
+  },
+  "escalation_conditions": [
+    "Required information remains unexplained after a bounded iteration."
+  ],
+  "requires_information_audit": true,
+  "allowed_specialists": [
+    "architecture-integration",
+    "data-ml-causality",
+    "domain-workflow",
+    "performance-reliability",
+    "security-privacy"
+  ]
+}

@@ -9,6 +9,7 @@ import fnmatch
 import json
 import os
 import re
+import stat
 import subprocess
 import sys
 import time
@@ -33,6 +34,7 @@ SAFE_TOOL_NAMES = {"open_workspace", *INSPECTION_TOOLS, *SHELL_TOOLS, *MUTATION_
 DEFAULT_MODEL = "gpt-5-6-thinking"
 DEFAULT_TIMEOUT = 0
 DEFAULT_QUEUE_TIMEOUT = 0.0
+MAX_PRIVATE_TOOL_LOG_BYTES = 16 * 1024 * 1024
 
 
 @dataclass
@@ -230,10 +232,34 @@ def validate_workspace_for_connector(workspace: Path, state: dict[str, Any]) -> 
 
 def read_tool_records(log_path: Path) -> list[dict[str, Any]]:
     records: list[dict[str, Any]] = []
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
     try:
-        lines = log_path.read_text(encoding="utf-8", errors="replace").splitlines()
+        descriptor = os.open(log_path, flags)
     except OSError:
         return records
+    try:
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode):
+            return records
+        offset = max(0, metadata.st_size - MAX_PRIVATE_TOOL_LOG_BYTES)
+        os.lseek(descriptor, offset, os.SEEK_SET)
+        remaining = metadata.st_size - offset
+        chunks: list[bytes] = []
+        while remaining > 0:
+            chunk = os.read(descriptor, min(1024 * 1024, remaining))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        data = b"".join(chunks)
+    finally:
+        os.close(descriptor)
+    if offset:
+        separator = data.find(b"\n")
+        data = data[separator + 1 :] if separator >= 0 else b""
+    lines = data.decode("utf-8", errors="replace").splitlines()
     for raw in lines:
         try:
             record = json.loads(raw)

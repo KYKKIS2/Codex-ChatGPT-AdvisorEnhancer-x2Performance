@@ -27,8 +27,17 @@ SEARCH_NEEDLE = '    if (config.toolMode === "full") {\n        registerAppTool(
 SEARCH_PATCHED = '    if (config.toolMode === "full" || config.toolMode === "readonly") {\n        registerAppTool(server, toolNames.grep, {'
 SHELL_NEEDLE = '    if (config.toolMode !== "codex") {\n        registerAppTool(server, toolNames.shell, {'
 SHELL_PATCHED = '    if (config.toolMode !== "codex" && config.toolMode !== "readonly") {\n        registerAppTool(server, toolNames.shell, {'
+SHELL_SYNC_DISABLED_PATCHED = '''    if (config.toolMode !== "codex"
+        && config.toolMode !== "readonly"
+        && config.disableSyncShell !== true) {
+        registerAdvisorAppTool(server, toolNames.shell, {'''
+SHELL_SYNC_DISABLED_ENV_PATCHED = '''    if (config.toolMode !== "codex"
+        && config.toolMode !== "readonly"
+        && process.env.DEVSPACE_DISABLE_SYNC_SHELL !== "true") {
+        registerAdvisorAppTool(server, toolNames.shell, {'''
 FS_IMPORT_NEEDLE = 'import { readFileSync } from "node:fs";'
 FS_IMPORT_PATCHED = 'import { readFileSync, realpathSync } from "node:fs";'
+FS_IMPORT_SECURE = 'import { lstatSync, readFileSync, realpathSync } from "node:fs";'
 RUNTIME_GUARD_MARKER = "const advisorRegisteredTools = new WeakMap();"
 RUNTIME_GUARDS = r'''const advisorRegisteredTools = new WeakMap();
 const advisorReadonlyToolNames = new Set(["open_workspace", "read", "grep", "glob", "ls"]);
@@ -79,6 +88,13 @@ OPEN_HANDLER_PATCHED = '''    }, async ({ path, mode, baseRef }) => {
         assertAdvisorReadonlyOpen(config, path, mode, baseRef);
         const { workspace, agentsFiles, availableAgentsFiles } = await workspaces.openWorkspace({ path, mode, baseRef });
         assertAdvisorReadonlyWorkspace(config, workspace);'''
+OPEN_HANDLER_SECURE = '''    }, async ({ path, mode, baseRef }) => {
+        const startedAt = performance.now();
+        assertAdvisorReadonlyOpen(config, path, mode, baseRef);
+        assertAdvisorPinnedOpen(config, path, mode, baseRef);
+        const { workspace, agentsFiles, availableAgentsFiles } = await workspaces.openWorkspace({ path, mode, baseRef });
+        assertAdvisorReadonlyWorkspace(config, workspace);
+        assertAdvisorPinnedWorkspace(config, workspace);'''
 OPEN_DESCRIPTION_NEEDLE = r'''        description: "Open a local project directory as a coding workspace. Call this once per project folder or worktree before reading, editing, searching, writing, showing changes, or running commands. Reuse the returned workspaceId for later calls in the same folder; do not call open_workspace again unless switching folders/worktrees, changing checkout/worktree mode, the workspaceId is rejected as unknown, or the user explicitly asks to reopen. By default this opens the actual checkout; set mode=\"worktree\" when the user asks for an isolated or parallel coding session. Returns a workspaceId, loaded root project instructions, and nested instruction file paths the model should read before working in those directories.",'''
 OPEN_DESCRIPTION_PATCHED = r'''        description: config.toolMode === "readonly"
             ? "Open the one pinned read-only advisor snapshot. Call this exactly once before using read, grep, glob, or ls. Only checkout mode is available."
@@ -142,6 +158,15 @@ def resolve_dist(executable: str) -> Path:
 def replace_once(text: str, needle: str, replacement: str, label: str) -> tuple[str, bool]:
     if replacement in text:
         return text, False
+    if label == "filesystem guard import" and FS_IMPORT_SECURE in text:
+        return text, False
+    if label == "read-only workspace open guard" and OPEN_HANDLER_SECURE in text:
+        return text, False
+    if label == "shell tool gate" and (
+        SHELL_SYNC_DISABLED_PATCHED in text
+        or SHELL_SYNC_DISABLED_ENV_PATCHED in text
+    ):
+        return text, False
     tracked_replacement = replacement.replace(
         "registerAppTool(server,",
         "registerAdvisorAppTool(server,",
@@ -163,16 +188,23 @@ def verify(config_text: str, server_text: str) -> None:
         (INSTRUCTION_PATCH.strip(), server_text),
         (tracked_write, server_text),
         (tracked_search, server_text),
-        (tracked_shell, server_text),
-        (FS_IMPORT_PATCHED, server_text),
         (RUNTIME_GUARD_MARKER, server_text),
         (OPEN_DESCRIPTION_PATCHED, server_text),
         (OPEN_SCHEMA_PATCHED, server_text),
-        (OPEN_HANDLER_PATCHED, server_text),
         (WORKSPACE_LOOKUP_PATCHED, server_text),
         (RETURN_SERVER_PATCHED, server_text),
     )
     missing = [marker.splitlines()[0] for marker, text in required if marker not in text]
+    if FS_IMPORT_PATCHED not in server_text and FS_IMPORT_SECURE not in server_text:
+        missing.append(FS_IMPORT_PATCHED)
+    if OPEN_HANDLER_PATCHED not in server_text and OPEN_HANDLER_SECURE not in server_text:
+        missing.append(OPEN_HANDLER_PATCHED.splitlines()[0])
+    if (
+        tracked_shell not in server_text
+        and SHELL_SYNC_DISABLED_PATCHED not in server_text
+        and SHELL_SYNC_DISABLED_ENV_PATCHED not in server_text
+    ):
+        missing.append(tracked_shell.splitlines()[0])
     if missing:
         raise RuntimeError("DevSpace read-only patch is incomplete: " + ", ".join(missing))
     if server_text.count("registerAppTool(server,") != 1:

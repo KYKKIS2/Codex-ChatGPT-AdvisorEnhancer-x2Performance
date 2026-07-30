@@ -38,7 +38,7 @@ ChatGPT advisor:
 Advisor output is guidance, not proof. Codex must verify repository facts,
 runtime behavior, commands, metrics, and file references locally.
 
-## Four Advisor Lanes
+## Five Advisor Lanes
 
 | Lane | Script | Repository access | Best use |
 | --- | --- | --- | --- |
@@ -46,6 +46,7 @@ runtime behavior, commands, metrics, and file references locally.
 | Prompt-only conclave | `conclave.py` | Only supplied text/files | Independent planner, critic, security, verifier, and synthesis passes |
 | Repo-aware advisor | `advisor_agent.py` | Read-only sanitized DevSpace snapshot | One evidence-backed repository review |
 | Repo-aware conclave | `agent_conclave.py` | Separate read-only agent conversations | Hard architecture, security, and broad code audits |
+| Goal research | `goal_research.py` | Read-only sanitized DevSpace snapshot plus durable local evidence | Multi-iteration goals where framing, evidence, and implementation must stay aligned |
 
 `router.py` chooses among these lanes, no-advisor, and verifier workflows.
 When a verified repo-aware connector is ready, repository analysis prefers an
@@ -78,6 +79,9 @@ call must first prove the current ChatGPT attachment with exact MCP evidence.
 - Checkpoints each repo-aware role and synthesis before submission so an
   interrupted conclave can recover completed online work without replaying an
   ambiguous ChatGPT turn.
+- Runs an opt-in, event-sourced goal-research controller that preserves goal
+  clauses, competing hypotheses, contradictions, Codex receipts, and fresh
+  post-change evidence across bounded iterations.
 - Shows sanitized live tool activity without exposing arguments, paths,
   contents, raw errors, credentials, conversation IDs, or private reasoning.
 
@@ -447,16 +451,20 @@ The default workflow:
    `~/.codex/advisor-agent/workspaces/<project>/generations/<hash>/`.
 3. Omits `.git`, `.codex-advisor`, dependency/build/cache directories,
    `.env*`, HAR/cookie/auth files, keys, wallet/seed material, browser profiles,
-   symlinks, binary files, archives, databases, and oversized files.
+   symlinks, binary files, archives, databases, and oversized files. Python
+   source receives a separate 1 MiB inspection ceiling so large modules can be
+   audited without admitting similarly sized logs or generated outputs.
 4. Redacts secret-looking text only when a second scan confirms the redacted
    result is clean.
 5. Builds the authoritative source plan while holding the per-project
    generation lock, verifies source and target hashes while publishing, then
    repeats the full source-tree and Git-provenance scan before reuse or return.
    Source changes fail closed instead of returning a stale generation.
-6. Rejects symlinks and non-regular source entries such as FIFOs, sockets, and
-   devices, opens every source path component with no-follow descriptor-relative
-   traversal, and performs cleanup without following hostile symlinks.
+6. Rejects descendant mounts, filesystem-device crossings, hardlinked regular
+   files, symlinks, and non-regular source entries such as FIFOs, sockets, and
+   devices. Every source path component is opened with no-follow
+   descriptor-relative traversal, and cleanup does not follow hostile symlinks.
+   Snapshot planning defaults to 20,000 entries and 512 MiB of copied content.
 7. Rechecks every copied path, directory, hash, generated-metadata checksum,
    symlink boundary, and exact mode before reusing an existing generation.
 8. Writes a public `SANITIZED_WORKSPACE_MANIFEST.json` with counts, hashes, and
@@ -467,7 +475,9 @@ The default workflow:
 10. Makes directories and executable files mode `0500` and other files mode
    `0400`.
 11. Starts the patched DevSpace server in `readonly` tool mode on literal
-    `127.0.0.1`.
+    `127.0.0.1` with a minimal environment, both security patches verified, and
+    same-origin OAuth protected-resource metadata checked before readiness is
+    reported.
 12. Pins DevSpace to one exact current generation through a private atomic
     pointer. Historical generations and staging directories remain outside the
     MCP-readable boundary even though the same connector URL can be reused.
@@ -494,6 +504,107 @@ repositories with customer records or unusual confidential data. Review the
 private manifest locally because its omission list and source filenames can
 themselves be sensitive; that detailed list is not exposed through MCP. Codex
 still validates findings in the original checkout.
+
+### Permanent Full-Access Domain (Explicit Opt-In)
+
+The normal repo-aware advisor route above stays generated, sanitized, and
+mechanically read-only. A separate Linux-only operator mode is available when
+the user explicitly wants one trusted ChatGPT account to edit and run commands
+against one original checkout through a stable Cloudflare hostname:
+
+```bash
+python3 ~/.codex/skills/external-advisor/scripts/advisor_domain_mcp.py prepare \
+  --project-dir "/absolute/path/to/the/main-checkout" \
+  --hostname "mcp.example.com"
+```
+
+This path requires Cloudflare Access Managed OAuth. A local gateway validates
+the Access JWT signature, issuer, application audience, current-time validity,
+subject, and one exact allowed email before forwarding to DevSpace. The gateway
+and DevSpace run in separate Bubblewrap sandboxes with separate runtime
+directories.
+Only the chosen original checkout is mounted read/write at `/workspace`; the
+rest of the home directory is absent, recognized sensitive path names are masked,
+Git metadata is read-only, and inherited credentials are cleared. Every `bash`
+or asynchronous process tool call runs in another networkless Bubblewrap
+sandbox that cannot see the origin socket, gateway socket, manager state, or
+gateway credential.
+NVIDIA CUDA devices are absent by default. An explicit `--enable-nvidia`
+prepare flag pins and passes only the required NVIDIA character devices through
+both sandbox layers while retaining the same network and filesystem isolation.
+An independent `--full-compute` flag removes origin CPU, memory, swap, task,
+open-file, and per-file-size ceilings for training while retaining the timed
+window and filesystem-reserve shutdown.
+The gateway permits eight authenticated MCP operations in parallel by default
+(configurable from 1 to 64), and the same bound limits active asynchronous
+process sessions. Each operation remains confined to the same exact
+`/workspace` mount. The permanent connector disables the upstream synchronous
+`bash` tool and routes all shell work through `exec_command`, which returns
+completed output for short commands or a durable handle within 30 seconds for
+long builds and training. Use `write_stdin` for polling or interaction. Exact retries
+reuse the active or recently completed execution across MCP reconnects; stable
+`executionKey` values make retries explicit, while distinct keys preserve
+intentional identical parallel runs. Finite gateway operations retain their
+admission slots until the upstream operation ends even if the client
+disconnects. Long-lived MCP GET event streams use separate capacity and are
+closed at the origin when their clients disconnect, preventing reconnects from
+exhausting tool-call capacity.
+The named tunnel also targets a mode-`0600` Unix socket below a dedicated
+root-provisioned, user-owned mode-`0700` directory in `/run`, instead of an
+unprivileged loopback TCP port. This keeps the socket visible to the hardened
+system `cloudflared` unit while its `ProtectHome` sandbox remains enabled, and
+prevents another local account from claiming the origin while the timed window
+is off.
+
+The public URL and allowed email are not credentials. Cloudflare admits only
+the audited account member using the restricted identity provider and
+phishing-resistant MFA. The successful OAuth grant is then held by the ChatGPT
+account, so every person who can use that same ChatGPT account shares the
+connector authority; the local gateway cannot identify individual humans behind
+a shared ChatGPT login.
+
+This is not a sanitized copy. Path masking is defense in depth, not a content
+classifier, so confidential content under ordinary filenames can still be
+visible to the connected ChatGPT account. The checkout's exact Git commit,
+tracked modifications, and non-ignored untracked file contents are pinned;
+dirty state requires explicit `--allow-dirty-checkout`, and changes to those
+inputs require another `prepare`. Ignored data and model trees remain visible
+as live repository content without being byte-hashed during `prepare`, so large
+research datasets do not require multi-hour duplicate reads. Bulk
+artifact/data/model/output roots, virtual environments, and `node_modules` are
+also excluded from secret-name enumeration; a native metadata-only pass still
+checks the complete tree for mounts, hardlinks, and special files.
+Repinning ordinary changes inside the same repository does not invalidate the
+separate Cloudflare attestation; switching repository roots or changing the
+public identity, runtime, tunnel, or OAuth configuration still does.
+Descendant mounts, hardlinks, special files, unsafe Git configuration, and
+checkout-local runtimes fail closed. Git objects remain read-only but visible,
+so committed history is part of the disclosure boundary. This does not replace
+or weaken the
+read-only advisor/conclave evidence rules, and the router never selects this
+full-access path automatically.
+
+Startup fails closed unless the named tunnel is active, its token is in a
+root-owned mode-`0600` file, a separate root-owned marker binds the local
+service to the audited tunnel UUID, one explicit loopback-only cloudflared
+diagnostics port proves the exact active local connector, and the public route
+presents Cloudflare
+Access's Managed OAuth challenge. A current 24-hour authenticated audit proves
+the restricted Cloudflare IdP, account membership, phishing-resistant MFA,
+the narrow per-connector ChatGPT callback path, active zone, single proxied CNAME, one active
+connector across complete paginated inventories, exact named-tunnel Unix
+origin, final deny catch-all, tunnel-side
+Access validation, and short OAuth sessions. The local services are never
+enabled at login or boot, have CPU/memory/process/file-size and reactive
+filesystem-reserve controls, pin runtime hashes, and stop automatically after a
+bounded 60-minute window by default. Asynchronous commands may continue for the
+remaining 5-minute to 8-hour exposure window, but the connector expiry
+terminates them. Direct original-checkout mode
+does not provide a hard aggregate write quota; use a bounded disposable
+filesystem when that property is required. Keep the ChatGPT app in **Any changes** /
+ask-before-writes mode. See
+[`docs/cloudflare-domain-mcp.md`](docs/cloudflare-domain-mcp.md) for Cloudflare
+Access setup, lifecycle commands, tunnel-token hardening, and tests.
 
 ### Start The Connector
 
@@ -663,6 +774,191 @@ blind resubmission.
 A failed run updates `latest-agent-conclave-attempt.md` but does not overwrite
 the last successful `latest-agent-conclave.md`.
 
+## Goal Research Mode
+
+`goal-research` is the explicit fifth lane for a broad implementation goal that
+cannot be protected by one review. It keeps Codex as the only editor and local
+command runner while read-only repo-aware advisors repeatedly test whether the
+work still satisfies the original goal.
+
+Use it when the main risk is not only a bad patch, but a plausible patch to the
+wrong problem: omitted requirements, proxy metrics, discarded information,
+stale assumptions, weak evidence, or a framing error shared by several
+reviewers. Keep using the router or one-shot lanes for ordinary decisions and
+reviews. `goal-research` is opt-in and does not change `router.py` defaults.
+
+The controller has two bounded loops:
+
+- The epistemic loop freezes the goal, traces every clause, independently maps
+  the repo, preserves contradictions, and maintains at most three competing
+  explanations: leading, credible alternative, and null/measurement.
+- The delivery loop issues exactly one hypothesis-scoped packet, waits for
+  Codex implementation and local verification receipts, then asks the
+  repo-aware post-change auditor to inspect a fresh current snapshot.
+
+Every first pass uses cartographer, falsifier, verifier, and a clean-room
+remapper in isolated conversations. Within one goal run, each core reviewer,
+selected specialist, and post-change auditor reuses its own stable
+project-scoped ChatGPT conversation across iterations, preserving useful role
+memory without mixing independent reviewers. The clean-room remapper and final
+blind auditor intentionally start fresh conversations so inherited framing
+cannot satisfy those gates. Iteration-specific recovery journals remain
+separate from the persistent chat state. Conversation memory is context, never
+evidence: every iteration must reopen the exact current sanitized snapshot and
+return snapshot-bound claims with fresh MCP proof. The controller may add at
+most two catalog specialists, and only when one extra read-only repository
+inspection can resolve an explicit current unknown with expected evidence and a
+stopping condition. Specialists cannot select or spawn other specialists.
+Advisors cannot edit files, run shell commands, grant waivers, expand scope, or
+converse recursively. Challenge and synthesis are one bounded prompt-only round
+over validated artifacts.
+
+All advisor artifacts use closed vocabularies for claim status, hypothesis kind,
+information-layer classification, pipeline kind, and specialist selection.
+Unknown aliases fail closed instead of being silently coerced. A post-change
+audit must account for every prior contradiction as still open or resolved;
+resolution requires fresh current-snapshot repository evidence.
+
+### Define The Goal
+
+Initialization accepts a versioned JSON contract. Keep it free of secrets; its
+contents are sent to the advisor during later phases.
+
+```json
+{
+  "schema_version": "1.0",
+  "goal_id": "preserve-required-behavior",
+  "version": 1,
+  "objective": "Implement the requested behavior and prove the real outcome.",
+  "clauses": [
+    {"id": "real-outcome", "text": "The requested outcome is preserved end to end.", "critical": true}
+  ],
+  "non_goals": ["Do not redesign unrelated components."],
+  "constraints": ["Codex remains the only editor and verifier."],
+  "allowed_scope": ["src", "tests"],
+  "acceptance_dimensions": [
+    {
+      "id": "end-to-end-proof",
+      "description": "A local discriminating check and fresh independent audit support the outcome.",
+      "kind": "hard_invariant",
+      "required": true,
+      "goal_clause_ids": ["real-outcome"],
+      "evidence_requirements": ["Codex local result", "Independent post-change audit"]
+    }
+  ],
+  "budgets": {
+    "max_iterations": 2,
+    "max_advisor_turns": 24,
+    "max_specialists_per_iteration": 1,
+    "max_active_hypotheses": 3
+  },
+  "escalation_conditions": ["A critical contradiction remains after a bounded iteration."],
+  "requires_information_audit": false,
+  "allowed_specialists": ["architecture-integration", "performance-reliability"],
+  "waivers": []
+}
+```
+
+Every clause must map to a required acceptance dimension. Hard invariants
+cannot be waived. A non-invariant waiver is valid only when the frozen goal
+records its ID, affected acceptance dimension, explicit user decision, and
+reason. Add one only after the user actually makes that decision; an advisor's
+suggestion is not authorization. Amending the goal creates the next immutable
+version and invalidates downstream work from the old version.
+
+### Run The Foreground Lifecycle
+
+The repository must be a Git root and must ignore `.codex-advisor/`. The normal
+sanitized connector must already be attached and proven by a direct repo-aware
+call. Grounding never silently falls back to prompt-only review.
+
+```bash
+GOAL=.codex-advisor/my-goal.json
+
+python3 ~/.codex/skills/external-advisor/scripts/goal_research.py init \
+  --project-dir . --goal-file "$GOAL" --run-id my-goal --json
+
+python3 ~/.codex/skills/external-advisor/scripts/goal_research.py advance \
+  --project-dir . --run-dir my-goal --json
+```
+
+Run `advance` again for each displayed controller phase. One invocation performs
+at most one guarded phase. It eventually exits in `WAITING_FOR_CODEX`, where
+Codex reads the one implementation packet, edits only the permitted scope, and
+records what actually changed:
+
+```bash
+python3 ~/.codex/skills/external-advisor/scripts/goal_research.py \
+  receipt-template --project-dir . --run-dir my-goal --kind codex \
+  > .codex-advisor/codex-receipt.json
+
+python3 ~/.codex/skills/external-advisor/scripts/goal_research.py \
+  record-codex --project-dir . --run-dir my-goal \
+  --receipt-file .codex-advisor/codex-receipt.json --json
+```
+
+Codex then runs the packet's local checks itself, fills a separate verification
+receipt with command exit results and acceptance evidence, and records it:
+
+```bash
+python3 ~/.codex/skills/external-advisor/scripts/goal_research.py \
+  receipt-template --project-dir . --run-dir my-goal --kind verification \
+  > .codex-advisor/verification-receipt.json
+
+python3 ~/.codex/skills/external-advisor/scripts/goal_research.py \
+  record-verification --project-dir . --run-dir my-goal \
+  --receipt-file .codex-advisor/verification-receipt.json --json
+```
+
+Continue `advance` through the fresh current-snapshot post-change audit and
+epistemic refresh.
+An accepted iteration does not complete the goal. Completion additionally
+requires fresh evidence for every required dimension, support for every
+critical clause, no critical contradiction, and a blind repo-aware final audit
+that receives the original goal and final snapshot but not the current
+synthesis recommendation.
+
+### State And Recovery
+
+Private state lives at:
+
+```text
+.codex-advisor/goal-research-runs/<run-id>/
+```
+
+`events.jsonl` is the authoritative, sequence-checked and digest-chained
+history. Immutable JSON artifacts hold role reports, hypotheses, challenge,
+packet, receipts, audits, and snapshots. `status.json` and `report.md` are
+replaceable projections. Repository-grounded evidence is conservatively stale
+after any source snapshot change.
+
+Inspect or recover a run without relying on chat memory:
+
+```bash
+python3 ~/.codex/skills/external-advisor/scripts/goal_research.py status \
+  --project-dir . --run-dir my-goal --json
+
+python3 ~/.codex/skills/external-advisor/scripts/goal_research.py resume \
+  --project-dir . --run-dir my-goal --json
+```
+
+Resume first uses the original checkpoint and GET-only reconciliation for a turn
+that may already have been submitted. If a run stopped visibly blocked and the
+operator fixes the transport or schema problem without changing the frozen
+source snapshot, the next explicit `resume` creates a numbered immutable retry
+checkpoint and preserves the failed attempt. Default advisor and queue timeouts
+are `0`, so an accepted online agent may finish without an arbitrary 900-second
+cutoff. Set positive limits only as deliberate operator deadlines. Exit codes
+are `0` success, `3` remote work still pending, `4` waiting for Codex or local
+verification, and `5` visibly blocked. A blocked run does not downgrade its
+evidence or edit/revert the checkout.
+
+Use `--dry-run` on `init` or `advance` to validate or describe the next step
+without contacting ChatGPT or appending an event. `help`, `status`, receipt
+templates, schema validation, and replay are also offline. The mode remains a
+foreground research-and-delivery controller, not a detached autonomous coder or
+a generic multi-agent workflow engine.
+
 ## Live Activity
 
 Foreground repo-aware calls emit fixed, sanitized stderr events for:
@@ -750,6 +1046,8 @@ python3 ./tests/test-prompt-conclave-orchestration.py
 ./tests/test-security-regressions.sh
 ./tests/test-agent-mode.sh
 ./tests/test-agent-conclave.sh
+node ./tests/test-cloudflare-access-gateway.mjs
+python3 ./tests/test-domain-mcp.py
 ./tests/test-memory.sh
 ./tests/test-ranking.sh
 ./tests/test-eval-harness.sh
@@ -843,6 +1141,7 @@ Never commit or send:
 - customer or unrelated private data
 - `.codex-advisor` transcripts and conversation state
 - DevSpace Owner passwords
+- Cloudflare tunnel tokens or permanent-domain gateway credentials
 
 The repository ignores common secret and runtime paths, including:
 
@@ -852,21 +1151,43 @@ vendor/
 .devspace/
 .cloudflared/
 *.har
+*.har.gz
 *.cookie.json
 *.cookies.json
 auth_*.json
 .env
 .env.*
+cloudflare-api-token
+cloudflare-audit-token
+origin-secret
+gateway-runtime.json
+pinned-root
+install-cloudflared-token.sh
+*.token
+*.secret
 *.pem
 *.key
 *.p12
 *.pfx
+*.pcap
+*.pdf
+*.ipynb
+*.parquet
+*.safetensors
+*.zip
 *.log
 ```
 
 Before release, inspect the exact staged commit surface and scan it for secrets.
 Whole-repository scans can include historical examples or generated vendor
-content; the staged diff is the authoritative release scope.
+content; the staged diff is the authoritative release scope. Run
+`python3 tests/test-publish-hygiene.py` to verify sensitive path ignores,
+high-confidence credential patterns, and, when local permanent-domain state is
+present, exact deployment and advisor-conversation identifiers without printing
+those values. The test also rejects unreviewed opaque artifacts, credentialed
+Git remotes, submodules, nested non-ignored repositories, Git LFS rules, and
+sensitive content that exists only in the staged index. Rerun it after staging
+the exact release commit and immediately before pushing.
 
 ## Bundled Skills
 

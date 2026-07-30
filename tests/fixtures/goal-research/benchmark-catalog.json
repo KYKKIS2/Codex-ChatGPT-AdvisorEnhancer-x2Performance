@@ -1,0 +1,15 @@
+{
+  "cases": [
+    {"id": "source-unavailable", "layer": "source_availability"},
+    {"id": "dropped-source", "layer": "pipeline_preservation"},
+    {"id": "destructive-representation", "layer": "representation_distinguishability"},
+    {"id": "weak-supervision", "layer": "learnability"},
+    {"id": "present-but-unused", "layer": "utilization"},
+    {"id": "objective-mismatch", "layer": "evaluation_validity"},
+    {"id": "shortcut-leakage", "layer": "causal_operational_validity"},
+    {"id": "long-context-collapse", "layer": "representation_distinguishability"},
+    {"id": "goal-proxy-drift", "layer": "evaluation_validity"},
+    {"id": "inherited-false-framing", "layer": "pipeline_preservation"},
+    {"id": "repeated-hypothesis", "layer": "learnability"}
+  ]
+}

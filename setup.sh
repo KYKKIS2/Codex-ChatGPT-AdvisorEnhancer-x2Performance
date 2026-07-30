@@ -13,6 +13,7 @@ VENV="$G4F/.venv"
 PY="$VENV/bin/python"
 RUNTIME_PATCH="$ROOT/patches/apply_gpt4free_runtime_patch.py"
 DEVSPACE_PATCH="$ROOT/codex-skill/external-advisor/scripts/devspace_readonly_patch.py"
+DEVSPACE_SECURE_PATCH="$ROOT/codex-skill/external-advisor/scripts/devspace_secure_origin_patch.py"
 SKILLS_SOURCE="$ROOT/codex-skill"
 SKILLS_DEST="${CODEX_HOME:-$HOME/.codex}/skills"
 EXTERNAL_ADVISOR_SKILL_DEST="$SKILLS_DEST/external-advisor"
@@ -34,6 +35,8 @@ REQUIRED_EXECUTABLES=(
   "$ROOT/tests/test-security-regressions.sh"
   "$ROOT/tests/test-agent-mode.sh"
   "$ROOT/tests/test-agent-conclave.sh"
+  "$ROOT/tests/test-cloudflare-access-gateway.mjs"
+  "$ROOT/tests/test-domain-mcp.py"
 )
 REQUIRED_CORE_FILES=(
   "$RUNTIME_PATCH"
@@ -49,11 +52,20 @@ REQUIRED_CORE_FILES=(
   "$ROOT/codex-skill/external-advisor/scripts/advisor_agent_setup.py"
   "$ROOT/codex-skill/external-advisor/scripts/advisor_agent_connect.py"
   "$ROOT/codex-skill/external-advisor/scripts/devspace_readonly_patch.py"
+  "$ROOT/codex-skill/external-advisor/scripts/devspace_secure_origin_patch.py"
+  "$ROOT/codex-skill/external-advisor/scripts/advisor_domain_mcp.py"
+  "$ROOT/codex-skill/external-advisor/scripts/cloudflare_access_gateway.mjs"
+  "$ROOT/codex-skill/external-advisor/scripts/devspace_secure_server.mjs"
+  "$ROOT/codex-skill/external-advisor/scripts/devspace_shell_sandbox.py"
   "$ROOT/codex-skill/external-advisor/scripts/conclave.py"
   "$ROOT/codex-skill/external-advisor/scripts/context_pack.py"
   "$ROOT/codex-skill/external-advisor/scripts/critique_final.py"
   "$ROOT/codex-skill/external-advisor/scripts/eval_harness.py"
   "$ROOT/codex-skill/external-advisor/scripts/g4f_pool.py"
+  "$ROOT/codex-skill/external-advisor/scripts/goal_research.py"
+  "$ROOT/codex-skill/external-advisor/scripts/goal_research_roles.py"
+  "$ROOT/codex-skill/external-advisor/scripts/goal_research_state.py"
+  "$ROOT/docs/cloudflare-domain-mcp.md"
   "$ROOT/codex-skill/external-advisor/scripts/memory_manager.py"
   "$ROOT/codex-skill/external-advisor/scripts/project_bind.py"
   "$ROOT/codex-skill/external-advisor/scripts/project_migrate.py"
@@ -173,6 +185,19 @@ if [[ "$installed_devspace_version" != "$DEVSPACE_VERSION" ]]; then
   exit 1
 fi
 python3 "$DEVSPACE_PATCH" --executable "$DEVSPACE_BIN"
+python3 "$DEVSPACE_SECURE_PATCH" --executable "$DEVSPACE_BIN"
+DEVSPACE_DIST="$(dirname "$(readlink -f "$DEVSPACE_BIN")")"
+chmod go-w \
+  "$DEVSPACE_DIST/cli.js" \
+  "$DEVSPACE_DIST/config.js" \
+  "$DEVSPACE_DIST/pi-tools.js" \
+  "$DEVSPACE_DIST/roots.js" \
+  "$DEVSPACE_DIST/server.js"
+find "$DEVSPACE_DIST" -type f -exec chmod go-w {} +
+DEVSPACE_PACKAGE_JSON="$(dirname "$DEVSPACE_DIST")/package.json"
+if [[ -f "$DEVSPACE_PACKAGE_JSON" ]]; then
+  chmod go-w "$DEVSPACE_PACKAGE_JSON"
+fi
 
 mkdir -p "$SKILLS_DEST"
 BACKUP_ROOT="${CODEX_HOME:-$HOME/.codex}/skill-backups/$(date -u +%Y%m%dT%H%M%SZ)"
@@ -188,15 +213,26 @@ for skill_dir in "$SKILLS_SOURCE"/*; do
   stage="$(mktemp -d "$SKILLS_DEST/.${skill_name}.staging.XXXXXX")"
   cp -R "$skill_dir"/. "$stage"/
   if [[ "$skill_name" == "external-advisor" ]]; then
+    mkdir -p "$stage/references"
+    cp "$ROOT/docs/cloudflare-domain-mcp.md" "$stage/references/cloudflare-domain-mcp.md"
     for required_name in \
       SKILL.md \
+      references/cloudflare-domain-mcp.md \
       scripts/advisor.py \
       scripts/advisor_concurrency.py \
       scripts/advisor_safety.py \
       scripts/router.py \
       scripts/advisor_agent.py \
       scripts/agent_conclave.py \
-      scripts/devspace_readonly_patch.py; do
+      scripts/goal_research.py \
+      scripts/goal_research_roles.py \
+      scripts/goal_research_state.py \
+      scripts/devspace_readonly_patch.py \
+      scripts/devspace_secure_origin_patch.py \
+      scripts/advisor_domain_mcp.py \
+      scripts/cloudflare_access_gateway.mjs \
+      scripts/devspace_secure_server.mjs \
+      scripts/devspace_shell_sandbox.py; do
       if [[ ! -f "$stage/$required_name" ]]; then
         rm -rf "$stage"
         echo "Staged external-advisor skill is incomplete: $required_name" >&2

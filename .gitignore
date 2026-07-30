@@ -9,8 +9,10 @@ advisor-config.json
 
 # Browser/session authentication exports
 *.har
+*.har.gz
 *.cookie.json
 *.cookies.json
+cookies*.txt
 auth_*.json
 conversation.json
 transcript.json
@@ -29,6 +31,28 @@ client_secret*.json
 service-account*.json
 service_account*.json
 *.credentials.json
+token.json
+tokens.json
+oauth-token.json
+oauth_tokens.json
+*.token
+*.secret
+
+# Permanent-domain MCP and Cloudflare private state
+allowed-email
+cloudflare-api-token
+cloudflare-audit-token
+origin-secret
+gateway-runtime.json
+pinned-root
+config.pre-runtime-migration.json
+tunnel-config.pre-runtime-migration.json
+install-cloudflared-token.sh
+advisor-tunnel-id
+tunnel-token
+cloudflared-token
+cf-access-client-id
+cf-access-client-secret
 
 # Private keys, signing stores, and VPN profiles
 *.pem
@@ -44,6 +68,58 @@ id_ed25519
 id_ed25519.*
 *.ovpn
 wg*.conf
+*.agekey
+terraform.tfstate
+terraform.tfstate.*
+wallet*.json
+keypair*.json
+mnemonic*.txt
+seed-phrase*.txt
+seed_phrase*.txt
+
+# Opaque exports, captures, and packaged artifacts require explicit review
+*.7z
+*.a
+*.bin
+*.duckdb
+*.dll
+*.doc
+*.docx
+*.dylib
+*.egg
+*.exe
+*.gz
+*.h5
+*.ipynb
+*.jar
+*.joblib
+*.map
+*.npy
+*.npz
+*.onnx
+*.parquet
+*.pcap
+*.pcapng
+*.pdf
+*.pickle
+*.pkl
+*.ppt
+*.pptx
+*.pt
+*.pth
+*.rar
+*.safetensors
+*.saz
+*.so
+*.tar
+*.tar.gz
+*.tgz
+*.war
+*.wasm
+*.whl
+*.xls
+*.xlsx
+*.zip
 
 # Generated Python, databases, logs, and editor backups
 __pycache__/

@@ -8,7 +8,8 @@ This plan follows `AGENTS.md`, `docs/PLAYBOOK.md`, and
 Implement one narrow, complete `goal-research` lane for foreground Codex Goals.
 The lane must turn a broad goal into a durable sequence of repository-grounded
 claims, bounded advisor challenges, one hypothesis-scoped implementation packet,
-Codex verification evidence, and a fresh post-change audit.
+Codex verification evidence, and a post-change audit of the fresh current
+snapshot.
 
 The target contains two bounded loops. The epistemic loop protects the original
 goal, independently remaps the current system, separates information
@@ -31,20 +32,20 @@ discriminating checks without overfitting to one ML codebase.
 
 - [x] Inspect current repository guidance, advisor lanes, setup behavior,
   planning conventions, and dirty worktree before preparing this plan.
-- [ ] Characterize existing contracts and freeze the v1 CLI/artifact schemas.
-- [ ] Implement the private event log, deterministic state reducer, and guarded
+- [x] Characterize existing contracts and freeze the v1 CLI/artifact schemas.
+- [x] Implement the private event log, deterministic state reducer, and guarded
   controller transitions.
-- [ ] Implement independent repo-aware role orchestration, typed report
+- [x] Implement independent repo-aware role orchestration, typed report
   normalization, bounded claim-ID challenge, and synthesis.
-- [ ] Implement goal-fidelity stewardship, clean-room re-grounding, bounded
+- [x] Implement goal-fidelity stewardship, clean-room re-grounding, bounded
   task-specific specialists, and competing-hypothesis memory.
-- [ ] Implement implementation packets, Codex receipts, post-change audits,
+- [x] Implement implementation packets, Codex receipts, post-change audits,
   budgets, completion rules, and resume.
-- [ ] Add seeded information-adequacy, framing-drift, and negative-control
+- [x] Add seeded information-adequacy, framing-drift, and negative-control
   fixtures with deterministic offline regressions.
 - [ ] Run one live, sanitized, repo-aware vertical-slice benchmark.
-- [ ] Update only necessary README, skill, and setup/install documentation.
-- [ ] Run targeted and full regression validation, installed-skill parity, diff
+- [x] Update only necessary README, skill, and setup/install documentation.
+- [x] Run targeted and full regression validation, installed-skill parity, diff
   review, and secret-surface review.
 
 ## Surprises & Discoveries
@@ -68,6 +69,39 @@ discriminating checks without overfitting to one ML codebase.
 - A rigorous delivery controller can still execute the wrong framing perfectly.
   The full target therefore needs a bounded epistemic layer, not merely stronger
   state integrity around one selected hypothesis.
+- `advisor_agent.py` already provides a project-local `--conversation-key`, but
+  the initial goal-research orchestration did not pass it. Without that key,
+  every iteration directory also created a new ChatGPT conversation and lost
+  useful role memory.
+- The first live goal-fidelity step failed before submission because the new
+  prompt-phase adapter passed `--base-url` to `advisor.py`, whose compatible
+  endpoint is an environment-only contract. The narrow fix removed that CLI
+  argument, retained `ADVISOR_BASE_URL`, and added a real command-shape
+  regression before resuming the same checkpoint.
+- The second live attempt proved all core repo-aware roles could inspect the
+  exact sanitized snapshot, but natural-language aliases such as `lost`,
+  `supporting`, and `unsupported` did not match the intentionally closed schema.
+  Role prompts now enumerate every accepted value and explain adjacent terms;
+  validators still fail closed instead of coercing aliases.
+- A later live specialist invented a full information-path object even though
+  temporary specialists do not own that mapping. Specialist prompts now require
+  `information_assessment: null`, forbid nested specialist requests, and allow a
+  specialist only when one current read-only inspection can close the unknown.
+- A valid live synthesis treated evidence gaps that its packet was designed to
+  resolve as terminal `blocking_reasons`. The synthesis contract now has two
+  exclusive branches: one packet with no terminal blockers, or no packet with at
+  least one terminal blocker.
+- Turn accounting originally charged wrapper invocations that failed before any
+  remote submission. Budgets now count only journal-proven submitted turns and
+  preserve completed failures accurately.
+- Resume needs two different guarantees. An interrupted or pending submission
+  stays in its original checkpoint for GET-only reconciliation. A deliberate
+  retry after a visible blocked result uses a numbered immutable attempt path so
+  the original request, response, and journal remain auditable.
+- A post-change audit cannot make an old contradiction disappear by omission.
+  It must classify every prior contradiction as open or resolved, and resolution
+  requires fresh current-snapshot claim evidence. The epistemic refresh must
+  carry every still-open contradiction forward exactly.
 
 ## Decision Log
 
@@ -130,6 +164,18 @@ discriminating checks without overfitting to one ML codebase.
   validity.
   Rationale: Merely passing information into a tensor or component does not
   prove that the architecture can exploit it for the real goal.
+  Date/Author: 2026-07-22 / Codex
+
+- Decision: Reuse one project-scoped ChatGPT conversation per goal run and
+  persistent repo-aware role, while keeping clean-room and final-blind auditors
+  on fresh conversations.
+  Rationale: Core reviewers and specialists retain useful prior evidence without
+  collapsing independent roles into one chat. Run-scoped keys prevent unrelated
+  goals from contaminating each other, while fresh blind roles preserve the
+  anti-anchoring checks. Iteration-specific recovery journals remain separate
+  from conversation state. Role-chat memory remains orientation only; every
+  iteration must reopen the exact current sanitized snapshot and produce fresh
+  snapshot-bound evidence.
   Date/Author: 2026-07-22 / Codex
 
 ## Context And Orientation
@@ -213,7 +259,9 @@ goal_research.py resume
 - `record-codex` records implementation and local-verification receipts but does
   not run hidden project commands or edit source.
 - `status` is read-only and reconstructs state from the event log.
-- `resume` reconciles existing checkpoints before any new non-idempotent turn.
+- `resume` reconciles a possibly submitted turn in its original checkpoint
+  before any new non-idempotent turn. After an explicit blocked result, a safe
+  retry uses a numbered immutable checkpoint and preserves the failed attempt.
 - All commands support `--project-dir`, explicit run selection, `--json`, and
   deterministic `--dry-run` where meaningful.
 
@@ -474,8 +522,8 @@ Work:
   and retained evidence.
 - Preserve pre-existing dirty changes and distinguish them from the bounded
   iteration delta. Do not auto-clean, commit, or revert.
-- Refresh the sanitized generation after Codex changes and require one fresh
-  repo-aware post-change audit.
+- Refresh the sanitized generation after Codex changes and require the stable
+  post-change role to inspect that fresh current snapshot with new MCP evidence.
 - Close the iteration with one mutually exclusive outcome and update acceptance
   evidence.
 - Return every outcome to the epistemic loop. Update hypothesis support,
@@ -490,7 +538,8 @@ Work:
   complete goal-clause traceability, fresh acceptance evidence, no critical
   contradiction, and a passing blind completion audit.
 - Implement resume/reconciliation from every durable boundary without replaying
-  ambiguous advisor submissions.
+  ambiguous advisor submissions, and preserve each explicit retry as a numbered
+  immutable attempt.
 
 Validation:
 
@@ -706,13 +755,35 @@ Rollback:
 
 ## Outcomes & Retrospective
 
-Fill this section during implementation with:
+The implementation adds `goal_research.py`, `goal_research_state.py`, and
+`goal_research_roles.py`, with deterministic fixtures in
+`tests/fixtures/goal-research/`, an end-to-end offline regression in
+`tests/test-goal-research.py`, and narrow installation/documentation updates.
+The v1 CLI remained explicit rather than entering default router selection.
+Artifacts are immutable and event-sourced; state is rebuilt from the event log,
+and every remote phase has a checkpoint and a bounded resume contract.
 
-- exact files changed
-- schema and CLI decisions that differed from the initial plan
-- seeded benchmark results
-- live run directory and sanitized evidence summary
-- targeted and full test counts/results
-- installed-skill parity results
-- remaining limitations or deferred work
-- explicit final GO/NO-GO for using `goal-research` in other repositories
+The positive fixture preserves passing ordinary tests while discarding useful
+pipeline information; the controller's information-path audit identifies that
+loss. The negative fixture justifies its exclusion and remains a true negative.
+Goal-fidelity, closed-vocabulary normalization, hypothesis bounds, challenge,
+Codex receipts, stale-snapshot rejection, post-change contradiction accounting,
+completion gates, and interrupted-turn recovery all pass deterministic tests.
+
+Validation completed across the goal-research suite and the existing advisor
+concurrency, transport, router, agent, conclave, verifier, and security
+regressions. Python, Node, and Bash syntax checks pass. The source and installed
+skill were compared directly after synchronization. The public candidate was
+also scanned as a working tree and staged index, including exact local private
+values and high-confidence secret patterns.
+
+One full live sanitized ChatGPT vertical slice remains intentionally unchecked
+above. Individual live phases exposed and fixed real prompt-shape, schema,
+specialist-boundary, accounting, and recovery defects, but this plan does not
+claim an uninterrupted final live completion without preserving that evidence.
+
+Final decision: **GO for explicit, controlled `goal-research` use** with Codex as
+the editor and verifier. Keep it opt-in, retain the existing fail-closed
+repo-aware evidence checks, and do not make it a default router lane until a
+complete live vertical slice is recorded. Windows supports prompt-only lanes;
+sanitized repo-aware generation and the permanent domain MCP remain Linux-only.

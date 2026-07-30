@@ -40,6 +40,9 @@ ALLOW_SENSITIVE_PROJECT_ENV = "ADVISOR_AGENT_ALLOW_SENSITIVE_PROJECT"
 SECRET_SCAN_ENV = "ADVISOR_AGENT_SECRET_SCAN"
 SECRET_SCAN_MAX_FILES_ENV = "ADVISOR_AGENT_SECRET_SCAN_MAX_FILES"
 SECRET_SCAN_MAX_BYTES_ENV = "ADVISOR_AGENT_SECRET_SCAN_MAX_BYTES"
+SANITIZED_SOURCE_MAX_BYTES_ENV = "ADVISOR_AGENT_SANITIZED_SOURCE_MAX_BYTES"
+SANITIZED_MAX_ENTRIES_ENV = "ADVISOR_AGENT_SANITIZED_MAX_ENTRIES"
+SANITIZED_MAX_TOTAL_BYTES_ENV = "ADVISOR_AGENT_SANITIZED_MAX_TOTAL_BYTES"
 SANITIZED_WORKSPACE_ENV = "ADVISOR_AGENT_SANITIZED_WORKSPACE"
 WORKSPACE_ROOT_ENV = "ADVISOR_AGENT_WORKSPACE_ROOT"
 
@@ -51,6 +54,11 @@ VALID_SANITIZED_WORKSPACE_MODES = {"auto", "always", "off"}
 CONFIG_SCHEMA_VERSION = "1.0"
 DEFAULT_SECRET_SCAN_MAX_FILES = 20000
 DEFAULT_SECRET_SCAN_MAX_BYTES = 262144
+DEFAULT_SANITIZED_SOURCE_MAX_BYTES = 1048576
+DEFAULT_SANITIZED_MAX_ENTRIES = 20000
+DEFAULT_SANITIZED_MAX_TOTAL_BYTES = 512 * 1024 * 1024
+DEFAULT_SOURCE_TREE_MAX_ENTRIES = 500000
+SANITIZED_LARGE_SOURCE_SUFFIXES = frozenset({".py", ".pyi"})
 
 SENSITIVE_AGENT_DIR_NAMES = {
     ".aws",
@@ -163,6 +171,31 @@ SENSITIVE_AGENT_SUFFIXES = (
     ".kdbx",
     ".p12",
     ".pfx",
+)
+
+FULL_ACCESS_SENSITIVE_NAME_MARKERS = (
+    "auth_openaichat",
+    "mnemonic",
+    "private-key",
+    "private_key",
+    "seed-phrase",
+    "seed_phrase",
+)
+
+FULL_ACCESS_SENSITIVE_SUFFIXES = (
+    ".agekey",
+    ".cookie.json",
+    ".cookies.json",
+    ".har",
+    ".jks",
+    ".kdbx",
+    ".key",
+    ".keystore",
+    ".p12",
+    ".pem",
+    ".pfx",
+    ".secret",
+    ".token",
 )
 
 CONTENT_SECRET_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
@@ -323,6 +356,8 @@ class SanitizedCopyPlan:
     skipped_paths: list[str] = field(default_factory=list)
     redacted_paths: list[str] = field(default_factory=list)
     fingerprint: str = ""
+    copied_bytes: int = 0
+    scanned_entries: int = 0
     errors: list[str] = field(default_factory=list)
 
 
@@ -553,10 +588,12 @@ def project_relative_parts(project: Path, path: Path) -> list[str]:
         return relative_parts(path)
 
 
-def contains_sensitive_project_marker(project: Path, path: Path) -> bool:
-    parts = project_relative_parts(project, path)
+def contains_sensitive_project_relative_marker(relative: Path) -> bool:
+    if relative.is_absolute() or ".." in relative.parts:
+        return True
+    parts = [part.lower() for part in relative.parts if part not in {"", os.sep}]
     joined = "/".join(parts)
-    name = path.name.lower()
+    name = relative.name.lower()
     if ".codex-advisor" in parts:
         return True
     if any(marker.lower() in joined for marker in BROWSER_DIR_MARKERS):
@@ -574,6 +611,37 @@ def contains_sensitive_project_marker(project: Path, path: Path) -> bool:
     if any(name.endswith(suffix) for suffix in SENSITIVE_AGENT_SUFFIXES):
         return True
     return False
+
+
+def contains_sensitive_full_access_relative_marker(relative: Path) -> bool:
+    if relative.is_absolute() or ".." in relative.parts:
+        return True
+    parts = [part.lower() for part in relative.parts if part not in {"", os.sep}]
+    joined = "/".join(parts)
+    name = relative.name.lower()
+    if ".codex-advisor" in parts:
+        return True
+    if any(marker.lower() in joined for marker in BROWSER_DIR_MARKERS):
+        return True
+    if any(part in SENSITIVE_AGENT_DIR_NAMES for part in parts):
+        return True
+    if name in SENSITIVE_AGENT_FILE_NAMES or name in safety.SENSITIVE_FILE_NAMES:
+        return True
+    if name.startswith(".env.") or (
+        name.startswith("auth_") and name.endswith(".json")
+    ):
+        return True
+    if any(marker in name for marker in FULL_ACCESS_SENSITIVE_NAME_MARKERS):
+        return True
+    return any(name.endswith(suffix) for suffix in FULL_ACCESS_SENSITIVE_SUFFIXES)
+
+
+def contains_sensitive_project_marker(project: Path, path: Path) -> bool:
+    try:
+        relative = path.resolve().relative_to(project.resolve())
+    except (OSError, ValueError):
+        return contains_sensitive_agent_marker(path)
+    return contains_sensitive_project_relative_marker(relative)
 
 
 def project_sensitive_reason(project: Path, path: Path) -> str:
@@ -674,6 +742,97 @@ def sha256_file(path: Path) -> str:
             os.close(descriptor)
 
 
+def decode_mountinfo_path(value: str) -> str:
+    try:
+        return re.sub(
+            r"\\([0-7]{3})",
+            lambda match: chr(int(match.group(1), 8)),
+            value,
+        )
+    except ValueError as exc:
+        raise RuntimeError("the kernel mount table contained an invalid path escape") from exc
+
+
+def source_descendant_mount_points(
+    project: Path,
+    *,
+    mountinfo_text: str | None = None,
+) -> list[Path]:
+    project = project.resolve(strict=True)
+    if mountinfo_text is None:
+        mountinfo = Path("/proc/self/mountinfo")
+        if not mountinfo.is_file():
+            return []
+        raw = mountinfo.read_bytes()
+        if len(raw) > 4 * 1024 * 1024:
+            raise RuntimeError("the process mount table exceeded its safety limit")
+        mountinfo_text = raw.decode("utf-8", errors="surrogateescape")
+    descendants: set[Path] = set()
+    for line in mountinfo_text.splitlines():
+        fields = line.split(" ")
+        if len(fields) < 6 or " - " not in line:
+            raise RuntimeError("the process mount table was malformed")
+        mount_point = Path(os.path.normpath(decode_mountinfo_path(fields[4])))
+        if not mount_point.is_absolute():
+            raise RuntimeError("the process mount table contained a relative mount point")
+        try:
+            relative = mount_point.relative_to(project)
+        except ValueError:
+            continue
+        if relative != Path("."):
+            descendants.add(mount_point)
+    return sorted(descendants, key=str)
+
+
+def verify_source_tree_boundary(
+    project_dir: str | Path,
+    *,
+    mountinfo_text: str | None = None,
+    max_entries: int = DEFAULT_SOURCE_TREE_MAX_ENTRIES,
+) -> None:
+    project = resolve_path(project_dir)
+    root_metadata = project.lstat()
+    if not stat.S_ISDIR(root_metadata.st_mode):
+        raise RuntimeError("source project root is not a directory")
+    mounts = source_descendant_mount_points(project, mountinfo_text=mountinfo_text)
+    if mounts:
+        relative = mounts[0].relative_to(project)
+        raise RuntimeError(f"source project contains a descendant mount point at {relative}")
+
+    errors: list[OSError] = []
+    entries = 0
+    for root, directories, files in os.walk(
+        project,
+        topdown=True,
+        followlinks=False,
+        onerror=errors.append,
+    ):
+        root_path = Path(root)
+        for name in [*directories, *files]:
+            entries += 1
+            if entries > max_entries:
+                raise RuntimeError("source project exceeded the boundary-scan entry limit")
+            path = root_path / name
+            try:
+                metadata = path.lstat()
+            except OSError as exc:
+                raise RuntimeError("source project changed during its boundary scan") from exc
+            if metadata.st_dev != root_metadata.st_dev:
+                raise RuntimeError("source project crosses a filesystem device boundary")
+            if stat.S_ISREG(metadata.st_mode) and metadata.st_nlink > 1:
+                raise RuntimeError("source project contains a hardlinked regular file")
+            if not (
+                stat.S_ISREG(metadata.st_mode)
+                or stat.S_ISDIR(metadata.st_mode)
+                or stat.S_ISLNK(metadata.st_mode)
+            ):
+                raise RuntimeError(
+                    "source project contains a socket, device, FIFO, or other unsupported entry"
+                )
+    if errors:
+        raise RuntimeError("source project could not be scanned completely")
+
+
 def scan_project_secrets(
     project_dir: str | Path,
     *,
@@ -692,6 +851,11 @@ def scan_project_secrets(
 
     if not project.exists() or not project.is_dir():
         result.errors.append("project directory does not exist or is not a directory")
+        return result
+    try:
+        verify_source_tree_boundary(project)
+    except (OSError, RuntimeError) as exc:
+        result.errors.append(f"source boundary validation failed: {exc}")
         return result
 
     def add_finding(path: Path, kind: str, reason: str) -> None:
@@ -810,6 +974,22 @@ def should_skip_sanitized_file(project: Path, path: Path, *, max_content_bytes: 
     return False, ""
 
 
+def sanitized_source_content_limit(*, max_content_bytes: int) -> int:
+    source_limit = int(
+        os.environ.get(
+            SANITIZED_SOURCE_MAX_BYTES_ENV,
+            DEFAULT_SANITIZED_SOURCE_MAX_BYTES,
+        )
+    )
+    return max(max_content_bytes, source_limit)
+
+
+def sanitized_file_content_limit(path: Path, *, max_content_bytes: int) -> int:
+    if path.suffix.lower() not in SANITIZED_LARGE_SOURCE_SUFFIXES:
+        return max_content_bytes
+    return sanitized_source_content_limit(max_content_bytes=max_content_bytes)
+
+
 def read_regular_file(path: Path, *, max_content_bytes: int) -> tuple[os.stat_result, bytes]:
     flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NONBLOCK", 0)
     if hasattr(os, "O_NOFOLLOW"):
@@ -858,8 +1038,13 @@ def read_regular_file_beneath(
     current_descriptor = root_descriptor
     file_descriptor = -1
     try:
+        root_stat = os.fstat(root_descriptor)
         for component in relative.parts[:-1]:
             next_descriptor = os.open(component, directory_flags, dir_fd=current_descriptor)
+            next_stat = os.fstat(next_descriptor)
+            if not stat.S_ISDIR(next_stat.st_mode) or next_stat.st_dev != root_stat.st_dev:
+                os.close(next_descriptor)
+                raise RuntimeError("source path crosses a filesystem boundary")
             if current_descriptor != root_descriptor:
                 os.close(current_descriptor)
             current_descriptor = next_descriptor
@@ -867,6 +1052,10 @@ def read_regular_file_beneath(
         stat_result = os.fstat(file_descriptor)
         if not stat.S_ISREG(stat_result.st_mode):
             raise RuntimeError("source entry is not a regular file")
+        if stat_result.st_dev != root_stat.st_dev:
+            raise RuntimeError("source file crosses a filesystem boundary")
+        if stat_result.st_nlink > 1:
+            raise RuntimeError("source file is hardlinked")
         if stat_result.st_size > max_content_bytes:
             raise RuntimeError(
                 f"source file exceeds sanitized content inspection limit ({max_content_bytes} bytes)"
@@ -942,6 +1131,38 @@ def sanitized_file_entry(
 def build_sanitized_copy_plan(project: Path, *, max_content_bytes: int) -> SanitizedCopyPlan:
     plan = SanitizedCopyPlan()
     digest = hashlib.sha256()
+    try:
+        max_entries = int(
+            os.environ.get(
+                SANITIZED_MAX_ENTRIES_ENV,
+                DEFAULT_SANITIZED_MAX_ENTRIES,
+            )
+        )
+        max_total_bytes = int(
+            os.environ.get(
+                SANITIZED_MAX_TOTAL_BYTES_ENV,
+                DEFAULT_SANITIZED_MAX_TOTAL_BYTES,
+            )
+        )
+    except ValueError:
+        plan.errors.append("sanitized workspace limits must be integers")
+        return plan
+    if max_entries < 1 or max_entries > DEFAULT_SOURCE_TREE_MAX_ENTRIES:
+        plan.errors.append(
+            f"sanitized workspace entry limit must be between 1 and "
+            f"{DEFAULT_SOURCE_TREE_MAX_ENTRIES}"
+        )
+        return plan
+    if max_total_bytes < 1 or max_total_bytes > 16 * 1024 * 1024 * 1024:
+        plan.errors.append(
+            "sanitized workspace byte limit must be between 1 and 17179869184"
+        )
+        return plan
+    try:
+        verify_source_tree_boundary(project)
+    except (OSError, RuntimeError) as exc:
+        plan.errors.append(f"source boundary validation failed: {exc}")
+        return plan
 
     def record(kind: str, relative: Path, detail: str = "") -> None:
         digest.update(kind.encode("ascii"))
@@ -970,6 +1191,13 @@ def build_sanitized_copy_plan(project: Path, *, max_content_bytes: int) -> Sanit
 
         kept_dirs: list[str] = []
         for name in dirs:
+            plan.scanned_entries += 1
+            if plan.scanned_entries > max_entries:
+                plan.errors.append(
+                    f"sanitized copy exceeded max entry limit ({max_entries})"
+                )
+                plan.fingerprint = digest.hexdigest()
+                return plan
             source = source_root / name
             if source.is_symlink():
                 plan.skipped_symlinks += 1
@@ -988,6 +1216,13 @@ def build_sanitized_copy_plan(project: Path, *, max_content_bytes: int) -> Sanit
         dirs[:] = kept_dirs
 
         for name in files:
+            plan.scanned_entries += 1
+            if plan.scanned_entries > max_entries:
+                plan.errors.append(
+                    f"sanitized copy exceeded max entry limit ({max_entries})"
+                )
+                plan.fingerprint = digest.hexdigest()
+                return plan
             source = source_root / name
             if source.is_symlink():
                 plan.skipped_symlinks += 1
@@ -998,11 +1233,15 @@ def build_sanitized_copy_plan(project: Path, *, max_content_bytes: int) -> Sanit
                 plan.skipped_files += 1
                 remember_skip(source, "reserved sanitized-workspace metadata path omitted")
                 continue
+            file_content_limit = sanitized_file_content_limit(
+                source,
+                max_content_bytes=max_content_bytes,
+            )
             entry, skip_reason = sanitized_file_entry(
                 project,
                 source,
                 relative,
-                max_content_bytes=max_content_bytes,
+                max_content_bytes=file_content_limit,
             )
             if entry is None:
                 if skip_reason.startswith("could not inspect file safely"):
@@ -1011,6 +1250,19 @@ def build_sanitized_copy_plan(project: Path, *, max_content_bytes: int) -> Sanit
                 plan.skipped_files += 1
                 remember_skip(source, skip_reason)
                 continue
+            target_size = (
+                len(entry.redacted_content)
+                if entry.redacted_content is not None
+                else entry.size
+            )
+            if plan.copied_bytes + target_size > max_total_bytes:
+                plan.errors.append(
+                    f"sanitized copy exceeded max aggregate byte limit "
+                    f"({max_total_bytes})"
+                )
+                plan.fingerprint = digest.hexdigest()
+                return plan
+            plan.copied_bytes += target_size
             plan.entries.append(entry)
             if entry.redacted_content is not None:
                 plan.redacted_paths.append(
@@ -1156,22 +1408,24 @@ def reusable_sanitized_generation(
 
 def git_source_provenance(project: Path) -> dict[str, Any]:
     def git(*args: str) -> subprocess.CompletedProcess[str]:
-        return subprocess.run(
-            ["git", "-C", str(project), *args],
+        return safety.run_hardened_git(
+            project,
+            list(args),
             text=True,
-            encoding="utf-8",
-            errors="replace",
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
             timeout=5,
-            check=False,
+            maximum_output_bytes=4 * 1024 * 1024,
         )
 
     try:
         head = git("rev-parse", "HEAD")
         tree = git("rev-parse", "HEAD^{tree}")
-        status = git("status", "--porcelain=v1", "--untracked-files=normal")
-    except (OSError, subprocess.TimeoutExpired):
+        status = git(
+            "status",
+            "--porcelain=v1",
+            "--untracked-files=normal",
+            "--ignore-submodules=all",
+        )
+    except (OSError, RuntimeError, subprocess.TimeoutExpired):
         return {"available": False}
     if head.returncode != 0 or tree.returncode != 0 or status.returncode != 0:
         return {"available": False}
@@ -1380,10 +1634,14 @@ def create_sanitized_workspace(
         try:
             safety.ensure_private_dir(staging)
             for entry in plan.entries:
+                file_content_limit = sanitized_file_content_limit(
+                    project / entry.relative,
+                    max_content_bytes=max_content_bytes,
+                )
                 before, source_content = read_regular_file_beneath(
                     project,
                     entry.relative,
-                    max_content_bytes=max_content_bytes,
+                    max_content_bytes=file_content_limit,
                 )
                 if (
                     before.st_size != entry.size
@@ -1453,7 +1711,12 @@ def create_sanitized_workspace(
             safety.atomic_write_text(staging / "ADVISOR_SANITIZED_WORKSPACE.md", marker_text)
             safety.atomic_write_json(staging / "SANITIZED_WORKSPACE_MANIFEST.json", manifest)
 
-            clean_scan = scan_project_secrets(staging)
+            clean_scan = scan_project_secrets(
+                staging,
+                max_content_bytes=sanitized_source_content_limit(
+                    max_content_bytes=max_content_bytes,
+                ),
+            )
             if not clean_scan.ok:
                 status.errors.append("sanitized workspace still contains sensitive-looking files")
                 for finding in clean_scan.findings[:12]:
@@ -1623,8 +1886,25 @@ def run_small_command(project_dir: Path, command: list[str], timeout: int = 5) -
 
 
 def check_worktree(project_dir: Path) -> WorktreeStatus:
-    inside, inside_output = run_small_command(project_dir, ["git", "rev-parse", "--is-inside-work-tree"])
-    has_head, head_output = run_small_command(project_dir, ["git", "rev-parse", "--verify", "HEAD"])
+    def git_check(arguments: list[str]) -> tuple[bool, str]:
+        try:
+            completed = safety.run_hardened_git(
+                project_dir,
+                arguments,
+                text=True,
+                timeout=5,
+                maximum_output_bytes=1024 * 1024,
+            )
+        except (OSError, RuntimeError, subprocess.TimeoutExpired) as exc:
+            return False, str(exc)
+        output = (completed.stdout + "\n" + completed.stderr).strip()
+        return (
+            completed.returncode == 0,
+            safety.truncate(safety.redact_sensitive_text(output), 400),
+        )
+
+    inside, inside_output = git_check(["rev-parse", "--is-inside-work-tree"])
+    has_head, head_output = git_check(["rev-parse", "--verify", "HEAD"])
     errors: list[str] = []
     if not inside:
         errors.append(inside_output or "not inside a Git work tree")
