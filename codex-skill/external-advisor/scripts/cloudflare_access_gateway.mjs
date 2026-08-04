@@ -15,7 +15,6 @@ const MAX_JWKS_BYTES = 256 * 1024;
 const DEFAULT_BODY_LIMIT = 16 * 1024 * 1024;
 const DEFAULT_CONCURRENCY = 8;
 const DEFAULT_CLOCK_SKEW_SECONDS = 60;
-const MAX_ACCESS_ASSERTION_LIFETIME_SECONDS = 15 * 60;
 const REQUEST_BODY_TIMEOUT_MS = 60 * 1000;
 const JWKS_CACHE_MS = 5 * 60 * 1000;
 const MIN_JWKS_REFRESH_INTERVAL_MS = 30 * 1000;
@@ -271,7 +270,6 @@ export function verifyAccessJwt(token, config, jwk, nowSeconds = Math.floor(Date
   }
   if (
     payload.exp <= payload.iat ||
-    payload.exp - payload.iat > MAX_ACCESS_ASSERTION_LIFETIME_SECONDS ||
     (payload.nbf !== undefined && payload.nbf > payload.exp)
   ) {
     fail("Cloudflare Access token temporal claims are invalid.");

@@ -12,6 +12,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -271,6 +272,28 @@ def test_cloudflared_runtime_namespace_contract() -> None:
     assert domain_mcp.cloudflared_socket_namespace_compatible(config)
     config["runtimeDir"] = f"/run/user/{os.getuid()}/advisor-domain-mcp"
     assert not domain_mcp.cloudflared_socket_namespace_compatible(config)
+
+
+def test_expiry_timer_status(config: dict[str, Any]) -> None:
+    wall_now = datetime(2026, 7, 30, 8, 0, tzinfo=timezone.utc)
+    active = domain_mcp.expiry_timer_details(
+        config,
+        True,
+        active_enter_monotonic_us=90_000_000,
+        monotonic_now=100.0,
+        wall_now=wall_now,
+    )
+    assert active == {
+        "expiryTimerExpiresAt": "2026-07-30T08:59:50+00:00",
+        "expiryTimerRemainingSeconds": 3590,
+        "expiryTimerRemaining": "59m 50s",
+    }
+    assert domain_mcp.expiry_timer_details(config, False) == {
+        "expiryTimerExpiresAt": "inactive",
+        "expiryTimerRemainingSeconds": 0,
+        "expiryTimerRemaining": "inactive",
+    }
+    assert domain_mcp.format_remaining_duration(90_061) == "1d 1h 1m 1s"
 
 
 def test_manager_guards(config: dict[str, Any], base: Path) -> None:
@@ -901,6 +924,9 @@ def test_cloudflare_hardening_audit(config: dict[str, Any]) -> None:
             omit_config_account_id: bool = False,
             multiple_connectors: bool = False,
             omit_result_info: bool = False,
+            long_policy_session: bool = False,
+            omit_team_name: bool = False,
+            wrong_team_name: bool = False,
         ) -> None:
             self.localhost_allowed = localhost_allowed
             self.weak_authenticator_allowed = weak_authenticator_allowed
@@ -908,6 +934,9 @@ def test_cloudflare_hardening_audit(config: dict[str, Any]) -> None:
             self.omit_config_account_id = omit_config_account_id
             self.multiple_connectors = multiple_connectors
             self.omit_result_info = omit_result_info
+            self.long_policy_session = long_policy_session
+            self.omit_team_name = omit_team_name
+            self.wrong_team_name = wrong_team_name
 
         def list_response(
             self,
@@ -969,6 +998,13 @@ def test_cloudflare_hardening_audit(config: dict[str, Any]) -> None:
                                     "access": {
                                         "required": True,
                                         "audTag": [config["accessAudience"]],
+                                        "teamName": (
+                                            "wrong-team"
+                                            if self.wrong_team_name
+                                            else config["accessIssuer"]
+                                            .removeprefix("https://")
+                                            .removesuffix(".cloudflareaccess.com")
+                                        ),
                                     }
                                 },
                             },
@@ -976,6 +1012,10 @@ def test_cloudflare_hardening_audit(config: dict[str, Any]) -> None:
                         ]
                     },
                 }
+                if self.omit_team_name:
+                    del result["config"]["ingress"][0]["originRequest"]["access"][
+                        "teamName"
+                    ]
                 if not self.omit_config_account_id:
                     result["account_id"] = account_id
                 return JsonResponse(result)
@@ -1031,6 +1071,8 @@ def test_cloudflare_hardening_audit(config: dict[str, Any]) -> None:
                 detail = json.loads(json.dumps(policy))
                 if self.weak_authenticator_allowed:
                     detail["mfa_config"]["allowed_authenticators"].append("totp")
+                if self.long_policy_session:
+                    detail["session_duration"] = "24h"
                 return self.list_response(path, [detail])
             if endpoint.endswith("/access/identity_providers"):
                 return self.list_response(path, [idp])
@@ -1058,6 +1100,8 @@ def test_cloudflare_hardening_audit(config: dict[str, Any]) -> None:
     assert checks["singleActiveConnector"] is True
     assert checks["localTunnelIdentityExact"] is True
     assert checks["localConnectorIdentityExact"] is True
+    assert checks["shortEffectivePolicySession"] is True
+    assert checks["tunnelAccessTeamExact"] is True
     optional_account_id_omitted = domain_mcp.audit_cloudflare_hardening(
         config,
         account_id=account_id,
@@ -1096,6 +1140,45 @@ def test_cloudflare_hardening_audit(config: dict[str, Any]) -> None:
     )
     assert weak_mfa["ready"] is False
     assert weak_mfa["phishingResistantMfaRequired"] is False
+    long_policy_session = domain_mcp.audit_cloudflare_hardening(
+        config,
+        account_id=account_id,
+        token="t" * 43,
+        redirect_uri=redirect_uri,
+        tunnel_id=tunnel_id,
+        zone_id=zone_id,
+        local_tunnel_identity=tunnel_id,
+        local_connector_identity=local_connector,
+        opener=CloudflareOpener(long_policy_session=True),
+    )
+    assert long_policy_session["ready"] is False
+    assert long_policy_session["shortEffectivePolicySession"] is False
+    missing_team_name = domain_mcp.audit_cloudflare_hardening(
+        config,
+        account_id=account_id,
+        token="t" * 43,
+        redirect_uri=redirect_uri,
+        tunnel_id=tunnel_id,
+        zone_id=zone_id,
+        local_tunnel_identity=tunnel_id,
+        local_connector_identity=local_connector,
+        opener=CloudflareOpener(omit_team_name=True),
+    )
+    assert missing_team_name["ready"] is False
+    assert missing_team_name["tunnelAccessTeamExact"] is False
+    wrong_team_name = domain_mcp.audit_cloudflare_hardening(
+        config,
+        account_id=account_id,
+        token="t" * 43,
+        redirect_uri=redirect_uri,
+        tunnel_id=tunnel_id,
+        zone_id=zone_id,
+        local_tunnel_identity=tunnel_id,
+        local_connector_identity=local_connector,
+        opener=CloudflareOpener(wrong_team_name=True),
+    )
+    assert wrong_team_name["ready"] is False
+    assert wrong_team_name["tunnelAccessTeamExact"] is False
     tcp_origin = domain_mcp.audit_cloudflare_hardening(
         config,
         account_id=account_id,
@@ -1789,6 +1872,7 @@ def main() -> None:
     with tempfile.TemporaryDirectory(prefix="advisor-domain-mcp-test-") as temporary:
         base = Path(temporary)
         config, project, secret = fixture_config(base)
+        test_expiry_timer_status(config)
         test_manager_guards(config, base)
         test_checkout_state_pin(base)
         test_checkout_boundary_guards(base)

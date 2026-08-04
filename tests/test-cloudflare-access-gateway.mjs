@@ -58,14 +58,17 @@ assert.throws(() => verifyAccessJwt(token({ email: "other@example.com" }), confi
 assert.throws(() => verifyAccessJwt(token({ exp: now - 1000 }), config, jwk, now), /expired/);
 assert.throws(() => verifyAccessJwt(token({ iat: undefined }), config, jwk, now), /issue time/);
 assert.throws(() => verifyAccessJwt(token({ sub: "" }), config, jwk, now), /subject/);
+assert.equal(
+  verifyAccessJwt(
+    token({ iat: now - 3600, nbf: now - 3600, exp: now + 24 * 3600 }),
+    config,
+    jwk,
+    now,
+  ).email,
+  "owner@example.com",
+);
 assert.throws(
-  () =>
-    verifyAccessJwt(
-      token({ iat: now - 3600, nbf: now - 3600, exp: now + 24 * 3600 }),
-      config,
-      jwk,
-      now,
-    ),
+  () => verifyAccessJwt(token({ iat: now - 5, nbf: now - 5, exp: now - 5 }), config, jwk, now),
   /temporal/,
 );
 assert.throws(

@@ -10,6 +10,8 @@ advisor-config.json
 # Browser/session authentication exports
 *.har
 *.har.gz
+cookie.json
+cookies.json
 *.cookie.json
 *.cookies.json
 cookies*.txt

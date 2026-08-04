@@ -61,7 +61,7 @@ MAX_CONCURRENT_LIMIT = 64
 DISK_GUARD_INTERVAL_SECONDS = 0.25
 STARTUP_READY_TIMEOUT_SECONDS = 5 * 60
 REMOTE_HARDENING_MAX_AGE_HOURS = 24
-CLOUDFLARE_HARDENING_PROFILE = 6
+CLOUDFLARE_HARDENING_PROFILE = 7
 CLOUDFLARE_API_ROOT = "https://api.cloudflare.com/client/v4"
 MAX_CLOUDFLARE_RESPONSE_BYTES = 4 * 1024 * 1024
 MAX_CLOUDFLARE_PAGES = 100
@@ -2685,7 +2685,13 @@ def audit_cloudflare_hardening(
     allowed_idps = app.get("allowed_idps")
     allowed_idps = allowed_idps if isinstance(allowed_idps, list) else []
     restricted_idp_ids = {provider["id"] for provider in restricted_idps}
-    expected_issuer = f"https://{str(organization.get('auth_domain') or '').lower()}"
+    auth_domain = str(organization.get("auth_domain") or "").lower()
+    expected_issuer = f"https://{auth_domain}"
+    expected_team_name = (
+        auth_domain.removesuffix(".cloudflareaccess.com")
+        if auth_domain.endswith(".cloudflareaccess.com")
+        else ""
+    )
 
     tunnel_config = tunnel_configuration.get("config")
     tunnel_config = tunnel_config if isinstance(tunnel_config, dict) else {}
@@ -2800,6 +2806,7 @@ def audit_cloudflare_hardening(
     exact_policy = False
     account_member_required = False
     mfa_required = False
+    effective_policy_session_short = False
     if len(policies) == 1 and isinstance(policies[0], dict):
         policy = policies[0]
         include = policy.get("include")
@@ -2838,6 +2845,12 @@ def audit_cloudflare_hardening(
                 maximum=24 * 60 * 60,
             )
         )
+        effective_policy_session_short = _duration_in_range(
+            policy.get("session_duration", app.get("session_duration")),
+            name="Effective Access policy session duration",
+            minimum=5 * 60,
+            maximum=15 * 60,
+        )
 
     checks = {
         "applicationUnique": application_unique,
@@ -2875,6 +2888,7 @@ def audit_cloudflare_hardening(
             minimum=5 * 60,
             maximum=15 * 60,
         ),
+        "shortEffectivePolicySession": effective_policy_session_short,
         "cloudflareIdpOnly": (
             len(allowed_idps) == 1
             and len(restricted_idp_ids) >= 1
@@ -2904,6 +2918,10 @@ def audit_cloudflare_hardening(
         "tunnelAccessValidationRequired": (
             tunnel_access.get("required") is True
             and tunnel_access.get("audTag") == [config["accessAudience"]]
+        ),
+        "tunnelAccessTeamExact": (
+            bool(expected_team_name)
+            and tunnel_access.get("teamName") == expected_team_name
         ),
         "finalCatchAllDeny": final_catch_all,
         "zoneIdentityExact": (
@@ -2955,6 +2973,69 @@ def audit_cloudflare_hardening(
 
 def service_active(unit: str) -> bool:
     return systemctl("is-active", "--quiet", unit).returncode == 0
+
+
+def format_remaining_duration(total_seconds: int) -> str:
+    seconds = max(0, total_seconds)
+    days, seconds = divmod(seconds, 24 * 60 * 60)
+    hours, seconds = divmod(seconds, 60 * 60)
+    minutes, seconds = divmod(seconds, 60)
+    parts = []
+    if days:
+        parts.append(f"{days}d")
+    if hours or days:
+        parts.append(f"{hours}h")
+    if minutes or hours or days:
+        parts.append(f"{minutes}m")
+    parts.append(f"{seconds}s")
+    return " ".join(parts)
+
+
+def expiry_timer_details(
+    config: dict[str, Any],
+    timer_active: bool,
+    *,
+    active_enter_monotonic_us: int | None = None,
+    monotonic_now: float | None = None,
+    wall_now: datetime | None = None,
+) -> dict[str, Any]:
+    if not timer_active:
+        return {
+            "expiryTimerExpiresAt": "inactive",
+            "expiryTimerRemainingSeconds": 0,
+            "expiryTimerRemaining": "inactive",
+        }
+    if active_enter_monotonic_us is None:
+        result = systemctl(
+            "show",
+            "--property=ActiveEnterTimestampMonotonic",
+            "--value",
+            EXPIRY_TIMER_UNIT,
+        )
+        try:
+            active_enter_monotonic_us = int(result.stdout.strip())
+        except (AttributeError, TypeError, ValueError):
+            active_enter_monotonic_us = 0
+        if result.returncode != 0 or active_enter_monotonic_us <= 0:
+            return {
+                "expiryTimerExpiresAt": "unknown",
+                "expiryTimerRemainingSeconds": -1,
+                "expiryTimerRemaining": "unknown",
+            }
+    duration_seconds = int(config["sessionDurationMinutes"]) * 60
+    current_monotonic = time.monotonic() if monotonic_now is None else monotonic_now
+    remaining_precise = max(
+        0.0,
+        active_enter_monotonic_us / 1_000_000 + duration_seconds - current_monotonic,
+    )
+    remaining = int(remaining_precise)
+    current_wall = datetime.now().astimezone() if wall_now is None else wall_now
+    expires_at = current_wall + timedelta(seconds=remaining_precise)
+    return {
+        "expiryTimerExpiresAt": expires_at.isoformat(timespec="seconds"),
+        "expiryTimerRemainingSeconds": remaining,
+        "expiryTimerRemaining": format_remaining_duration(remaining),
+    }
 
 
 def start_services(config_path: Path) -> None:
@@ -3170,6 +3251,7 @@ def service_status(config_path: Path) -> dict[str, Any]:
     origin_active = service_active(ORIGIN_UNIT)
     gateway_active = service_active(GATEWAY_UNIT)
     timer_active = service_active(EXPIRY_TIMER_UNIT)
+    timer_details = expiry_timer_details(config, timer_active)
     return {
         "configured": access_complete(config),
         "cloudflareHardeningCurrent": cloudflare_hardening_current(config),
@@ -3182,6 +3264,7 @@ def service_status(config_path: Path) -> dict[str, Any]:
         "gatewayActive": gateway_active,
         "expiryTimerActive": timer_active,
         "sessionDurationMinutes": config.get("sessionDurationMinutes"),
+        **timer_details,
         "resourceLimits": (
             (
                 "origin_compute=full-host,"
