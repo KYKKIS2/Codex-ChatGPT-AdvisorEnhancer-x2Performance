@@ -5,12 +5,16 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+if ($DevSpaceVersion -ne "1.0.4") {
+    throw "Refusing unreviewed DevSpace version $DevSpaceVersion; expected 1.0.4."
+}
 $Root = Split-Path -Parent $MyInvocation.MyCommand.Path
 $Vendor = Join-Path $Root "vendor"
 $G4f = Join-Path $Vendor "gpt4free"
 $Venv = Join-Path $G4f ".venv"
 $Py = Join-Path $Venv "Scripts\python.exe"
 $RuntimePatch = Join-Path $Root "patches\apply_gpt4free_runtime_patch.py"
+$SecurityConstraints = Join-Path $Root "constraints\gpt4free-security.txt"
 $DevSpacePatch = Join-Path $Root "codex-skill\external-advisor\scripts\devspace_readonly_patch.py"
 $DevSpaceSecurePatch = Join-Path $Root "codex-skill\external-advisor\scripts\devspace_secure_origin_patch.py"
 $SkillsSource = Join-Path $Root "codex-skill"
@@ -33,6 +37,7 @@ $RequiredFiles = @(
     (Join-Path $Root "tests\test-advisor-concurrency.ps1"),
     (Join-Path $Root "tests\test-advisor-concurrency.py"),
     $RuntimePatch,
+    $SecurityConstraints,
     $DevSpacePatch,
     $DevSpaceSecurePatch,
     (Join-Path $Root "codex-skill\external-advisor\SKILL.md"),
@@ -112,12 +117,8 @@ try {
     if (-not (Test-Path $Py)) {
         python -m venv $Venv
     }
-    & $Py -m pip install --upgrade pip
-    if ($LASTEXITCODE -ne 0) { throw "pip upgrade failed." }
-    & $Py -m pip install -r requirements.txt
+    & $Py -m pip install --constraint $SecurityConstraints -r requirements.txt
     if ($LASTEXITCODE -ne 0) { throw "gpt4free requirements install failed." }
-    & $Py -m pip install python-multipart a2wsgi Brotli pycryptodome python-dotenv
-    if ($LASTEXITCODE -ne 0) { throw "gpt4free supplemental dependency install failed." }
 
     & python $RuntimePatch $G4f
     if ($LASTEXITCODE -ne 0) { throw "gpt4free advisor runtime patch failed." }
@@ -158,22 +159,18 @@ $InstalledDevSpaceVersion = if ($null -ne $DevSpaceCommand) {
 } else {
     ""
 }
-if ($null -eq $DevSpaceCommand -or $InstalledDevSpaceVersion -ne $DevSpaceVersion) {
-    if ($null -eq (Get-Command npm -ErrorAction SilentlyContinue)) {
-        throw "npm is required to install DevSpace $DevSpaceVersion for repo-aware advisor mode."
-    }
-    npm install --global "@waishnav/devspace@$DevSpaceVersion"
-    if ($LASTEXITCODE -ne 0) { throw "DevSpace install failed." }
-    $DevSpaceCommand = Get-Command devspace -ErrorAction Stop
+$DevSpaceReady = $false
+if ($null -ne $DevSpaceCommand -and $InstalledDevSpaceVersion -eq $DevSpaceVersion) {
+    & python $DevSpacePatch --executable $DevSpaceCommand.Source
+    if ($LASTEXITCODE -ne 0) { throw "DevSpace read-only patch failed." }
+    & python $DevSpaceSecurePatch --executable $DevSpaceCommand.Source
+    if ($LASTEXITCODE -ne 0) { throw "DevSpace secure-origin patch failed." }
+    $DevSpaceReady = $true
+} elseif ($null -ne $DevSpaceCommand) {
+    Write-Warning "Repo-aware mode disabled; expected reviewed DevSpace $DevSpaceVersion, found $InstalledDevSpaceVersion."
+} else {
+    Write-Warning "Repo-aware mode disabled; reviewed DevSpace $DevSpaceVersion is not installed."
 }
-$InstalledDevSpaceVersion = (& $DevSpaceCommand.Source --version | Select-Object -Last 1).Trim()
-if ($InstalledDevSpaceVersion -ne $DevSpaceVersion) {
-    throw "DevSpace version verification failed: expected $DevSpaceVersion, got $InstalledDevSpaceVersion."
-}
-& python $DevSpacePatch --executable $DevSpaceCommand.Source
-if ($LASTEXITCODE -ne 0) { throw "DevSpace read-only patch failed." }
-& python $DevSpaceSecurePatch --executable $DevSpaceCommand.Source
-if ($LASTEXITCODE -ne 0) { throw "DevSpace secure-origin patch failed." }
 
 New-Item -ItemType Directory -Force -Path $SkillsDest | Out-Null
 $BackupRoot = Join-Path $CodexHome ("skill-backups\" + (Get-Date).ToUniversalTime().ToString("yyyyMMddTHHmmssZ"))
@@ -258,7 +255,13 @@ Write-Host "Pinned gpt4free ref: $Gpt4FreeRef"
 Write-Host "Next steps:"
 Write-Host "1. Put your ChatGPT HAR file in: $G4f\har_and_cookies"
 Write-Host "2. Start the local API: .\start-g4f.ps1"
-Write-Host "3. For repo-aware ChatGPT agent mode, run from a project:"
-Write-Host "   python $HOME\.codex\skills\external-advisor\scripts\advisor_agent_connect.py serve --project-dir ."
-Write-Host "   Then paste the printed /mcp URL into ChatGPT Developer Mode."
-Write-Host "4. Restart Codex so it discovers the bundled skills."
+Write-Host "3. Restart Codex so it discovers the bundled skills."
+if ($DevSpaceReady) {
+    Write-Host "4. Repo-aware mode is ready. From a project, run:"
+    Write-Host "   python $HOME\.codex\skills\external-advisor\scripts\advisor_agent_connect.py serve --project-dir ."
+    Write-Host "   Then paste the printed /mcp URL into ChatGPT Developer Mode."
+} else {
+    Write-Host "4. Prompt-only advisor mode is ready. Repo-aware mode stays disabled until the"
+    Write-Host "   reviewed DevSpace $DevSpaceVersion package is installed through a locked,"
+    Write-Host "   supply-chain-reviewed pnpm project."
+}

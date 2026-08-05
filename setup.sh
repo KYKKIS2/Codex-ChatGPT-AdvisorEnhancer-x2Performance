@@ -4,7 +4,12 @@ umask 077
 
 GPT4FREE_URL="${GPT4FREE_URL:-https://github.com/xtekky/gpt4free.git}"
 GPT4FREE_REF="${GPT4FREE_REF:-883c717437c4d91b68869359ed05b0427f34df65}"
-DEVSPACE_VERSION="${DEVSPACE_VERSION:-1.0.4}"
+REVIEWED_DEVSPACE_VERSION="1.0.4"
+if [[ -n "${DEVSPACE_VERSION:-}" && "$DEVSPACE_VERSION" != "$REVIEWED_DEVSPACE_VERSION" ]]; then
+  echo "Refusing unreviewed DevSpace version $DEVSPACE_VERSION; expected $REVIEWED_DEVSPACE_VERSION." >&2
+  exit 1
+fi
+DEVSPACE_VERSION="$REVIEWED_DEVSPACE_VERSION"
 ADVISOR_ALLOW_UNVERIFIED_VENDOR="${ADVISOR_ALLOW_UNVERIFIED_VENDOR:-false}"
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 VENDOR="$ROOT/vendor"
@@ -12,6 +17,7 @@ G4F="$VENDOR/gpt4free"
 VENV="$G4F/.venv"
 PY="$VENV/bin/python"
 RUNTIME_PATCH="$ROOT/patches/apply_gpt4free_runtime_patch.py"
+SECURITY_CONSTRAINTS="$ROOT/constraints/gpt4free-security.txt"
 DEVSPACE_PATCH="$ROOT/codex-skill/external-advisor/scripts/devspace_readonly_patch.py"
 DEVSPACE_SECURE_PATCH="$ROOT/codex-skill/external-advisor/scripts/devspace_secure_origin_patch.py"
 SKILLS_SOURCE="$ROOT/codex-skill"
@@ -40,6 +46,7 @@ REQUIRED_EXECUTABLES=(
 )
 REQUIRED_CORE_FILES=(
   "$RUNTIME_PATCH"
+  "$SECURITY_CONSTRAINTS"
   "$ROOT/codex-skill/external-advisor/SKILL.md"
   "$ROOT/codex-skill/external-advisor/scripts/activity_monitor.py"
   "$ROOT/codex-skill/external-advisor/scripts/advisor.py"
@@ -150,9 +157,7 @@ cd "$G4F"
 if [[ ! -x "$PY" ]]; then
   python3 -m venv "$VENV"
 fi
-"$PY" -m pip install --upgrade pip
-"$PY" -m pip install -r requirements.txt
-"$PY" -m pip install python-multipart a2wsgi Brotli pycryptodome python-dotenv
+"$PY" -m pip install --constraint "$SECURITY_CONSTRAINTS" -r requirements.txt
 
 python3 "$RUNTIME_PATCH" "$G4F"
 "$PY" -m py_compile \
@@ -168,35 +173,37 @@ chmod 700 "$G4F/har_and_cookies"
 chmod +x "${REQUIRED_EXECUTABLES[@]}"
 
 installed_devspace_version=""
+DEVSPACE_BIN=""
 if command -v devspace >/dev/null 2>&1; then
-  installed_devspace_version="$(devspace --version 2>/dev/null | tail -n 1 | tr -d '\r' || true)"
-fi
-if [[ "$installed_devspace_version" != "$DEVSPACE_VERSION" ]]; then
-  if ! command -v npm >/dev/null 2>&1; then
-    echo "npm is required to install DevSpace $DEVSPACE_VERSION for repo-aware advisor mode." >&2
-    exit 1
+  candidate_devspace_bin="$(command -v devspace)"
+  if [[ "$candidate_devspace_bin" =~ ^/mnt/[A-Za-z]/ ]]; then
+    echo "Warning: ignoring Windows-host DevSpace on WSL: $candidate_devspace_bin" >&2
+  else
+    DEVSPACE_BIN="$candidate_devspace_bin"
+    installed_devspace_version="$("$DEVSPACE_BIN" --version 2>/dev/null | tail -n 1 | tr -d '\r' || true)"
   fi
-  npm install --global "@waishnav/devspace@$DEVSPACE_VERSION"
 fi
-DEVSPACE_BIN="$(command -v devspace)"
-installed_devspace_version="$(devspace --version 2>/dev/null | tail -n 1 | tr -d '\r' || true)"
-if [[ "$installed_devspace_version" != "$DEVSPACE_VERSION" ]]; then
-  echo "DevSpace version verification failed: expected $DEVSPACE_VERSION, got ${installed_devspace_version:-unknown}." >&2
-  exit 1
-fi
-python3 "$DEVSPACE_PATCH" --executable "$DEVSPACE_BIN"
-python3 "$DEVSPACE_SECURE_PATCH" --executable "$DEVSPACE_BIN"
-DEVSPACE_DIST="$(dirname "$(readlink -f "$DEVSPACE_BIN")")"
-chmod go-w \
-  "$DEVSPACE_DIST/cli.js" \
-  "$DEVSPACE_DIST/config.js" \
-  "$DEVSPACE_DIST/pi-tools.js" \
-  "$DEVSPACE_DIST/roots.js" \
-  "$DEVSPACE_DIST/server.js"
-find "$DEVSPACE_DIST" -type f -exec chmod go-w {} +
-DEVSPACE_PACKAGE_JSON="$(dirname "$DEVSPACE_DIST")/package.json"
-if [[ -f "$DEVSPACE_PACKAGE_JSON" ]]; then
-  chmod go-w "$DEVSPACE_PACKAGE_JSON"
+DEVSPACE_READY=false
+if [[ -n "$DEVSPACE_BIN" && "$installed_devspace_version" == "$DEVSPACE_VERSION" ]]; then
+  python3 "$DEVSPACE_PATCH" --executable "$DEVSPACE_BIN"
+  python3 "$DEVSPACE_SECURE_PATCH" --executable "$DEVSPACE_BIN"
+  DEVSPACE_DIST="$(dirname "$(readlink -f "$DEVSPACE_BIN")")"
+  chmod go-w \
+    "$DEVSPACE_DIST/cli.js" \
+    "$DEVSPACE_DIST/config.js" \
+    "$DEVSPACE_DIST/pi-tools.js" \
+    "$DEVSPACE_DIST/roots.js" \
+    "$DEVSPACE_DIST/server.js"
+  find "$DEVSPACE_DIST" -type f -exec chmod go-w {} +
+  DEVSPACE_PACKAGE_JSON="$(dirname "$DEVSPACE_DIST")/package.json"
+  if [[ -f "$DEVSPACE_PACKAGE_JSON" ]]; then
+    chmod go-w "$DEVSPACE_PACKAGE_JSON"
+  fi
+  DEVSPACE_READY=true
+elif [[ -n "$installed_devspace_version" ]]; then
+  echo "Warning: repo-aware mode disabled; expected reviewed DevSpace $DEVSPACE_VERSION, found $installed_devspace_version." >&2
+else
+  echo "Warning: repo-aware mode disabled; reviewed DevSpace $DEVSPACE_VERSION is not installed." >&2
 fi
 
 mkdir -p "$SKILLS_DEST"
@@ -279,8 +286,18 @@ Pinned gpt4free ref: $GPT4FREE_REF
 Next steps:
 1. Put your ChatGPT HAR file in: $G4F/har_and_cookies
 2. Start the local API: ./start-g4f.sh
-3. For repo-aware ChatGPT agent mode, run from a project:
+3. Restart Codex so it discovers the bundled skills.
+EOF
+if [[ "$DEVSPACE_READY" == "true" ]]; then
+  cat <<EOF
+4. Repo-aware mode is ready. From a project, run:
    python3 ~/.codex/skills/external-advisor/scripts/advisor_agent_connect.py serve --project-dir .
    Then paste the printed /mcp URL into ChatGPT Developer Mode.
-4. Restart Codex so it discovers the bundled skills.
 EOF
+else
+  cat <<EOF
+4. Prompt-only advisor mode is ready. Repo-aware mode stays disabled until the
+   reviewed DevSpace $DEVSPACE_VERSION package is installed through a locked,
+   supply-chain-reviewed pnpm project.
+EOF
+fi

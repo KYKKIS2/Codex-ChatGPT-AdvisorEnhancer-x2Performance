@@ -13,6 +13,8 @@ import time
 from pathlib import Path
 from typing import Any, Callable, TextIO
 
+import advisor_concurrency as concurrency
+
 
 ACTIVITY_PREFIX = "[advisor activity]"
 DEFAULT_HEARTBEAT_SECONDS = 30.0
@@ -69,11 +71,7 @@ def owned_by_current_user(path: Path) -> bool:
 
 
 def expected_devspace_process(pid: int) -> bool:
-    if pid <= 0:
-        return False
-    try:
-        os.kill(pid, 0)
-    except OSError:
+    if not concurrency.process_alive(pid):
         return False
 
     proc_cmdline = Path("/proc") / str(pid) / "cmdline"
