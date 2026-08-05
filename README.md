@@ -127,8 +127,12 @@ Repo-aware agent mode also needs:
   tunnel URL
 - ChatGPT Developer Mode / custom MCP app support on the account
 
-The setup scripts install the pinned DevSpace package when `devspace` is not
-already available. They do not modify ChatGPT account settings.
+The setup scripts verify and patch reviewed DevSpace `1.0.4` when it is already
+available. They do not perform an unlocked global JavaScript install. Without
+that optional tool, prompt-only advisor and conclave modes remain available;
+repo-aware mode stays disabled. The scripts do not modify ChatGPT account
+settings. On WSL, `setup.sh` ignores Windows-host npm shims under `/mnt/<drive>`
+so they cannot be mistaken for a native Ubuntu DevSpace installation.
 
 ## Install
 
@@ -157,8 +161,8 @@ Setup:
 2. Creates its local virtual environment and installs dependencies.
 3. Applies and verifies the ChatGPT Project, model-routing, WebSocket, recovery,
    and runtime patches.
-4. Installs or verifies pinned DevSpace `1.0.4` and applies the read-only tool
-   mode patch.
+4. Verifies an existing DevSpace `1.0.4` and applies the read-only tool mode
+   patches; otherwise it safely leaves optional repo-aware mode disabled.
 5. Installs each folder under `codex-skill/` into
    `${CODEX_HOME:-~/.codex}/skills`.
 6. Preserves the previous installed skill in
@@ -1042,6 +1046,7 @@ Fast Linux regression suite:
 python3 ./tests/test-prompt-transport.py
 python3 ./tests/test-prompt-conclave-orchestration.py
 ./tests/test-advisor-live-activity.sh
+python3 ./tests/test-process-liveness.py
 ./tests/test-advisor-concurrency.sh
 ./tests/test-security-regressions.sh
 ./tests/test-agent-mode.sh
@@ -1066,6 +1071,7 @@ Windows:
 .\tests\test-router.ps1
 .\tests\test-context-pack.ps1
 .\tests\test-verifier-loop.ps1
+python .\tests\test-process-liveness.py
 .\tests\test-advisor-concurrency.ps1
 .\tests\test-memory.ps1
 .\tests\test-ranking.ps1

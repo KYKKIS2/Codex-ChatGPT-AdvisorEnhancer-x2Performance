@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import http.client
 import os
 import signal
 import socket
@@ -37,7 +38,7 @@ def endpoint_ready(url: str, timeout: float = 1.0) -> bool:
     try:
         with concurrency.open_loopback_url(request, timeout=timeout) as response:
             return response.status == 200
-    except (OSError, RuntimeError, urllib.error.URLError):
+    except (OSError, RuntimeError, urllib.error.URLError, http.client.HTTPException):
         return False
 
 
@@ -59,6 +60,41 @@ def worker_command(python: Path, port: int, debug: bool) -> list[str]:
     if debug:
         command.append("--debug")
     return command
+
+
+def stop_request_path(run_id: str) -> Path:
+    return (
+        concurrency.runtime_root()
+        / "stop-requests"
+        / f"{concurrency.key_digest(run_id, 32)}.json"
+    )
+
+
+def consume_matching_stop_request(
+    run_id: str,
+    manager_pid: int,
+    manager_identity: str,
+) -> bool:
+    if not run_id or manager_pid <= 0 or not manager_identity:
+        return False
+    path = stop_request_path(run_id)
+    payload = concurrency.load_json(path)
+    try:
+        request_manager_pid = int(payload.get("manager_pid") or 0)
+    except (TypeError, ValueError):
+        return False
+    matches = (
+        str(payload.get("run_id") or "") == run_id
+        and request_manager_pid == manager_pid
+        and str(payload.get("manager_identity") or "") == manager_identity
+    )
+    if not matches:
+        return False
+    try:
+        path.unlink(missing_ok=True)
+    except OSError:
+        return False
+    return True
 
 
 def executable_path(path: Path) -> Path:
@@ -331,6 +367,37 @@ def remove_owned_manifest(run_id: str) -> None:
         path.unlink(missing_ok=True)
 
 
+def remove_stale_manifest_generation(
+    run_id: str,
+    manager_pid: int,
+    manager_identity: str,
+) -> None:
+    """Remove only the stopped manager generation, while excluding a restart."""
+    if not run_id or manager_pid <= 0:
+        return
+    manager_lock = concurrency.InterProcessLock(
+        concurrency.runtime_root() / "g4f-pool-manager.lock",
+        timeout=0.0,
+    )
+    if not manager_lock.try_acquire():
+        return
+    try:
+        path = concurrency.pool_manifest_path()
+        payload = concurrency.load_json(path)
+        try:
+            manifest_pid = int(payload.get("manager_pid") or 0)
+        except (TypeError, ValueError):
+            return
+        if (
+            str(payload.get("run_id") or "") == run_id
+            and manifest_pid == manager_pid
+            and str(payload.get("manager_identity") or "") == manager_identity
+        ):
+            path.unlink(missing_ok=True)
+    finally:
+        manager_lock.release()
+
+
 def active_manifest_ready() -> bool:
     payload = concurrency.load_json(concurrency.pool_manifest_path())
     manager_pid = int(payload.get("manager_pid") or 0)
@@ -413,6 +480,8 @@ def command_serve_locked(args: argparse.Namespace) -> int:
     env["G4F_PROVIDER"] = args.provider
     env["G4F_MODEL"] = args.model
     run_id = uuid.uuid4().hex
+    manager_pid = os.getpid()
+    manager_identity = concurrency.process_identity(manager_pid)
     processes: list[subprocess.Popen[Any]] = []
     transient_processes: dict[str, dict[str, Any]] = {}
     request_dir = concurrency.transient_request_dir(run_id)
@@ -473,8 +542,8 @@ def command_serve_locked(args: argparse.Namespace) -> int:
         manifest = {
             "schema_version": 2,
             "run_id": run_id,
-            "manager_pid": os.getpid(),
-            "manager_identity": concurrency.process_identity(os.getpid()),
+            "manager_pid": manager_pid,
+            "manager_identity": manager_identity,
             "started_at": time.time(),
             "mode": args.mode,
             "model": args.model,
@@ -505,6 +574,13 @@ def command_serve_locked(args: argparse.Namespace) -> int:
         print(f"g4f advisor supervisor ready. Manifest: {concurrency.pool_manifest_path()}", flush=True)
 
         while not stopping:
+            if os.name == "nt" and consume_matching_stop_request(
+                run_id,
+                manager_pid,
+                manager_identity,
+            ):
+                stopping = True
+                continue
             for index, process in enumerate(processes):
                 code = process.poll()
                 if code is not None:
@@ -526,22 +602,56 @@ def command_serve_locked(args: argparse.Namespace) -> int:
             time.sleep(0.1)
         return 0
     finally:
-        remove_owned_manifest(run_id)
+        try:
+            remove_owned_manifest(run_id)
+        except OSError as exc:
+            print(f"Warning: could not invalidate the stopping g4f pool manifest: {exc}", file=sys.stderr)
         for worker in list(transient_processes.values()):
-            stop_transient_worker(worker)
-            remove_request_artifacts(worker["request_path"], worker.get("log_path"))
+            try:
+                stop_transient_worker(worker)
+            except Exception as exc:
+                print(f"Warning: could not stop a transient g4f worker: {exc}", file=sys.stderr)
+            try:
+                remove_request_artifacts(worker["request_path"], worker.get("log_path"))
+            except Exception as exc:
+                print(f"Warning: could not remove transient worker artifacts: {exc}", file=sys.stderr)
         transient_processes.clear()
-        for path in request_dir.glob("*.json"):
-            payload = concurrency.load_json(path)
-            concurrency.terminate_external_process(
-                int(payload.get("worker_pid") or 0),
-                str(payload.get("worker_identity") or ""),
-            )
-            remove_request_artifacts(path)
+        try:
+            pending_requests = list(request_dir.glob("*.json"))
+        except OSError as exc:
+            pending_requests = []
+            print(f"Warning: could not enumerate transient worker requests: {exc}", file=sys.stderr)
+        for path in pending_requests:
+            try:
+                payload = concurrency.load_json(path)
+                concurrency.terminate_external_process(
+                    int(payload.get("worker_pid") or 0),
+                    str(payload.get("worker_identity") or ""),
+                )
+            except Exception as exc:
+                print(f"Warning: could not stop a recorded transient g4f worker: {exc}", file=sys.stderr)
+            try:
+                remove_request_artifacts(path)
+            except Exception as exc:
+                print(f"Warning: could not remove a transient worker request: {exc}", file=sys.stderr)
         for process in reversed(processes):
-            terminate_process(process)
+            try:
+                terminate_process(process)
+            except Exception as exc:
+                print(f"Warning: could not stop g4f worker pid {process.pid}: {exc}", file=sys.stderr)
+        try:
+            stop_request_path(run_id).unlink(missing_ok=True)
+        except OSError as exc:
+            print(f"Warning: could not remove the g4f stop request: {exc}", file=sys.stderr)
+        try:
+            remove_owned_manifest(run_id)
+        except OSError as exc:
+            print(f"Warning: could not remove the g4f pool manifest: {exc}", file=sys.stderr)
         for signum, handler in previous_handlers.items():
-            signal.signal(signum, handler)
+            try:
+                signal.signal(signum, handler)
+            except (OSError, ValueError) as exc:
+                print(f"Warning: could not restore signal handler {signum}: {exc}", file=sys.stderr)
 
 
 def command_status(_args: argparse.Namespace) -> int:
@@ -605,14 +715,32 @@ def command_stop(args: argparse.Namespace) -> int:
     payload = concurrency.load_json(path)
     manager_pid = int(payload.get("manager_pid") or 0)
     manager_identity = str(payload.get("manager_identity") or "")
+    run_id = str(payload.get("run_id") or "")
     if not concurrency.process_alive(manager_pid, manager_identity):
-        path.unlink(missing_ok=True)
+        remove_stale_manifest_generation(run_id, manager_pid, manager_identity)
         print("g4f worker pool is not running.")
         return 0
-    try:
-        os.kill(manager_pid, signal.SIGTERM)
-    except OSError as exc:
-        raise RuntimeError(f"Could not stop g4f pool manager pid {manager_pid}: {exc}") from exc
+    request_path: Path | None = None
+    if os.name == "nt":
+        if not run_id or not manager_identity:
+            raise RuntimeError("The g4f pool manifest is missing its run id or process identity.")
+        request_path = stop_request_path(run_id)
+        safety.atomic_write_json(
+            request_path,
+            {
+                "schema_version": 1,
+                "run_id": run_id,
+                "manager_pid": manager_pid,
+                "manager_identity": manager_identity,
+                "requested_at": time.time(),
+            },
+            sort_keys=True,
+        )
+    else:
+        try:
+            os.kill(manager_pid, signal.SIGTERM)
+        except OSError as exc:
+            raise RuntimeError(f"Could not stop g4f pool manager pid {manager_pid}: {exc}") from exc
     deadline = time.monotonic() + args.timeout
     while concurrency.process_alive(manager_pid, manager_identity):
         if time.monotonic() >= deadline:
@@ -620,7 +748,12 @@ def command_stop(args: argparse.Namespace) -> int:
                 f"g4f pool manager pid {manager_pid} did not stop within {args.timeout:.0f}s."
             )
         time.sleep(0.1)
-    path.unlink(missing_ok=True)
+    if request_path is not None:
+        try:
+            request_path.unlink(missing_ok=True)
+        except OSError as exc:
+            print(f"Warning: could not remove the completed g4f stop request: {exc}", file=sys.stderr)
+    remove_stale_manifest_generation(run_id, manager_pid, manager_identity)
     print("g4f worker pool stopped.")
     return 0
 

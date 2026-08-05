@@ -221,13 +221,50 @@ def process_state(pid: int) -> str:
         return ""
 
 
+def windows_process_alive(pid: int) -> bool:
+    """Check a Windows process without sending it a signal.
+
+    Python's ``os.kill`` uses ``TerminateProcess`` on Windows for signals other
+    than the console control events. In particular, ``os.kill(pid, 0)`` is not
+    the harmless POSIX existence probe and must never be used here.
+    """
+    if pid <= 0 or os.name != "nt":
+        return False
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        synchronize = 0x00100000
+        wait_timeout = 0x00000102
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        kernel32.OpenProcess.restype = wintypes.HANDLE
+        kernel32.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+        kernel32.WaitForSingleObject.restype = wintypes.DWORD
+        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+        kernel32.CloseHandle.restype = wintypes.BOOL
+        handle = kernel32.OpenProcess(synchronize, False, pid)
+        if not handle:
+            return False
+        try:
+            return kernel32.WaitForSingleObject(handle, 0) == wait_timeout
+        finally:
+            kernel32.CloseHandle(handle)
+    except (AttributeError, OSError, ValueError):
+        return False
+
+
 def process_alive(pid: int, expected_identity: str = "") -> bool:
     if pid <= 0:
         return False
-    try:
-        os.kill(pid, 0)
-    except (ProcessLookupError, OSError):
-        return False
+    if os.name == "nt":
+        if not windows_process_alive(pid):
+            return False
+    else:
+        try:
+            os.kill(pid, 0)
+        except (ProcessLookupError, OSError):
+            return False
     if process_state(pid) == "Z":
         return False
     if expected_identity:
