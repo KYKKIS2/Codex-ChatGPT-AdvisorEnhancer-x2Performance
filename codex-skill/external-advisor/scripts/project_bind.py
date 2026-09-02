@@ -48,12 +48,30 @@ def bind_project(project_dir: Path, value: str, name: str | None) -> Path:
     if name:
         payload["name"] = name
     safety.atomic_write_json(path, payload)
+    try:
+        import advisor_cloud_catalog  # noqa: PLC0415
+
+        advisor_cloud_catalog.register_project_binding(project_dir, payload)
+    except Exception:
+        print(
+            "Advisor GUI catalog registration was skipped; the repository Project binding is still valid.",
+            file=sys.stderr,
+        )
     return path
 
 
 def clear_project(project_dir: Path) -> Path:
     path = project_path(project_dir)
     path.unlink(missing_ok=True)
+    try:
+        import advisor_cloud_catalog  # noqa: PLC0415
+
+        advisor_cloud_catalog.unregister_project_path(project_dir)
+    except Exception:
+        print(
+            "Advisor GUI catalog cleanup was skipped; the repository Project binding was removed.",
+            file=sys.stderr,
+        )
     return path
 
 

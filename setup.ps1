@@ -22,6 +22,7 @@ $AllowUnverifiedVendor = $env:ADVISOR_ALLOW_UNVERIFIED_VENDOR -eq "true"
 
 $RequiredFiles = @(
     (Join-Path $Root "start-g4f.ps1"),
+    (Join-Path $Root "start-advisor-gui.ps1"),
     (Join-Path $Root "tests\test-advisor.ps1"),
     (Join-Path $Root "tests\test-conclave.ps1"),
     (Join-Path $Root "tests\test-router.ps1"),
@@ -37,6 +38,11 @@ $RequiredFiles = @(
     $DevSpaceSecurePatch,
     (Join-Path $Root "codex-skill\external-advisor\SKILL.md"),
     (Join-Path $Root "codex-skill\external-advisor\scripts\advisor.py"),
+    (Join-Path $Root "codex-skill\external-advisor\scripts\advisor_cloud_catalog.py"),
+    (Join-Path $Root "codex-skill\external-advisor\scripts\advisor_gui.py"),
+    (Join-Path $Root "codex-skill\external-advisor\scripts\advisor_cloud_gui.html"),
+    (Join-Path $Root "codex-skill\external-advisor\scripts\advisor_cloud_gui.js"),
+    (Join-Path $Root "codex-skill\external-advisor\scripts\advisor_cloud_gui.css"),
     (Join-Path $Root "codex-skill\external-advisor\scripts\advisor_concurrency.py"),
     (Join-Path $Root "codex-skill\external-advisor\scripts\advisor_safety.py"),
     (Join-Path $Root "codex-skill\external-advisor\scripts\agent_mode.py"),
@@ -46,6 +52,7 @@ $RequiredFiles = @(
     (Join-Path $Root "codex-skill\external-advisor\scripts\goal_research_roles.py"),
     (Join-Path $Root "codex-skill\external-advisor\scripts\goal_research_state.py"),
     (Join-Path $Root "docs\cloudflare-domain-mcp.md"),
+    (Join-Path $Root "docs\advisor-cloud-gui.md"),
     (Join-Path $Root "codex-skill\external-advisor\scripts\advisor_domain_mcp.py"),
     (Join-Path $Root "codex-skill\external-advisor\scripts\cloudflare_access_gateway.mjs"),
     (Join-Path $Root "codex-skill\external-advisor\scripts\devspace_secure_server.mjs"),
@@ -192,10 +199,19 @@ try {
             Copy-Item -Force `
                 -Path (Join-Path $Root "docs\cloudflare-domain-mcp.md") `
                 -Destination (Join-Path $ReferencesDir "cloudflare-domain-mcp.md")
+            Copy-Item -Force `
+                -Path (Join-Path $Root "docs\advisor-cloud-gui.md") `
+                -Destination (Join-Path $ReferencesDir "advisor-cloud-gui.md")
             foreach ($requiredName in @(
                 "SKILL.md",
                 "references\cloudflare-domain-mcp.md",
+                "references\advisor-cloud-gui.md",
                 "scripts\advisor.py",
+                "scripts\advisor_cloud_catalog.py",
+                "scripts\advisor_gui.py",
+                "scripts\advisor_cloud_gui.html",
+                "scripts\advisor_cloud_gui.js",
+                "scripts\advisor_cloud_gui.css",
                 "scripts\advisor_concurrency.py",
                 "scripts\advisor_safety.py",
                 "scripts\router.py",
@@ -243,6 +259,7 @@ finally {
 @{
     setup_dir = $Root
     start_g4f = (Join-Path $Root "start-g4f.ps1")
+    start_advisor_gui = (Join-Path $Root "start-advisor-gui.ps1")
     base_url = "http://127.0.0.1:8080/v1"
     model = "gpt-5-6-thinking"
     worker_mode = "transient"
@@ -258,7 +275,8 @@ Write-Host "Pinned gpt4free ref: $Gpt4FreeRef"
 Write-Host "Next steps:"
 Write-Host "1. Put your ChatGPT HAR file in: $G4f\har_and_cookies"
 Write-Host "2. Start the local API: .\start-g4f.ps1"
-Write-Host "3. For repo-aware ChatGPT agent mode, run from a project:"
+Write-Host "3. Optional: start the local cloud-chat GUI: .\start-advisor-gui.ps1"
+Write-Host "4. For repo-aware ChatGPT agent mode, run from a project:"
 Write-Host "   python $HOME\.codex\skills\external-advisor\scripts\advisor_agent_connect.py serve --project-dir ."
 Write-Host "   Then paste the printed /mcp URL into ChatGPT Developer Mode."
-Write-Host "4. Restart Codex so it discovers the bundled skills."
+Write-Host "5. Restart Codex so it discovers the bundled skills."

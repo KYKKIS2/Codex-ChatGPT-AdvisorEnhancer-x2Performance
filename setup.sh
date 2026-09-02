@@ -21,6 +21,7 @@ SKILL_CONFIG="$EXTERNAL_ADVISOR_SKILL_DEST/advisor-config.json"
 
 REQUIRED_EXECUTABLES=(
   "$ROOT/start-g4f.sh"
+  "$ROOT/start-advisor-gui.sh"
   "$ROOT/tests/test-advisor.sh"
   "$ROOT/tests/test-conclave.sh"
   "$ROOT/tests/test-router.sh"
@@ -43,6 +44,11 @@ REQUIRED_CORE_FILES=(
   "$ROOT/codex-skill/external-advisor/SKILL.md"
   "$ROOT/codex-skill/external-advisor/scripts/activity_monitor.py"
   "$ROOT/codex-skill/external-advisor/scripts/advisor.py"
+  "$ROOT/codex-skill/external-advisor/scripts/advisor_cloud_catalog.py"
+  "$ROOT/codex-skill/external-advisor/scripts/advisor_gui.py"
+  "$ROOT/codex-skill/external-advisor/scripts/advisor_cloud_gui.html"
+  "$ROOT/codex-skill/external-advisor/scripts/advisor_cloud_gui.js"
+  "$ROOT/codex-skill/external-advisor/scripts/advisor_cloud_gui.css"
   "$ROOT/codex-skill/external-advisor/scripts/advisor_background.py"
   "$ROOT/codex-skill/external-advisor/scripts/advisor_concurrency.py"
   "$ROOT/codex-skill/external-advisor/scripts/advisor_safety.py"
@@ -66,6 +72,7 @@ REQUIRED_CORE_FILES=(
   "$ROOT/codex-skill/external-advisor/scripts/goal_research_roles.py"
   "$ROOT/codex-skill/external-advisor/scripts/goal_research_state.py"
   "$ROOT/docs/cloudflare-domain-mcp.md"
+  "$ROOT/docs/advisor-cloud-gui.md"
   "$ROOT/codex-skill/external-advisor/scripts/memory_manager.py"
   "$ROOT/codex-skill/external-advisor/scripts/project_bind.py"
   "$ROOT/codex-skill/external-advisor/scripts/project_migrate.py"
@@ -215,10 +222,17 @@ for skill_dir in "$SKILLS_SOURCE"/*; do
   if [[ "$skill_name" == "external-advisor" ]]; then
     mkdir -p "$stage/references"
     cp "$ROOT/docs/cloudflare-domain-mcp.md" "$stage/references/cloudflare-domain-mcp.md"
+    cp "$ROOT/docs/advisor-cloud-gui.md" "$stage/references/advisor-cloud-gui.md"
     for required_name in \
       SKILL.md \
       references/cloudflare-domain-mcp.md \
+      references/advisor-cloud-gui.md \
       scripts/advisor.py \
+      scripts/advisor_cloud_catalog.py \
+      scripts/advisor_gui.py \
+      scripts/advisor_cloud_gui.html \
+      scripts/advisor_cloud_gui.js \
+      scripts/advisor_cloud_gui.css \
       scripts/advisor_concurrency.py \
       scripts/advisor_safety.py \
       scripts/router.py \
@@ -260,6 +274,7 @@ from pathlib import Path
 payload = {
     "setup_dir": os.environ["ROOT"],
     "start_g4f": os.environ["START_G4F"],
+    "start_advisor_gui": str(Path(os.environ["ROOT"]) / "start-advisor-gui.sh"),
     "base_url": "http://127.0.0.1:8080/v1",
     "model": "gpt-5-6-thinking",
     "worker_mode": "transient",
@@ -279,8 +294,9 @@ Pinned gpt4free ref: $GPT4FREE_REF
 Next steps:
 1. Put your ChatGPT HAR file in: $G4F/har_and_cookies
 2. Start the local API: ./start-g4f.sh
-3. For repo-aware ChatGPT agent mode, run from a project:
+3. Optional: start the local cloud-chat GUI: ./start-advisor-gui.sh
+4. For repo-aware ChatGPT agent mode, run from a project:
    python3 ~/.codex/skills/external-advisor/scripts/advisor_agent_connect.py serve --project-dir .
    Then paste the printed /mcp URL into ChatGPT Developer Mode.
-4. Restart Codex so it discovers the bundled skills.
+5. Restart Codex so it discovers the bundled skills.
 EOF

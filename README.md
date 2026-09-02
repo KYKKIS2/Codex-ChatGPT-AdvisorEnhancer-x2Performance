@@ -273,6 +273,44 @@ G4F_PORT=8180 ./start-g4f.sh
 G4F_DEBUG=true ./start-g4f.sh
 ```
 
+## Optional ChatGPT Cloud GUI
+
+The advisor provides a small loopback-only interface that imports visible
+messages from explicitly bound ChatGPT Projects and continues the original
+cloud conversations without loading the large ChatGPT web UI:
+
+```bash
+./start-advisor-gui.sh --project-dir /absolute/path/to/a/bound/repository
+```
+
+Open `http://127.0.0.1:8088/chat/`. The interface uses a separate loopback
+process, so it can coexist with the advisor supervisor on port `8080`. The page
+loads only repository-owned local assets; a strict Content Security Policy
+blocks unrelated browser connections. Server-side requests continue through
+the existing g4f/HAR route, while full history and compaction stay in ChatGPT.
+The open stream renders ChatGPT's user-visible activity summaries live without
+exposing hidden reasoning or raw tool traffic to the browser.
+Optional activity-history reads make one request per poll and pause for at least
+60 seconds after HTTP `429`, honoring a longer numeric `Retry-After` when given.
+If that provider stream closes before ChatGPT's authoritative turn status is
+complete, the page and reload path continue with read-only progress snapshots;
+the original POST is never replayed.
+If ChatGPT completes on a tool node without emitting its final narrative, the
+next follow-up retains that exact cloud node as its parent, preserving the full
+conversation branch instead of falling back to an older assistant message.
+The local transcript renderer also supports native MathML equations and
+responsive Markdown tables without loading third-party browser assets. Images
+can be attached with the composer button or pasted from the clipboard; the
+bridge validates, bounds, and metadata-strips static images before using g4f's
+ChatGPT multimodal route.
+The interface preserves `.codex-advisor` as the authoritative repository
+binding, keeps opaque account-bound mappings under
+`${CODEX_HOME:-~/.codex}/advisor-gui`, and holds imported message bodies only in
+the current page's memory.
+
+See [Optional ChatGPT Cloud GUI](docs/advisor-cloud-gui.md) for Windows usage,
+security boundaries, and interrupted-turn recovery.
+
 Keep `ADVISOR_REMOTE_MAX_CONCURRENCY=2` as the normal maximum. Lower it to `1`
 when the account is already being throttled. Capacity is captured when the
 supervisor starts, so stop and restart that supervisor after changing it;

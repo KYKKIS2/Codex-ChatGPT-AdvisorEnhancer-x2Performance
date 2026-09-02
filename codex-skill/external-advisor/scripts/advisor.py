@@ -698,6 +698,15 @@ def write_project_binding(project_id: str, source: str | None = None, name: str 
     if name:
         data.setdefault("name", name)
     safety.atomic_write_json(path, data)
+    try:
+        import advisor_cloud_catalog  # noqa: PLC0415
+
+        advisor_cloud_catalog.register_project_binding(advisor_project_dir(), data)
+    except Exception:
+        print(
+            "Advisor GUI catalog registration was skipped; the repository Project binding is still valid.",
+            file=sys.stderr,
+        )
 
 
 def find_gizmo(payload: Any) -> dict[str, Any] | None:
