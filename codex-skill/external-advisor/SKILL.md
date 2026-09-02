@@ -77,8 +77,10 @@ Recognized sensitive path names are masked, Git metadata is read-only, and dirty
 checkout state requires explicit `--allow-dirty-checkout`. Tracked
 modifications and non-ignored untracked contents are hash-pinned. Ignored data
 and model trees remain live and visible without byte hashing, while descendant
-mounts, hardlinks, special files, unsafe Git configuration, or a checkout-local
-runtime fail closed.
+mounts, hardlinks with any link outside the checkout, special files, unsafe Git
+configuration, or a checkout-local runtime fail closed. Hardlink groups fully
+contained within intentionally exposed bulk roots are accepted so they cannot
+bypass path masks.
 The complete checkout receives a native metadata-only boundary pass. Sensitive
 names are masked outside intentionally exposed bulk artifact/data/model/output
 roots, virtual environments, and `node_modules`; those bulk roots are not

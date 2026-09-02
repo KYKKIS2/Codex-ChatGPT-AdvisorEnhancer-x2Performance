@@ -88,6 +88,11 @@ FULL_ACCESS_BULK_PATH_SCAN_ROOTS = (
     "outputs",
     "runs",
 )
+FULL_ACCESS_CONTAINED_HARDLINK_ROOTS = frozenset(
+    name
+    for name in FULL_ACCESS_BULK_PATH_SCAN_ROOTS
+    if name not in {".git", ".codex-advisor"}
+)
 _AGENT_MODE_MODULE: Any | None = None
 
 
@@ -254,8 +259,6 @@ def stable_regular_file_record(path: Path) -> dict[str, Any]:
         before = os.fstat(descriptor)
         if not stat.S_ISREG(before.st_mode):
             raise DomainMcpError("Checkout fingerprint target is not a regular file.")
-        if before.st_nlink > 1:
-            raise DomainMcpError("The exposed checkout contains a hardlinked regular file.")
         digest = hashlib.sha256()
         while chunk := os.read(descriptor, 1024 * 1024):
             digest.update(chunk)
@@ -469,65 +472,83 @@ def verify_exposed_tree_boundary(
             "unmount it before enabling full access."
         )
 
-    entries = run_find_bytes(
+    entry_types = run_find_bytes(
         project,
-        ["-mindepth", "1", "-printf", "."],
-        maximum_bytes=MAX_EXPOSED_TREE_ENTRIES + 1,
+        ["-mindepth", "1", "-printf", "%y\\0"],
+        maximum_bytes=MAX_GIT_PATH_BYTES,
     )
-    if len(entries) > MAX_EXPOSED_TREE_ENTRIES:
+    type_records = entry_types.split(b"\0")
+    if type_records[-1:] != [b""]:
+        raise DomainMcpError("The exposed checkout metadata scan returned malformed data.")
+    type_records.pop()
+    if len(type_records) > MAX_EXPOSED_TREE_ENTRIES:
         raise DomainMcpError("The exposed checkout exceeded the boundary-scan entry limit.")
+    if any(entry_type not in {b"f", b"d", b"l"} for entry_type in type_records):
+        raise DomainMcpError(
+            "The exposed checkout contains a socket, device, FIFO, or other "
+            "unsupported filesystem entry."
+        )
 
-    violation = run_find_bytes(
+    # A hardlink is safe for this single-root sandbox only when every directory
+    # entry contributing to the inode's link count is inside an intentionally
+    # exposed bulk root. This also prevents aliases from bypassing path masks.
+    hardlink_metadata = run_find_bytes(
         project,
         [
             "-mindepth",
             "1",
-            "(",
-            "(",
             "-type",
             "f",
             "-links",
             "+1",
-            ")",
-            "-o",
-            "(",
-            "!",
-            "-type",
-            "f",
-            "!",
-            "-type",
-            "d",
-            "!",
-            "-type",
-            "l",
-            ")",
-            ")",
             "-printf",
-            "%P\\0",
-            "-quit",
+            "%D\\0%i\\0%n\\0%P\\0",
         ],
         maximum_bytes=MAX_GIT_PATH_BYTES,
     )
-    if not violation:
-        return
-    encoded_relative = violation.split(b"\0", 1)[0]
-    relative = Path(os.fsdecode(encoded_relative))
-    if relative.is_absolute() or ".." in relative.parts:
-        raise DomainMcpError("The exposed checkout metadata scan returned an unsafe path.")
-    path = project / relative
-    try:
-        metadata = path.lstat()
-    except OSError as exc:
-        raise DomainMcpError("The exposed checkout changed during its boundary scan.") from exc
-    if stat.S_ISREG(metadata.st_mode) and metadata.st_nlink > 1:
+    fields = hardlink_metadata.split(b"\0")
+    if fields[-1:] != [b""]:
+        raise DomainMcpError("The exposed checkout hardlink scan returned malformed data.")
+    fields.pop()
+    if len(fields) % 4 or len(fields) // 4 > len(type_records):
+        raise DomainMcpError("The exposed checkout hardlink scan returned malformed data.")
+
+    hardlinks: dict[tuple[int, int], list[int]] = {}
+    for offset in range(0, len(fields), 4):
+        device_raw, inode_raw, link_count_raw, relative_raw = fields[offset : offset + 4]
+        if not all(
+            value and all(48 <= character <= 57 for character in value)
+            for value in (device_raw, inode_raw, link_count_raw)
+        ):
+            raise DomainMcpError("The exposed checkout hardlink scan returned malformed data.")
+        device = int(device_raw)
+        inode = int(inode_raw)
+        link_count = int(link_count_raw)
+        relative = Path(os.fsdecode(relative_raw))
+        if (
+            inode <= 0
+            or link_count <= 1
+            or not relative.parts
+            or relative.is_absolute()
+            or ".." in relative.parts
+        ):
+            raise DomainMcpError("The exposed checkout hardlink scan returned malformed data.")
+        if relative.parts[0] not in FULL_ACCESS_CONTAINED_HARDLINK_ROOTS:
+            raise DomainMcpError(
+                "The exposed checkout contains a hardlinked regular file outside "
+                "the permitted bulk-data roots."
+            )
+        key = (device, inode)
+        record = hardlinks.setdefault(key, [0, link_count])
+        if record[1] != link_count:
+            raise DomainMcpError("The exposed checkout changed during its boundary scan.")
+        record[0] += 1
+
+    if any(observed != expected for observed, expected in hardlinks.values()):
         raise DomainMcpError(
-            "The exposed checkout contains a hardlinked regular file; "
-            "replace hardlinks with independent files before enabling full access."
+            "The exposed checkout contains a hardlinked regular file with another "
+            "link outside the checkout, or changed during its boundary scan."
         )
-    raise DomainMcpError(
-        "The exposed checkout contains a socket, device, FIFO, or other "
-        "unsupported filesystem entry."
-    )
 
 
 def verify_git_config_safe(project: Path) -> None:

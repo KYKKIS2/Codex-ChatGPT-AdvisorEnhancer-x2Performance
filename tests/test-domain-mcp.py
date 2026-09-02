@@ -831,6 +831,43 @@ def test_checkout_boundary_guards(base: Path) -> None:
         raise AssertionError("boundary scan accepted a hardlink")
     hardlink.unlink()
 
+    artifacts = project / "artifacts"
+    artifacts.mkdir()
+    internal_target = artifacts / "internal-hardlink-target"
+    internal_target.write_text("internal\n", encoding="utf-8")
+    internal_hardlink = artifacts / "internal-hardlink"
+    os.link(internal_target, internal_hardlink)
+    domain_mcp.verify_exposed_tree_boundary(project, mountinfo_text=clean_mountinfo)
+
+    external_alias = base / "external-hardlink-alias"
+    os.link(internal_target, external_alias)
+    try:
+        domain_mcp.verify_exposed_tree_boundary(
+            project,
+            mountinfo_text=clean_mountinfo,
+        )
+    except domain_mcp.DomainMcpError as exc:
+        assert "hardlinked regular file" in str(exc)
+    else:
+        raise AssertionError("boundary scan accepted a hardlink escaping the checkout")
+    external_alias.unlink()
+    domain_mcp.verify_exposed_tree_boundary(project, mountinfo_text=clean_mountinfo)
+
+    record = domain_mcp.stable_regular_file_record(internal_hardlink)
+    assert record["sha256"] == domain_mcp.file_sha256(internal_target)
+
+    ordinary_target = project / "ordinary-hardlink-target"
+    ordinary_target.write_text("ordinary\n", encoding="utf-8")
+    ordinary_hardlink = project / "ordinary-hardlink"
+    os.link(ordinary_target, ordinary_hardlink)
+    try:
+        domain_mcp.verify_exposed_tree_boundary(project, mountinfo_text=clean_mountinfo)
+    except domain_mcp.DomainMcpError as exc:
+        assert "permitted bulk-data roots" in str(exc)
+    else:
+        raise AssertionError("boundary scan accepted an ordinary-path hardlink")
+    ordinary_hardlink.unlink()
+
     local_python = project / "python"
     local_python.write_text("#!/bin/sh\n", encoding="utf-8")
     os.chmod(local_python, 0o755)

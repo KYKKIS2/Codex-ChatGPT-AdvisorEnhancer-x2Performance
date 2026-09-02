@@ -203,6 +203,213 @@ REQUEST_AUTH_PATCHED = """        if (trustedProxySecret) {
 CLOSE_NEEDLE = "            oauthProvider.close();"
 CLOSE_PATCHED = "            oauthProvider?.close();"
 
+TRANSPORT_MAP_NEEDLE = """    const transports = new Map();"""
+TRANSPORT_RETENTION_PATCHED_LEGACY = r'''    const transports = new Map();
+    const transportIdleTimers = new Map();
+    const transportIdleTtlMs = Number(
+        process.env.DEVSPACE_MCP_SESSION_IDLE_TTL_MS ?? 300000
+    );
+    if (!Number.isInteger(transportIdleTtlMs)
+        || transportIdleTtlMs < 1000
+        || transportIdleTtlMs > 3600000) {
+        throw new Error("DevSpace MCP session idle TTL must be an integer from 1000 through 3600000 milliseconds.");
+    }
+    const cancelTransportIdleClose = (sessionId) => {
+        const timer = transportIdleTimers.get(sessionId);
+        if (timer)
+            clearTimeout(timer);
+        transportIdleTimers.delete(sessionId);
+    };
+    const closeTransport = (transport, event, fields = {}) => {
+        Promise.resolve()
+            .then(() => transport.close())
+            .catch((error) => {
+            logEvent(config.logging, "error", "mcp_session_close_error", {
+                event,
+                error: error instanceof Error ? error.message : String(error),
+                ...fields,
+            });
+        });
+    };
+    const scheduleTransportIdleClose = (transport) => {
+        const sessionId = transport.sessionId;
+        if (!sessionId)
+            return;
+        cancelTransportIdleClose(sessionId);
+        const timer = setTimeout(() => {
+            transportIdleTimers.delete(sessionId);
+            if (transports.get(sessionId) !== transport)
+                return;
+            transports.delete(sessionId);
+            logEvent(config.logging, "info", "mcp_session_expired", {
+                sessionIdPrefix: sessionIdPrefix(sessionId),
+                idleTtlMs: transportIdleTtlMs,
+            });
+            closeTransport(transport, "idle_expiry", {
+                sessionIdPrefix: sessionIdPrefix(sessionId),
+            });
+        }, transportIdleTtlMs);
+        timer.unref?.();
+        transportIdleTimers.set(sessionId, timer);
+    };'''
+TRANSPORT_RETENTION_PATCHED = r'''    const transports = new Map();
+    const transportIdleTimers = new Map();
+    const transportActiveRequests = new Map();
+    const transportIdleTtlMs = Number(
+        process.env.DEVSPACE_MCP_SESSION_IDLE_TTL_MS ?? 300000
+    );
+    if (!Number.isInteger(transportIdleTtlMs)
+        || transportIdleTtlMs < 1000
+        || transportIdleTtlMs > 3600000) {
+        throw new Error("DevSpace MCP session idle TTL must be an integer from 1000 through 3600000 milliseconds.");
+    }
+    const cancelTransportIdleClose = (sessionId) => {
+        const timer = transportIdleTimers.get(sessionId);
+        if (timer)
+            clearTimeout(timer);
+        transportIdleTimers.delete(sessionId);
+    };
+    const closeTransport = (transport, event, fields = {}) => {
+        Promise.resolve()
+            .then(() => transport.close())
+            .catch((error) => {
+            logEvent(config.logging, "error", "mcp_session_close_error", {
+                event,
+                error: error instanceof Error ? error.message : String(error),
+                ...fields,
+            });
+        });
+    };
+    const beginTransportRequest = (transport) => {
+        const sessionId = transport.sessionId;
+        if (!sessionId)
+            return;
+        cancelTransportIdleClose(sessionId);
+        transportActiveRequests.set(
+            sessionId,
+            (transportActiveRequests.get(sessionId) ?? 0) + 1,
+        );
+    };
+    const scheduleTransportIdleClose = (transport) => {
+        const sessionId = transport.sessionId;
+        if (!sessionId
+            || transports.get(sessionId) !== transport
+            || (transportActiveRequests.get(sessionId) ?? 0) !== 0) {
+            return;
+        }
+        cancelTransportIdleClose(sessionId);
+        const timer = setTimeout(() => {
+            transportIdleTimers.delete(sessionId);
+            if (transports.get(sessionId) !== transport
+                || (transportActiveRequests.get(sessionId) ?? 0) !== 0) {
+                return;
+            }
+            transports.delete(sessionId);
+            transportActiveRequests.delete(sessionId);
+            logEvent(config.logging, "info", "mcp_session_expired", {
+                sessionIdPrefix: sessionIdPrefix(sessionId),
+                idleTtlMs: transportIdleTtlMs,
+            });
+            closeTransport(transport, "idle_expiry", {
+                sessionIdPrefix: sessionIdPrefix(sessionId),
+            });
+        }, transportIdleTtlMs);
+        timer.unref?.();
+        transportIdleTimers.set(sessionId, timer);
+    };
+    const finishTransportRequest = (transport) => {
+        const sessionId = transport.sessionId;
+        if (!sessionId)
+            return;
+        const activeRequests = transportActiveRequests.get(sessionId) ?? 0;
+        if (activeRequests > 1) {
+            transportActiveRequests.set(sessionId, activeRequests - 1);
+            return;
+        }
+        transportActiveRequests.delete(sessionId);
+        scheduleTransportIdleClose(transport);
+    };'''
+
+TRANSPORT_LOOKUP_NEEDLE = '''                transport = transports.get(sessionId);
+                if (!transport) {
+                    sendJsonRpcError(res, 404, -32000, "Unknown MCP session");
+                    return;
+                }'''
+TRANSPORT_LOOKUP_PATCHED_LEGACY = TRANSPORT_LOOKUP_NEEDLE + '''
+                cancelTransportIdleClose(sessionId);'''
+TRANSPORT_LOOKUP_PATCHED = '''                transport = transports.get(sessionId);
+                if (!transport) {
+                    sendJsonRpcError(res, 404, -32000, "Unknown MCP session");
+                    return;
+                }
+                beginTransportRequest(transport);'''
+
+TRANSPORT_ONCLOSE_NEEDLE = '''                transport.onclose = () => {
+                    const closedSessionId = transport?.sessionId;
+                    if (closedSessionId) {
+                        transports.delete(closedSessionId);
+                        logEvent(config.logging, "info", "mcp_session_closed", {
+                            sessionIdPrefix: sessionIdPrefix(closedSessionId),
+                        });
+                    }
+                };'''
+TRANSPORT_ONCLOSE_PATCHED_LEGACY = '''                transport.onclose = () => {
+                    const closedSessionId = transport?.sessionId;
+                    if (closedSessionId) {
+                        cancelTransportIdleClose(closedSessionId);
+                        transports.delete(closedSessionId);
+                        logEvent(config.logging, "info", "mcp_session_closed", {
+                            sessionIdPrefix: sessionIdPrefix(closedSessionId),
+                        });
+                    }
+                };'''
+TRANSPORT_ONCLOSE_PATCHED = '''                transport.onclose = () => {
+                    const closedSessionId = transport?.sessionId;
+                    if (closedSessionId
+                        && transports.get(closedSessionId) === transport) {
+                        cancelTransportIdleClose(closedSessionId);
+                        transports.delete(closedSessionId);
+                        transportActiveRequests.delete(closedSessionId);
+                        logEvent(config.logging, "info", "mcp_session_closed", {
+                            sessionIdPrefix: sessionIdPrefix(closedSessionId),
+                        });
+                    }
+                };'''
+
+TRANSPORT_HANDLE_NEEDLE = '''            await transport.handleRequest(req, res, req.body);'''
+TRANSPORT_HANDLE_PATCHED_LEGACY = '''            try {
+                await transport.handleRequest(req, res, req.body);
+            }
+            finally {
+                scheduleTransportIdleClose(transport);
+            }'''
+TRANSPORT_HANDLE_PATCHED = '''            try {
+                await transport.handleRequest(req, res, req.body);
+            }
+            finally {
+                finishTransportRequest(transport);
+            }'''
+
+TRANSPORT_SHUTDOWN_NEEDLE = '''            processSessions.shutdown();
+            oauthProvider?.close();'''
+TRANSPORT_SHUTDOWN_PATCHED_LEGACY = '''            processSessions.shutdown();
+            for (const timer of transportIdleTimers.values())
+                clearTimeout(timer);
+            transportIdleTimers.clear();
+            for (const transport of transports.values())
+                closeTransport(transport, "server_shutdown");
+            transports.clear();
+            oauthProvider?.close();'''
+TRANSPORT_SHUTDOWN_PATCHED = '''            processSessions.shutdown();
+            for (const timer of transportIdleTimers.values())
+                clearTimeout(timer);
+            transportIdleTimers.clear();
+            for (const transport of transports.values())
+                closeTransport(transport, "server_shutdown");
+            transports.clear();
+            transportActiveRequests.clear();
+            oauthProvider?.close();'''
+
 OPEN_NEEDLE = """        assertAdvisorReadonlyOpen(config, path, mode, baseRef);
         const { workspace, agentsFiles, availableAgentsFiles } = await workspaces.openWorkspace({ path, mode, baseRef });
         assertAdvisorReadonlyWorkspace(config, workspace);"""
@@ -267,7 +474,11 @@ function advisorProcessExecutionIdentity({ root, cwd, command, tty, columns, row
 function advisorProcessMaxActive(config) {
     if (config.toolMode !== "full")
         return undefined;
-    const value = config.processMaxActive;
+    const value = Number(
+        config.processMaxActive
+        ?? process.env.DEVSPACE_PROCESS_MAX_ACTIVE
+        ?? 8
+    );
     if (!Number.isInteger(value) || value < 1 || value > 64)
         throw new Error("Secure DevSpace active-process limit must be an integer from 1 through 64.");
     return value;
@@ -283,10 +494,23 @@ PROCESS_MAX_ACTIVE_HELPER_LEGACY = r'''function advisorProcessMaxActive(config) 
     return value;
 }
 '''
-PROCESS_MAX_ACTIVE_HELPER = r'''function advisorProcessMaxActive(config) {
+PROCESS_MAX_ACTIVE_HELPER_CONFIG_ONLY = r'''function advisorProcessMaxActive(config) {
     if (config.toolMode !== "full")
         return undefined;
     const value = config.processMaxActive;
+    if (!Number.isInteger(value) || value < 1 || value > 64)
+        throw new Error("Secure DevSpace active-process limit must be an integer from 1 through 64.");
+    return value;
+}
+'''
+PROCESS_MAX_ACTIVE_HELPER = r'''function advisorProcessMaxActive(config) {
+    if (config.toolMode !== "full")
+        return undefined;
+    const value = Number(
+        config.processMaxActive
+        ?? process.env.DEVSPACE_PROCESS_MAX_ACTIVE
+        ?? 8
+    );
     if (!Number.isInteger(value) || value < 1 || value > 64)
         throw new Error("Secure DevSpace active-process limit must be an integer from 1 through 64.");
     return value;
@@ -1158,6 +1382,11 @@ def verify(
         (AUTH_ROUTER_PATCHED, server_text),
         (REQUEST_AUTH_PATCHED, server_text),
         (CLOSE_PATCHED, server_text),
+        (TRANSPORT_RETENTION_PATCHED, server_text),
+        (TRANSPORT_LOOKUP_PATCHED, server_text),
+        (TRANSPORT_ONCLOSE_PATCHED, server_text),
+        (TRANSPORT_HANDLE_PATCHED, server_text),
+        (TRANSPORT_SHUTDOWN_PATCHED, server_text),
         (OPEN_PATCHED, server_text),
         (WORKSPACE_PATCHED, server_text),
         (PROCESS_HELPER_MARKER, server_text),
@@ -1210,6 +1439,7 @@ def verify(
         ("unsandboxed process command", PROCESS_START_NEEDLE, server_text),
         ("process tools restricted to Codex mode", PROCESS_REGISTER_NEEDLE, server_text),
         ("environment-backed active process limit", PROCESS_MAX_ACTIVE_HELPER_LEGACY, server_text),
+        ("config-only active process limit", PROCESS_MAX_ACTIVE_HELPER_CONFIG_ONLY, server_text),
         ("unbounded process manager", PROCESS_MANAGER_FACTORY_NEEDLE, server_text),
         ("process output without replay identity", PROCESS_RESULT_NEEDLE, server_text),
         ("process manager without replay tracking", PROCESS_MANAGER_START_NEEDLE, process_sessions_text),
@@ -1217,6 +1447,12 @@ def verify(
         ("process session removed before replay recovery", PROCESS_MANAGER_WRITE_NEEDLE, process_sessions_text),
         ("duplicate pinned-workspace guard", WORKSPACE_DUPLICATE_PATCHED, server_text),
         ("lexical-only path guard", ROOTS_ASSERT_NEEDLE, roots_text),
+        ("transport close without idle timer cleanup", TRANSPORT_ONCLOSE_NEEDLE, server_text),
+        ("transport retention without active request tracking", TRANSPORT_RETENTION_PATCHED_LEGACY, server_text),
+        ("transport lookup without active request tracking", TRANSPORT_LOOKUP_PATCHED_LEGACY, server_text),
+        ("transport close without identity guard", TRANSPORT_ONCLOSE_PATCHED_LEGACY, server_text),
+        ("transport finalizer without active request tracking", TRANSPORT_HANDLE_PATCHED_LEGACY, server_text),
+        ("transport shutdown without active request cleanup", TRANSPORT_SHUTDOWN_PATCHED_LEGACY, server_text),
     )
     present = [label for label, marker, text in forbidden if marker in text]
     if present:
@@ -1266,6 +1502,53 @@ def patch_devspace(dist: Path, *, check_only: bool) -> bool:
             )
         server_text = server_text.replace(matches[0], CRYPTO_IMPORT_PATCHED, 1)
         changed = True
+    for label, replacement, candidates in (
+        (
+            "MCP transport retention",
+            TRANSPORT_RETENTION_PATCHED,
+            (TRANSPORT_RETENTION_PATCHED_LEGACY, TRANSPORT_MAP_NEEDLE),
+        ),
+        (
+            "MCP transport lookup",
+            TRANSPORT_LOOKUP_PATCHED,
+            (TRANSPORT_LOOKUP_PATCHED_LEGACY, TRANSPORT_LOOKUP_NEEDLE),
+        ),
+        (
+            "MCP transport close",
+            TRANSPORT_ONCLOSE_PATCHED,
+            (TRANSPORT_ONCLOSE_PATCHED_LEGACY, TRANSPORT_ONCLOSE_NEEDLE),
+        ),
+        (
+            "MCP transport request lifecycle",
+            TRANSPORT_HANDLE_PATCHED,
+            (TRANSPORT_HANDLE_PATCHED_LEGACY, TRANSPORT_HANDLE_NEEDLE),
+        ),
+        (
+            "MCP transport shutdown",
+            TRANSPORT_SHUTDOWN_PATCHED,
+            (TRANSPORT_SHUTDOWN_PATCHED_LEGACY, TRANSPORT_SHUTDOWN_NEEDLE),
+        ),
+    ):
+        if replacement in server_text:
+            continue
+        selected = None
+        for candidate in candidates:
+            count = server_text.count(candidate)
+            if count > 1:
+                raise RuntimeError(
+                    f"DevSpace secure-origin {label} patch found {count} "
+                    "compatible insertion points."
+                )
+            if count == 1:
+                selected = candidate
+                break
+        if selected is None:
+            raise RuntimeError(
+                f"DevSpace secure-origin {label} patch expected exactly one "
+                "compatible insertion point, found 0."
+            )
+        server_text = server_text.replace(selected, replacement, 1)
+        changed = True
     for path_label, needle, replacement in (
         ("config", CONFIG_NEEDLE, CONFIG_PATCHED),
         ("filesystem import", FS_IMPORT_NEEDLE, FS_IMPORT_PATCHED),
@@ -1309,13 +1592,19 @@ def patch_devspace(dist: Path, *, check_only: bool) -> bool:
             )
             changed |= did_change
     if PROCESS_MAX_ACTIVE_HELPER not in server_text:
-        if PROCESS_MAX_ACTIVE_HELPER_LEGACY in server_text:
-            server_text = server_text.replace(
-                PROCESS_MAX_ACTIVE_HELPER_LEGACY,
-                PROCESS_MAX_ACTIVE_HELPER,
-                1,
-            )
+        legacy_helpers = (
+            PROCESS_MAX_ACTIVE_HELPER_CONFIG_ONLY,
+            PROCESS_MAX_ACTIVE_HELPER_LEGACY,
+        )
+        matches = [helper for helper in legacy_helpers if server_text.count(helper) == 1]
+        if len(matches) == 1:
+            server_text = server_text.replace(matches[0], PROCESS_MAX_ACTIVE_HELPER, 1)
             changed = True
+        elif matches:
+            raise RuntimeError(
+                "DevSpace secure-origin active process limit patch found multiple "
+                "legacy helpers."
+            )
         else:
             server_text, did_change = replace_once(
                 server_text,

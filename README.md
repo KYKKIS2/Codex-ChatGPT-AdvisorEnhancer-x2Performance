@@ -611,14 +611,16 @@ as live repository content without being byte-hashed during `prepare`, so large
 research datasets do not require multi-hour duplicate reads. Bulk
 artifact/data/model/output roots, virtual environments, and `node_modules` are
 also excluded from secret-name enumeration; a native metadata-only pass still
-checks the complete tree for mounts, hardlinks, and special files.
+checks the complete tree for mounts, special files, and hardlinks. Hardlink
+groups are accepted only when every link is contained within intentionally
+exposed bulk roots in the checkout, preventing aliases from bypassing masks.
 Repinning ordinary changes inside the same repository does not invalidate the
 separate Cloudflare attestation; switching repository roots or changing the
 public identity, runtime, tunnel, or OAuth configuration still does.
-Descendant mounts, hardlinks, special files, unsafe Git configuration, and
-checkout-local runtimes fail closed. Git objects remain read-only but visible,
-so committed history is part of the disclosure boundary. This does not replace
-or weaken the
+Descendant mounts, externally linked or ordinary-path hardlinks, special files,
+unsafe Git configuration, and checkout-local runtimes fail closed. Git objects remain
+read-only but visible, so committed history is part of the disclosure boundary.
+This does not replace or weaken the
 read-only advisor/conclave evidence rules, and the router never selects this
 full-access path automatically.
 

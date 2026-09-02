@@ -54,8 +54,11 @@ The DevSpace process has:
   non-ignored untracked paths in the clean or explicitly approved dirty state;
   ignored data/model trees remain live and visible without byte hashing
 - a full boundary scan immediately before each mount; descendant mounts,
-  hardlinked regular files, sockets, devices, FIFOs, and incomplete scans fail
-  closed; this is a native metadata pass and does not read file contents
+  hardlinks with any directory entry outside the exposed checkout, sockets,
+  devices, FIFOs, and incomplete scans fail closed; hardlink groups entirely
+  contained within intentionally exposed bulk roots are accepted, preventing
+  aliases from bypassing path masks, and this native metadata pass does not read
+  file contents
 - recognized `.env`, HAR, advisor-state, credential-like, and other sensitive
   path names replaced by private empty read-only mounts before DevSpace starts;
   this is a path-only pass and does not classify ordinary file contents;
@@ -489,7 +492,8 @@ isolation, environment clearing, home isolation, network isolation, split
 origin/gateway Bubblewrap sandboxes, systemd resource/timer units, private
 Cloudflare-origin socket health, runtime-integrity pinning, disk-reserve
 enforcement, tracked/untracked content pinning, ignored-data live visibility,
-pre-sandbox Git-helper suppression, descendant-mount and hardlink rejection,
+pre-sandbox Git-helper suppression, descendant-mount rejection, contained
+bulk-root hardlink acceptance, external and ordinary-path hardlink rejection,
 asynchronous process completion, reconnect replay deduplication, intentional
 parallel duplicates, active-process limits, complete Cloudflare pagination,
 loopback diagnostics parsing, and strict
