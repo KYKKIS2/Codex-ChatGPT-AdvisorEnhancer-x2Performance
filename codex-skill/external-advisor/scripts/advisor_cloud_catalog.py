@@ -22,6 +22,7 @@ import advisor_safety as safety
 CATALOG_VERSION = 1
 PROJECT_ID_RE = re.compile(r"^g-p-[A-Za-z0-9]+$")
 MAX_TITLE_CHARS = 300
+MAX_RECOVERY_HISTORY = 20
 
 
 class CatalogError(RuntimeError):
@@ -30,6 +31,10 @@ class CatalogError(RuntimeError):
 
 class AccountMismatchError(CatalogError):
     """Raised when the active HAR belongs to another ChatGPT account."""
+
+
+class RecoveryStateChangedError(CatalogError):
+    """Raised when a recovery action no longer targets the current journal."""
 
 
 def state_root() -> Path:
@@ -131,6 +136,30 @@ def _opaque_unlocked(kind: str, value: str) -> str:
         hashlib.sha256,
     ).hexdigest()
     return digest[:32]
+
+
+def recovery_journal_token(record: dict[str, Any]) -> str | None:
+    """Return an opaque identity for the exact unresolved journal in a record."""
+    submission = record.get("submission")
+    reconcile_message_id = record.get("reconcile_message_id")
+    material: dict[str, Any] = {}
+    if isinstance(submission, dict):
+        nonce = submission.get("nonce")
+        started_at = submission.get("started_at")
+        if not isinstance(nonce, str) or not nonce:
+            return None
+        material["submission_nonce"] = nonce
+        if isinstance(started_at, (int, float)):
+            material["submission_started_at"] = started_at
+    if isinstance(reconcile_message_id, str) and reconcile_message_id:
+        material["reconcile_message_id"] = reconcile_message_id
+        completed_at = record.get("last_completed_at")
+        if isinstance(completed_at, (int, float)):
+            material["last_completed_at"] = completed_at
+    if not material:
+        return None
+    serialized = json.dumps(material, sort_keys=True, separators=(",", ":"))
+    return _opaque_unlocked("recovery-journal", serialized)
 
 
 def _decode_jwt_claims(token: str) -> dict[str, Any]:
@@ -503,6 +532,44 @@ def finish_submission(
             _save_unlocked(data)
 
 
+def complete_submission_from_remote_state(
+    project_key: str,
+    conversation_key: str,
+    auth: dict[str, Any],
+    nonce: str,
+    state: dict[str, Any],
+) -> None:
+    """Atomically install proven remote state and clear the matching journal."""
+    with catalog_lock():
+        data = _load_unlocked()
+        _bind_account_unlocked(data, auth)
+        project = data["projects"].get(project_key)
+        conversations = project.get("conversations") if isinstance(project, dict) else None
+        record = conversations.get(conversation_key) if isinstance(conversations, dict) else None
+        if not isinstance(record, dict):
+            raise CatalogError("The requested cloud conversation is not registered.")
+        submission = record.get("submission")
+        if not isinstance(submission, dict) or submission.get("nonce") != nonce:
+            raise CatalogError("The cloud submission journal changed before reconciliation completed.")
+        if state.get("conversation_id") != record.get("conversation_id"):
+            raise CatalogError("ChatGPT returned a different conversation during reconciliation.")
+        message_id = state.get("message_id")
+        if not isinstance(message_id, str) or not message_id:
+            raise CatalogError("ChatGPT reconciliation returned no continuation message.")
+
+        for name in ("message_id", "parent_message_id", "user_id"):
+            value = state.get(name)
+            if isinstance(value, str) and value:
+                record[name] = value
+        now = time.time()
+        record.pop("submission", None)
+        record.pop("reconcile_message_id", None)
+        record["last_completed_at"] = now
+        record["state_updated_at"] = now
+        record["submission_refreshed_at"] = now
+        _durably_save_submission_unlocked(data)
+
+
 def clear_submission_after_refresh(
     project_key: str,
     conversation_key: str,
@@ -521,6 +588,68 @@ def clear_submission_after_refresh(
             record.pop("reconcile_message_id", None)
             record["submission_refreshed_at"] = time.time()
             _save_unlocked(data)
+
+
+def adopt_current_branch(
+    project_key: str,
+    conversation_key: str,
+    auth: dict[str, Any],
+    state: dict[str, Any],
+    expected_recovery_token: str,
+) -> None:
+    """Archive an unresolved journal and atomically adopt the active cloud branch."""
+    if not re.fullmatch(r"[0-9a-f]{32}", expected_recovery_token):
+        raise CatalogError("The cloud recovery identity is invalid.")
+    with catalog_lock():
+        data = _load_unlocked()
+        _bind_account_unlocked(data, auth)
+        project = data["projects"].get(project_key)
+        conversations = project.get("conversations") if isinstance(project, dict) else None
+        record = conversations.get(conversation_key) if isinstance(conversations, dict) else None
+        if not isinstance(record, dict):
+            raise CatalogError("The requested cloud conversation is not registered.")
+        if state.get("conversation_id") != record.get("conversation_id"):
+            raise CatalogError("ChatGPT returned a different conversation during branch recovery.")
+
+        submission = record.get("submission")
+        reconcile_message_id = record.get("reconcile_message_id")
+        if not isinstance(submission, dict) and not isinstance(reconcile_message_id, str):
+            raise RecoveryStateChangedError(
+                "This cloud conversation was already reconciled by another session."
+            )
+        current_recovery_token = recovery_journal_token(record)
+        if (
+            not isinstance(current_recovery_token, str)
+            or not hmac.compare_digest(current_recovery_token, expected_recovery_token)
+        ):
+            raise RecoveryStateChangedError(
+                "The cloud recovery state changed before it could be adopted."
+            )
+
+        now = time.time()
+        recovery: dict[str, Any] = {
+            "resolution": "adopt_current_branch",
+            "resolved_at": now,
+            "previous_message_id": record.get("message_id"),
+        }
+        if isinstance(submission, dict):
+            recovery["submission"] = copy.deepcopy(submission)
+        if isinstance(reconcile_message_id, str):
+            recovery["reconcile_message_id"] = reconcile_message_id
+        history = record.get("recovery_history")
+        if not isinstance(history, list):
+            history = []
+        record["recovery_history"] = (history + [recovery])[-MAX_RECOVERY_HISTORY:]
+
+        for name in ("message_id", "parent_message_id", "user_id"):
+            value = state.get(name)
+            if isinstance(value, str) and value:
+                record[name] = value
+        record.pop("submission", None)
+        record.pop("reconcile_message_id", None)
+        record["state_updated_at"] = now
+        record["current_branch_adopted_at"] = now
+        _durably_save_submission_unlocked(data)
 
 
 def submission_pending(project_key: str, conversation_key: str, auth: dict[str, Any]) -> bool:

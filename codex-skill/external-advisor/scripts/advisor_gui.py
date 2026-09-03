@@ -15,7 +15,7 @@ import time
 from io import BytesIO
 from pathlib import Path
 from typing import Any, Iterable, Iterator
-from urllib.parse import urlencode, urlsplit
+from urllib.parse import quote, urlencode, urlsplit
 
 from flask import Flask, Response, abort, jsonify, redirect, request, send_from_directory, stream_with_context
 from PIL import Image, ImageOps
@@ -109,8 +109,16 @@ class GuiCloudHistoryPending(GuiBridgeError):
     """The cloud turn ended but its conversation graph is not settled yet."""
 
 
+class GuiCloudHistoryUnresolved(GuiBridgeError):
+    """A settled cloud graph cannot satisfy the durable reconciliation journal."""
+
+
 class GuiRemoteStatusUnavailable(GuiBridgeError):
     """The cloud stream status is temporarily unavailable."""
+
+
+class GuiRemoteReadUnavailable(GuiBridgeError):
+    """A read-only cloud history request failed transiently."""
 
 
 class GuiRequestTooLarge(GuiBridgeError):
@@ -182,6 +190,14 @@ def _recovery_interval() -> float:
         raise GuiBridgeError("ADVISOR_GUI_RECOVERY_INTERVAL must be a number.") from exc
 
 
+def _unresolved_after_seconds() -> float:
+    raw = os.environ.get("ADVISOR_GUI_UNRESOLVED_AFTER_SECONDS", "60")
+    try:
+        return max(15.0, min(3600.0, float(raw)))
+    except ValueError as exc:
+        raise GuiBridgeError("ADVISOR_GUI_UNRESOLVED_AFTER_SECONDS must be a number.") from exc
+
+
 def list_remote_project_conversations(
     project_id: str,
     auth: dict[str, Any],
@@ -237,8 +253,12 @@ def fetch_remote_conversation(conversation_id: str, auth: dict[str, Any]) -> dic
             _bounded_timeout(),
             operation="advisor GUI cloud conversation fetch",
         )
+    except advisor.RateLimitError:
+        raise
     except RuntimeError as exc:
-        raise GuiBridgeError("Could not refresh the selected ChatGPT conversation.") from exc
+        raise GuiRemoteReadUnavailable(
+            "The selected ChatGPT conversation is temporarily unavailable."
+        ) from exc
     return _validated_remote_conversation(data, conversation_id)
 
 
@@ -454,20 +474,33 @@ def _finish_submission_if_remote_complete(
     auth: dict[str, Any],
     nonce: str,
 ) -> bool:
-    """Trust ChatGPT's stream status before converting the durable journal."""
+    """Resolve the exact journal from completed cloud history without replaying it."""
     try:
-        status = advisor.remote_conversation_stream_status(
+        record = catalog.conversation_record(project_key, conversation_key, auth)
+        submission = record.get("submission")
+        if not isinstance(submission, dict) or submission.get("nonce") != nonce:
+            return False
+        prior_message_id = submission.get("prior_message_id")
+        prompt_sha256 = submission.get("prompt_sha256")
+        user_message_id = submission.get("user_message_id")
+        data = fetch_ambiguous_submission_result(
             conversation_id,
             auth,
-            _bounded_timeout(),
+            prior_message_id if isinstance(prior_message_id, str) else None,
+            prompt_sha256 if isinstance(prompt_sha256, str) else None,
+            user_message_id if isinstance(user_message_id, str) else None,
+            attempts=1,
+            interval=0,
+        )
+        state = remote_state_from_data(conversation_id, data, auth)
+        catalog.complete_submission_from_remote_state(
+            project_key,
+            conversation_key,
+            auth,
+            nonce,
+            state,
         )
     except Exception:
-        return False
-    if not advisor.remote_conversation_is_complete(status):
-        return False
-    try:
-        catalog.finish_submission(project_key, conversation_key, auth, nonce)
-    except catalog.CatalogError:
         return False
     return True
 
@@ -741,6 +774,15 @@ def browser_conversation(
         if isinstance(current_message, dict)
         else None
     )
+    advisor_cloud = {
+        "project": project_key,
+        "conversation": conversation_key,
+        "syncedAt": now_ms,
+        "continuationFromTool": current_role == "tool",
+    }
+    recovery_token = catalog.recovery_journal_token(record)
+    if isinstance(recovery_token, str):
+        advisor_cloud["recoveryToken"] = recovery_token
     return {
         "id": f"advisor-cloud-{project_key}-{conversation_key}",
         "title": str(record.get("title") or "ChatGPT Cloud conversation")[:300],
@@ -752,12 +794,7 @@ def browser_conversation(
             "OpenaiAccount": dict(opaque_state),
             "OpenaiChat": dict(opaque_state),
         },
-        "advisorCloud": {
-            "project": project_key,
-            "conversation": conversation_key,
-            "syncedAt": now_ms,
-            "continuationFromTool": current_role == "tool",
-        },
+        "advisorCloud": advisor_cloud,
     }
 
 
@@ -785,6 +822,39 @@ def _conversation_is_still_in_project(
         raise GuiBridgeError("The selected conversation is no longer in the registered ChatGPT Project.")
 
 
+def _pending_journal_started_at(record: dict[str, Any]) -> float | None:
+    submission = record.get("submission")
+    value = submission.get("started_at") if isinstance(submission, dict) else record.get("last_completed_at")
+    return float(value) if isinstance(value, (int, float)) and value > 0 else None
+
+
+def _history_pending_is_unresolved(record: dict[str, Any]) -> bool:
+    started_at = _pending_journal_started_at(record)
+    return bool(
+        started_at is not None
+        and time.time() - started_at >= _unresolved_after_seconds()
+    )
+
+
+def _require_current_recovery_token(
+    record: dict[str, Any],
+    expected_recovery_token: str,
+) -> None:
+    if (
+        len(expected_recovery_token) != 32
+        or any(character not in "0123456789abcdef" for character in expected_recovery_token)
+    ):
+        raise GuiBridgeError("The cloud recovery identity is invalid.")
+    current_recovery_token = catalog.recovery_journal_token(record)
+    if (
+        not isinstance(current_recovery_token, str)
+        or not secrets.compare_digest(current_recovery_token, expected_recovery_token)
+    ):
+        raise catalog.RecoveryStateChangedError(
+            "The cloud recovery state changed; refresh before choosing a branch."
+        )
+
+
 def import_conversation(
     project_key: str,
     conversation_key: str,
@@ -806,35 +876,42 @@ def import_conversation(
         reconcile_message_id = record.get("reconcile_message_id")
         if not isinstance(reconcile_message_id, str):
             reconcile_message_id = None
-        if isinstance(submission, dict):
-            recovered_submission = True
-            prior_message_id = submission.get("prior_message_id")
-            if not isinstance(prior_message_id, str):
-                prior_message_id = None
-            prompt_sha256 = submission.get("prompt_sha256")
-            if not isinstance(prompt_sha256, str):
-                prompt_sha256 = None
-            user_message_id = submission.get("user_message_id")
-            if not isinstance(user_message_id, str):
-                user_message_id = None
-            data = fetch_ambiguous_submission_result(
-                conversation_id,
-                auth,
-                prior_message_id,
-                prompt_sha256,
-                user_message_id,
-                attempts=None if wait else 1,
-                interval=None if wait else 0,
-            )
-        else:
-            require_complete_conversation(conversation_id, auth)
-            data = fetch_reconciled_conversation(
-                conversation_id,
-                auth,
-                reconcile_message_id,
-                attempts=None if wait else 1,
-                interval=None if wait else 0,
-            )
+        try:
+            if isinstance(submission, dict):
+                recovered_submission = True
+                prior_message_id = submission.get("prior_message_id")
+                if not isinstance(prior_message_id, str):
+                    prior_message_id = None
+                prompt_sha256 = submission.get("prompt_sha256")
+                if not isinstance(prompt_sha256, str):
+                    prompt_sha256 = None
+                user_message_id = submission.get("user_message_id")
+                if not isinstance(user_message_id, str):
+                    user_message_id = None
+                data = fetch_ambiguous_submission_result(
+                    conversation_id,
+                    auth,
+                    prior_message_id,
+                    prompt_sha256,
+                    user_message_id,
+                    attempts=None if wait else 1,
+                    interval=None if wait else 0,
+                )
+            else:
+                require_complete_conversation(conversation_id, auth)
+                data = fetch_reconciled_conversation(
+                    conversation_id,
+                    auth,
+                    reconcile_message_id,
+                    attempts=None if wait else 1,
+                    interval=None if wait else 0,
+                )
+        except GuiCloudHistoryPending as exc:
+            if _history_pending_is_unresolved(record):
+                raise GuiCloudHistoryUnresolved(
+                    "ChatGPT finished, but the interrupted local send cannot be matched to the current cloud branch."
+                ) from exc
+            raise
         state = remote_state_from_data(conversation_id, data, auth)
         catalog.update_remote_state(project_key, conversation_key, auth, state)
         # Import/Refresh is the reconciliation step after an interrupted
@@ -846,6 +923,75 @@ def import_conversation(
     result = browser_conversation(project_key, conversation_key, refreshed, data)
     result["recoveredSubmission"] = recovered_submission
     return result
+
+
+def adopt_current_cloud_branch(
+    project_key: str,
+    conversation_key: str,
+    auth: dict[str, Any],
+    expected_recovery_token: str,
+) -> dict[str, Any]:
+    """Explicitly archive unresolved state and continue from ChatGPT's active branch."""
+    record = catalog.conversation_record(project_key, conversation_key, auth)
+    if not (record.get("submission") or record.get("reconcile_message_id")):
+        raise catalog.RecoveryStateChangedError(
+            "This cloud conversation no longer needs branch recovery."
+        )
+    _require_current_recovery_token(record, expected_recovery_token)
+    if not _history_pending_is_unresolved(record):
+        raise GuiCloudHistoryPending("Cloud reconciliation is still within its automatic retry window.")
+    conversation_id = record.get("conversation_id")
+    if not isinstance(conversation_id, str) or not conversation_id:
+        raise GuiBridgeError("The private cloud conversation mapping is invalid.")
+
+    lease = concurrency.ConversationLockLease(timeout=_queue_timeout(), locks=[], keys=set())
+    try:
+        lease.acquire_key("conversation:" + conversation_id)
+        record = catalog.conversation_record(project_key, conversation_key, auth)
+        if not (record.get("submission") or record.get("reconcile_message_id")):
+            raise catalog.RecoveryStateChangedError(
+                "This cloud conversation was reconciled by another session."
+            )
+        _require_current_recovery_token(record, expected_recovery_token)
+        if not _history_pending_is_unresolved(record):
+            raise catalog.RecoveryStateChangedError(
+                "The cloud recovery state changed; refresh before choosing a branch."
+            )
+        _conversation_is_still_in_project(project_key, conversation_id, auth)
+        require_complete_conversation(conversation_id, auth)
+        data = fetch_remote_conversation(conversation_id, auth)
+        state = remote_state_from_data(conversation_id, data, auth)
+        catalog.adopt_current_branch(
+            project_key,
+            conversation_key,
+            auth,
+            state,
+            expected_recovery_token,
+        )
+    finally:
+        lease.release()
+
+    refreshed = catalog.conversation_record(project_key, conversation_key, auth)
+    result = browser_conversation(project_key, conversation_key, refreshed, data)
+    result["adoptedCurrentBranch"] = True
+    return result
+
+
+def chatgpt_conversation_url(
+    project_key: str,
+    conversation_key: str,
+    auth: dict[str, Any],
+) -> str:
+    record = catalog.conversation_record(project_key, conversation_key, auth)
+    conversation_id = record.get("conversation_id")
+    if (
+        not isinstance(conversation_id, str)
+        or len(conversation_id) < 8
+        or len(conversation_id) > 200
+        or any(not (character.isalnum() or character in "-_") for character in conversation_id)
+    ):
+        raise GuiBridgeError("The private cloud conversation mapping is invalid.")
+    return "https://chatgpt.com/c/" + quote(conversation_id, safe="")
 
 
 def observe_pending_conversation(
@@ -920,12 +1066,28 @@ def _safe_route(callable_: Any) -> Any:
         response, status = _error_response(str(exc), 429, "activity_rate_limited")
         response.headers["Retry-After"] = str(int(exc.retry_after))
         return response, status
+    except advisor.RateLimitError as exc:
+        retry_after = max(60.0, float(exc.retry_after or 0.0))
+        concurrency.record_remote_rate_limit(retry_after)
+        response, status = _error_response(
+            "ChatGPT cloud reads are temporarily rate limited.",
+            429,
+            "remote_read_rate_limited",
+        )
+        response.headers["Retry-After"] = str(int(retry_after))
+        return response, status
     except GuiRemoteTurnRunning as exc:
         return _error_response(str(exc), 409, "remote_turn_running")
+    except GuiCloudHistoryUnresolved as exc:
+        return _error_response(str(exc), 409, "cloud_history_unresolved")
     except GuiCloudHistoryPending as exc:
         return _error_response(str(exc), 409, "cloud_history_pending")
     except GuiRemoteStatusUnavailable as exc:
         return _error_response(str(exc), 409, "remote_status_unavailable")
+    except GuiRemoteReadUnavailable as exc:
+        return _error_response(str(exc), 503, "remote_read_unavailable")
+    except catalog.RecoveryStateChangedError as exc:
+        return _error_response(str(exc), 409, "recovery_state_changed")
     except catalog.AccountMismatchError as exc:
         return _error_response(str(exc), 409)
     except (catalog.CatalogError, GuiBridgeError) as exc:
@@ -1562,15 +1724,67 @@ def install_advisor_routes(app: Flask, script_dir: Path | None = None) -> Flask:
     def conversation_import(project_key: str, conversation_key: str) -> Any:
         if not _same_origin_request():
             return _error_response("Cross-origin advisor GUI requests are blocked.", 403)
-        return _safe_route(
-            lambda: jsonify({
-                "conversation": import_conversation(
+        def payload() -> Any:
+            try:
+                conversation = import_conversation(
                     project_key,
                     conversation_key,
                     require_auth(),
                     wait=False,
+                )
+            except GuiCloudHistoryUnresolved as exc:
+                return jsonify({"message": str(exc), "status": "unresolved"})
+            except GuiRemoteTurnRunning as exc:
+                return jsonify({"message": str(exc), "status": "running"})
+            except GuiCloudHistoryPending as exc:
+                return jsonify({"message": str(exc), "status": "pending"})
+            except GuiRemoteStatusUnavailable as exc:
+                return jsonify({"message": str(exc), "status": "unknown"})
+            return jsonify({"conversation": conversation})
+        return _safe_route(payload)
+
+    @app.post("/advisor-api/projects/<project_key>/conversations/<conversation_key>/adopt-current")
+    def conversation_adopt_current(project_key: str, conversation_key: str) -> Any:
+        if request.headers.get("X-Advisor-Cloud") != "1":
+            return _error_response("The advisor cloud request marker is required.", 403)
+        if not _same_origin_request():
+            return _error_response("Cross-origin advisor GUI requests are blocked.", 403)
+        body = request.get_json(silent=True)
+        expected_keys = {"acknowledge", "recovery_token", "resolution"}
+        if (
+            not isinstance(body, dict)
+            or set(body) != expected_keys
+            or body.get("acknowledge") != "do_not_resend"
+            or body.get("resolution") != "adopt_current_branch"
+            or not isinstance(body.get("recovery_token"), str)
+            or len(body["recovery_token"]) != 32
+            or any(character not in "0123456789abcdef" for character in body["recovery_token"])
+        ):
+            return _error_response("Explicit current-branch recovery confirmation is required.", 400)
+        return _safe_route(
+            lambda: jsonify({
+                "conversation": adopt_current_cloud_branch(
+                    project_key,
+                    conversation_key,
+                    require_auth(),
+                    body["recovery_token"],
                 ),
             })
+        )
+
+    @app.get("/advisor-api/projects/<project_key>/conversations/<conversation_key>/open-chatgpt")
+    def conversation_open_chatgpt(project_key: str, conversation_key: str) -> Any:
+        if not _same_origin_request():
+            return _error_response("Cross-origin advisor GUI requests are blocked.", 403)
+        return _safe_route(
+            lambda: redirect(
+                chatgpt_conversation_url(
+                    project_key,
+                    conversation_key,
+                    require_auth(),
+                ),
+                code=302,
+            )
         )
 
     @app.get("/advisor-api/projects/<project_key>/conversations/<conversation_key>/observe")

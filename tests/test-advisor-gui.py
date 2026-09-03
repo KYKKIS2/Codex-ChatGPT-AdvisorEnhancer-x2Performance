@@ -394,6 +394,25 @@ class AdvisorGuiTest(unittest.TestCase):
         record.assert_called_once_with(12.0)
         self.assertEqual(raised.exception.retry_after, 60.0)
 
+    def test_remote_conversation_read_failures_keep_typed_recovery_boundaries(self) -> None:
+        with mock.patch.object(
+            advisor_gui.advisor,
+            "get_remote_json_with_backoff",
+            side_effect=RuntimeError("temporary transport failure"),
+        ):
+            with self.assertRaises(advisor_gui.GuiRemoteReadUnavailable):
+                advisor_gui.fetch_remote_conversation("conversation-raw-123", self.auth)
+
+        limited = advisor_gui.advisor.RateLimitError("rate limited", retry_after=75.0)
+        with mock.patch.object(
+            advisor_gui.advisor,
+            "get_remote_json_with_backoff",
+            side_effect=limited,
+        ):
+            with self.assertRaises(advisor_gui.advisor.RateLimitError) as raised:
+                advisor_gui.fetch_remote_conversation("conversation-raw-123", self.auth)
+        self.assertIs(raised.exception, limited)
+
     def test_remote_state_contains_all_openai_chat_continuation_fields(self) -> None:
         state = advisor_gui.remote_state_from_data(
             "conversation-raw-123",
@@ -506,10 +525,10 @@ class AdvisorGuiTest(unittest.TestCase):
             conversation_key,
             self.auth,
             "nonce-one",
-            "user-new",
+            "user-one",
         )
         bound = catalog.conversation_record(project_key, conversation_key, self.auth)
-        self.assertEqual(bound["submission"]["user_message_id"], "user-new")
+        self.assertEqual(bound["submission"]["user_message_id"], "user-one")
         catalog.update_remote_state(
             project_key,
             conversation_key,
@@ -536,10 +555,22 @@ class AdvisorGuiTest(unittest.TestCase):
         self.assertFalse(completed)
         self.assertTrue(catalog.submission_pending(project_key, conversation_key, self.auth))
 
-        with mock.patch.object(
-            advisor_gui.advisor,
-            "remote_conversation_stream_status",
-            return_value="COMPLETE",
+        completed_graph = graph(
+            "conversation-raw-123",
+            "assistant-final",
+            prior_message_id="assistant-old",
+        )
+        with (
+            mock.patch.object(
+                advisor_gui.advisor,
+                "remote_conversation_stream_status",
+                return_value="COMPLETE",
+            ),
+            mock.patch.object(
+                advisor_gui,
+                "fetch_remote_conversation",
+                return_value=completed_graph,
+            ) as remote_fetch,
         ):
             completed = advisor_gui._finish_submission_if_remote_complete(
                 project_key,
@@ -549,9 +580,49 @@ class AdvisorGuiTest(unittest.TestCase):
                 "nonce-one",
             )
         self.assertTrue(completed)
+        remote_fetch.assert_called_once_with("conversation-raw-123", self.auth)
         record = catalog.conversation_record(project_key, conversation_key, self.auth)
         self.assertNotIn("submission", record)
-        self.assertEqual(record["reconcile_message_id"], "assistant-new")
+        self.assertNotIn("reconcile_message_id", record)
+        self.assertEqual(record["message_id"], "assistant-final")
+        self.assertEqual(record["parent_message_id"], "assistant-final")
+
+    def test_completed_remote_state_cannot_clear_a_newer_submission_journal(self) -> None:
+        project_key, conversation_key = self.register()
+        catalog.update_remote_state(
+            project_key,
+            conversation_key,
+            self.auth,
+            {
+                "conversation_id": "conversation-raw-123",
+                "message_id": "assistant-old",
+                "parent_message_id": "assistant-old",
+            },
+        )
+        catalog.begin_submission(
+            project_key,
+            conversation_key,
+            self.auth,
+            "nonce-current",
+            prompt_sha256=prompt_sha256(),
+        )
+
+        with self.assertRaises(catalog.CatalogError):
+            catalog.complete_submission_from_remote_state(
+                project_key,
+                conversation_key,
+                self.auth,
+                "nonce-stale",
+                {
+                    "conversation_id": "conversation-raw-123",
+                    "message_id": "assistant-final",
+                    "parent_message_id": "assistant-final",
+                },
+            )
+
+        record = catalog.conversation_record(project_key, conversation_key, self.auth)
+        self.assertEqual(record["submission"]["nonce"], "nonce-current")
+        self.assertEqual(record["message_id"], "assistant-old")
 
     def test_pending_observer_renders_safe_progress_without_clearing_journal(self) -> None:
         project_key, conversation_key = self.register()
@@ -602,6 +673,9 @@ class AdvisorGuiTest(unittest.TestCase):
         self.assertIn("Inspected repository files", serialized)
         self.assertNotIn("private hidden reasoning", serialized)
         self.assertNotIn("private tool output", serialized)
+        recovery_token = observed["conversation"]["advisorCloud"].get("recoveryToken")
+        self.assertIsInstance(recovery_token, str)
+        self.assertEqual(len(recovery_token), 32)
         self.assertTrue(catalog.submission_pending(project_key, conversation_key, self.auth))
 
         catalog.clear_submission_after_refresh(project_key, conversation_key, self.auth)
@@ -620,6 +694,7 @@ class AdvisorGuiTest(unittest.TestCase):
             )
         self.assertEqual(external["status"], "streaming")
         self.assertEqual(external["conversation"]["items"][-1]["content"], "Partial visible answer.")
+        self.assertNotIn("recoveryToken", external["conversation"]["advisorCloud"])
 
     def test_stale_post_finish_import_cannot_regress_cloud_parent(self) -> None:
         project_key, conversation_key = self.register()
@@ -690,6 +765,267 @@ class AdvisorGuiTest(unittest.TestCase):
         reconciled = catalog.conversation_record(project_key, conversation_key, self.auth)
         self.assertEqual(reconciled["message_id"], "assistant-new")
         self.assertNotIn("reconcile_message_id", reconciled)
+
+    def test_explicit_branch_adoption_archives_journal_and_updates_parent(self) -> None:
+        project_key, conversation_key = self.register()
+        catalog.update_remote_state(
+            project_key,
+            conversation_key,
+            self.auth,
+            {
+                "conversation_id": "conversation-raw-123",
+                "message_id": "assistant-old",
+                "parent_message_id": "assistant-old",
+            },
+        )
+        catalog.begin_submission(
+            project_key,
+            conversation_key,
+            self.auth,
+            "nonce-one",
+            prompt_sha256=prompt_sha256(),
+        )
+        recovery_token = catalog.recovery_journal_token(
+            catalog.conversation_record(project_key, conversation_key, self.auth)
+        )
+        self.assertIsInstance(recovery_token, str)
+
+        catalog.adopt_current_branch(
+            project_key,
+            conversation_key,
+            self.auth,
+            {
+                "conversation_id": "conversation-raw-123",
+                "message_id": "assistant-current",
+                "parent_message_id": "assistant-current",
+                "user_id": "device-id",
+            },
+            recovery_token,
+        )
+
+        record = catalog.conversation_record(project_key, conversation_key, self.auth)
+        self.assertNotIn("submission", record)
+        self.assertNotIn("reconcile_message_id", record)
+        self.assertEqual(record["message_id"], "assistant-current")
+        self.assertEqual(record["parent_message_id"], "assistant-current")
+        self.assertEqual(len(record["recovery_history"]), 1)
+        recovery = record["recovery_history"][0]
+        self.assertEqual(recovery["resolution"], "adopt_current_branch")
+        self.assertEqual(recovery["submission"]["nonce"], "nonce-one")
+        self.assertEqual(recovery["submission"]["prompt_sha256"], prompt_sha256())
+
+        adopted_record = catalog.conversation_record(project_key, conversation_key, self.auth)
+        with self.assertRaises(catalog.RecoveryStateChangedError):
+            catalog.adopt_current_branch(
+                project_key,
+                conversation_key,
+                self.auth,
+                {
+                    "conversation_id": "conversation-raw-123",
+                    "message_id": "assistant-current",
+                    "parent_message_id": "assistant-current",
+                },
+                recovery_token,
+            )
+        self.assertEqual(
+            catalog.conversation_record(project_key, conversation_key, self.auth),
+            adopted_record,
+        )
+
+    def test_stale_branch_adoption_cannot_clear_a_newer_submission_journal(self) -> None:
+        project_key, conversation_key = self.register()
+        catalog.update_remote_state(
+            project_key,
+            conversation_key,
+            self.auth,
+            {
+                "conversation_id": "conversation-raw-123",
+                "message_id": "assistant-old",
+                "parent_message_id": "assistant-old",
+            },
+        )
+        catalog.begin_submission(
+            project_key,
+            conversation_key,
+            self.auth,
+            "nonce-old",
+            prompt_sha256=prompt_sha256(),
+        )
+        stale_token = catalog.recovery_journal_token(
+            catalog.conversation_record(project_key, conversation_key, self.auth)
+        )
+        self.assertIsInstance(stale_token, str)
+        catalog.clear_submission_after_refresh(project_key, conversation_key, self.auth)
+        catalog.begin_submission(
+            project_key,
+            conversation_key,
+            self.auth,
+            "nonce-new",
+            prompt_sha256=prompt_sha256("A newer prompt."),
+        )
+        newer_record = catalog.conversation_record(project_key, conversation_key, self.auth)
+
+        with self.assertRaises(catalog.RecoveryStateChangedError):
+            catalog.adopt_current_branch(
+                project_key,
+                conversation_key,
+                self.auth,
+                {
+                    "conversation_id": "conversation-raw-123",
+                    "message_id": "assistant-current",
+                    "parent_message_id": "assistant-current",
+                },
+                stale_token,
+            )
+
+        self.assertEqual(
+            catalog.conversation_record(project_key, conversation_key, self.auth),
+            newer_record,
+        )
+
+    def test_old_pending_history_transitions_to_unresolved_without_clearing_journal(self) -> None:
+        project_key, conversation_key = self.register()
+        catalog.update_remote_state(
+            project_key,
+            conversation_key,
+            self.auth,
+            {
+                "conversation_id": "conversation-raw-123",
+                "message_id": "assistant-old",
+                "parent_message_id": "assistant-old",
+            },
+        )
+        catalog.begin_submission(
+            project_key,
+            conversation_key,
+            self.auth,
+            "nonce-one",
+            prompt_sha256=prompt_sha256(),
+        )
+
+        with (
+            mock.patch.object(advisor_gui, "_conversation_is_still_in_project"),
+            mock.patch.object(advisor_gui, "_unresolved_after_seconds", return_value=0),
+            mock.patch.object(
+                advisor_gui,
+                "fetch_ambiguous_submission_result",
+                side_effect=advisor_gui.GuiCloudHistoryPending("pending"),
+            ),
+        ):
+            with self.assertRaises(advisor_gui.GuiCloudHistoryUnresolved):
+                advisor_gui.import_conversation(
+                    project_key,
+                    conversation_key,
+                    self.auth,
+                    wait=False,
+                )
+
+        record = catalog.conversation_record(project_key, conversation_key, self.auth)
+        self.assertIn("submission", record)
+        self.assertNotIn("recovery_history", record)
+
+    def test_adopt_current_cloud_branch_never_replays_pending_submission(self) -> None:
+        project_key, conversation_key = self.register()
+        catalog.update_remote_state(
+            project_key,
+            conversation_key,
+            self.auth,
+            {
+                "conversation_id": "conversation-raw-123",
+                "message_id": "assistant-old",
+                "parent_message_id": "assistant-old",
+            },
+        )
+        catalog.begin_submission(
+            project_key,
+            conversation_key,
+            self.auth,
+            "nonce-one",
+            prompt_sha256=prompt_sha256(),
+        )
+        recovery_token = catalog.recovery_journal_token(
+            catalog.conversation_record(project_key, conversation_key, self.auth)
+        )
+        self.assertIsInstance(recovery_token, str)
+        current = graph("conversation-raw-123", "assistant-current")
+
+        with (
+            mock.patch.object(advisor_gui, "_history_pending_is_unresolved", return_value=True),
+            mock.patch.object(advisor_gui, "_conversation_is_still_in_project") as project_check,
+            mock.patch.object(advisor_gui, "require_complete_conversation") as complete_check,
+            mock.patch.object(advisor_gui, "fetch_remote_conversation", return_value=current) as fetch,
+        ):
+            adopted = advisor_gui.adopt_current_cloud_branch(
+                project_key,
+                conversation_key,
+                self.auth,
+                recovery_token,
+            )
+
+        project_check.assert_called_once()
+        complete_check.assert_called_once()
+        fetch.assert_called_once()
+        self.assertTrue(adopted["adoptedCurrentBranch"])
+        self.assertEqual(adopted["items"][-1]["content"], "The inspection is complete.")
+        record = catalog.conversation_record(project_key, conversation_key, self.auth)
+        self.assertNotIn("submission", record)
+        self.assertEqual(record["message_id"], "assistant-current")
+        self.assertEqual(record["recovery_history"][-1]["resolution"], "adopt_current_branch")
+
+    def test_adopt_current_cloud_branch_rejects_journal_changed_after_remote_read(self) -> None:
+        project_key, conversation_key = self.register()
+        catalog.update_remote_state(
+            project_key,
+            conversation_key,
+            self.auth,
+            {
+                "conversation_id": "conversation-raw-123",
+                "message_id": "assistant-old",
+                "parent_message_id": "assistant-old",
+            },
+        )
+        catalog.begin_submission(
+            project_key,
+            conversation_key,
+            self.auth,
+            "nonce-old",
+            prompt_sha256=prompt_sha256(),
+        )
+        stale_token = catalog.recovery_journal_token(
+            catalog.conversation_record(project_key, conversation_key, self.auth)
+        )
+        self.assertIsInstance(stale_token, str)
+        current = graph("conversation-raw-123", "assistant-current")
+
+        def rotate_journal(*_args: object) -> dict[str, object]:
+            catalog.clear_submission_after_refresh(project_key, conversation_key, self.auth)
+            catalog.begin_submission(
+                project_key,
+                conversation_key,
+                self.auth,
+                "nonce-new",
+                prompt_sha256=prompt_sha256("A newer prompt."),
+            )
+            return current
+
+        with (
+            mock.patch.object(advisor_gui, "_history_pending_is_unresolved", return_value=True),
+            mock.patch.object(advisor_gui, "_conversation_is_still_in_project"),
+            mock.patch.object(advisor_gui, "require_complete_conversation"),
+            mock.patch.object(advisor_gui, "fetch_remote_conversation", side_effect=rotate_journal),
+        ):
+            with self.assertRaises(catalog.RecoveryStateChangedError):
+                advisor_gui.adopt_current_cloud_branch(
+                    project_key,
+                    conversation_key,
+                    self.auth,
+                    stale_token,
+                )
+
+        record = catalog.conversation_record(project_key, conversation_key, self.auth)
+        self.assertEqual(record["submission"]["nonce"], "nonce-new")
+        self.assertEqual(record["message_id"], "assistant-old")
+        self.assertNotIn("recovery_history", record)
 
     def test_ambiguous_submission_import_waits_for_new_final_and_clears_journal(self) -> None:
         project_key, conversation_key = self.register()
@@ -1073,6 +1409,11 @@ class AdvisorGuiTest(unittest.TestCase):
         self.assertIn("recoverConversationUntilReady", javascript)
         self.assertIn("observeConversation", javascript)
         self.assertIn("remote_turn_running", javascript)
+        self.assertIn("remote_read_rate_limited", javascript)
+        self.assertIn("remote_read_unavailable", javascript)
+        self.assertIn("isRecoverableCloudReadError", javascript)
+        self.assertIn("showRecoveryProgress", javascript)
+        self.assertIn("Stop synchronization", javascript)
         self.assertIn("ChatGPT is still working", javascript)
         self.assertIn("Previous turn ended without a final answer", javascript)
         self.assertIn("continuationFromTool", javascript)
@@ -1090,6 +1431,14 @@ class AdvisorGuiTest(unittest.TestCase):
         self.assertIn('id="image-input"', html)
         self.assertIn('accept="image/jpeg,image/png,image/webp,image/gif"', html)
         self.assertIn('id="attachment-tray"', html)
+        self.assertIn('id="conversation-count"', html)
+        self.assertIn('id="cancel-load"', html)
+        self.assertIn('id="retry-load"', html)
+        self.assertIn('id="jump-latest"', html)
+        self.assertIn('id="recovery-panel"', html)
+        self.assertIn('id="adopt-current-branch"', html)
+        self.assertIn('id="recovery-dialog"', html)
+        self.assertIn('class="mode-option active"', html)
         self.assertIn(".activity-row", stylesheet)
         self.assertIn(".turn-state.working", stylesheet)
         self.assertIn(".turn-state.warning", stylesheet)
@@ -1098,6 +1447,32 @@ class AdvisorGuiTest(unittest.TestCase):
         self.assertIn(".math-display", stylesheet)
         self.assertIn(".markdown-table-scroll", stylesheet)
         self.assertIn("body.sidebar-collapsed", stylesheet)
+        self.assertIn(".jump-latest", stylesheet)
+        self.assertIn(".mode-switch", stylesheet)
+        self.assertIn("prefers-reduced-motion", stylesheet)
+        self.assertIn("setEmptyState", javascript)
+        self.assertIn("openController", javascript)
+        self.assertIn("cancelConversationLoad", javascript)
+        self.assertIn("retryConversationLoad", javascript)
+        self.assertIn("transcriptNearLatest", javascript)
+        self.assertIn("updateLatestControl", javascript)
+        self.assertIn("readLocationSelection", javascript)
+        self.assertEqual(javascript.count('fetch("/backend-api/v2/conversation"'), 1)
+        self.assertIn("conversationLocation", javascript)
+        self.assertIn('project: state.projectKey', javascript)
+        self.assertIn("!locationSelection.projectKey", javascript)
+        self.assertIn("MAX_CLOUD_HISTORY_ATTEMPTS", javascript)
+        self.assertIn("cloud_history_unresolved", javascript)
+        self.assertIn("recovery_state_changed", javascript)
+        self.assertIn("recovery_token", javascript)
+        self.assertIn("currentRecoveryToken", javascript)
+        self.assertIn("stopActivityPolling", javascript)
+        self.assertIn('recoveryError?.code === "cloud_history_unresolved"', javascript)
+        self.assertIn("Cloud history needs a recovery decision", javascript)
+        self.assertIn("adoptCurrentCloudBranch", javascript)
+        self.assertIn("do_not_resend", javascript)
+        self.assertIn(".recovery-panel", stylesheet)
+        self.assertIn(".recovery-dialog", stylesheet)
 
     def test_loopback_shell_security_headers_and_route_surface(self) -> None:
         try:
@@ -1203,8 +1578,137 @@ class AdvisorGuiTest(unittest.TestCase):
                 headers={"Origin": "http://localhost", "X-Advisor-Cloud": "1"},
                 environ_base={"REMOTE_ADDR": "127.0.0.1", "HTTP_HOST": "localhost"},
             )
-        self.assertEqual(running.status_code, 409)
-        self.assertEqual(running.get_json()["error"]["code"], "remote_turn_running")
+        self.assertEqual(running.status_code, 200)
+        self.assertEqual(running.get_json()["status"], "running")
+        for exception, expected_status in (
+            (advisor_gui.GuiCloudHistoryPending("Cloud history pending."), "pending"),
+            (advisor_gui.GuiRemoteStatusUnavailable("Cloud status unavailable."), "unknown"),
+        ):
+            with self.subTest(import_status=expected_status), mock.patch.object(
+                advisor_gui,
+                "import_conversation",
+                side_effect=exception,
+            ):
+                pending = client.post(
+                    "/advisor-api/projects/project/conversations/conversation/import",
+                    headers={"Origin": "http://localhost", "X-Advisor-Cloud": "1"},
+                    environ_base={"REMOTE_ADDR": "127.0.0.1", "HTTP_HOST": "localhost"},
+                )
+            self.assertEqual(pending.status_code, 200)
+            self.assertEqual(pending.get_json()["status"], expected_status)
+        observe_path = "/advisor-api/projects/project/conversations/conversation/observe"
+        with (
+            mock.patch.object(advisor_gui, "require_auth", return_value=self.auth),
+            mock.patch.object(
+                advisor_gui,
+                "observe_pending_conversation",
+                side_effect=advisor_gui.advisor.RateLimitError("rate limited", retry_after=75.0),
+            ),
+            mock.patch.object(advisor_gui.concurrency, "record_remote_rate_limit") as record_limit,
+        ):
+            remote_limited = client.get(
+                observe_path,
+                headers={"Origin": "http://localhost"},
+                environ_base={"REMOTE_ADDR": "127.0.0.1", "HTTP_HOST": "localhost"},
+            )
+        self.assertEqual(remote_limited.status_code, 429)
+        self.assertEqual(remote_limited.get_json()["error"]["code"], "remote_read_rate_limited")
+        self.assertEqual(remote_limited.headers["Retry-After"], "75")
+        record_limit.assert_called_once_with(75.0)
+
+        with (
+            mock.patch.object(advisor_gui, "require_auth", return_value=self.auth),
+            mock.patch.object(
+                advisor_gui,
+                "observe_pending_conversation",
+                side_effect=advisor_gui.GuiRemoteReadUnavailable("Cloud read unavailable."),
+            ),
+        ):
+            remote_unavailable = client.get(
+                observe_path,
+                headers={"Origin": "http://localhost"},
+                environ_base={"REMOTE_ADDR": "127.0.0.1", "HTTP_HOST": "localhost"},
+            )
+        self.assertEqual(remote_unavailable.status_code, 503)
+        self.assertEqual(remote_unavailable.get_json()["error"]["code"], "remote_read_unavailable")
+        with mock.patch.object(
+            advisor_gui,
+            "import_conversation",
+            side_effect=advisor_gui.GuiCloudHistoryUnresolved("Cloud turn unresolved."),
+        ):
+            unresolved = client.post(
+                "/advisor-api/projects/project/conversations/conversation/import",
+                headers={"Origin": "http://localhost", "X-Advisor-Cloud": "1"},
+                environ_base={"REMOTE_ADDR": "127.0.0.1", "HTTP_HOST": "localhost"},
+            )
+        self.assertEqual(unresolved.status_code, 200)
+        self.assertEqual(unresolved.get_json()["status"], "unresolved")
+        recovery_path = "/advisor-api/projects/project/conversations/conversation/adopt-current"
+        recovery_body = {
+            "acknowledge": "do_not_resend",
+            "recovery_token": "a" * 32,
+            "resolution": "adopt_current_branch",
+        }
+        with (
+            mock.patch.object(advisor_gui, "require_auth", return_value=self.auth),
+            mock.patch.object(
+                advisor_gui,
+                "adopt_current_cloud_branch",
+                return_value={"id": "opaque", "items": [], "adoptedCurrentBranch": True},
+            ) as adopt,
+            mock.patch.object(
+                advisor_gui,
+                "chatgpt_conversation_url",
+                return_value="https://chatgpt.com/c/conversation-raw-123",
+            ),
+        ):
+            adopted = client.post(
+                recovery_path,
+                json=recovery_body,
+                headers={"Origin": "http://localhost", "X-Advisor-Cloud": "1"},
+                environ_base={"REMOTE_ADDR": "127.0.0.1", "HTTP_HOST": "localhost"},
+            )
+            rejected = client.post(
+                recovery_path,
+                json={"resolution": "adopt_current_branch"},
+                headers={"Origin": "http://localhost", "X-Advisor-Cloud": "1"},
+                environ_base={"REMOTE_ADDR": "127.0.0.1", "HTTP_HOST": "localhost"},
+            )
+            cross_origin_recovery = client.post(
+                recovery_path,
+                json=recovery_body,
+                headers={"Origin": "https://example.com", "X-Advisor-Cloud": "1"},
+                environ_base={"REMOTE_ADDR": "127.0.0.1", "HTTP_HOST": "localhost"},
+            )
+            opened = client.get(
+                "/advisor-api/projects/project/conversations/conversation/open-chatgpt",
+                headers={"Origin": "http://localhost"},
+                environ_base={"REMOTE_ADDR": "127.0.0.1", "HTTP_HOST": "localhost"},
+            )
+        self.assertEqual(adopted.status_code, 200)
+        self.assertTrue(adopted.get_json()["conversation"]["adoptedCurrentBranch"])
+        adopt.assert_called_once_with("project", "conversation", self.auth, "a" * 32)
+        self.assertEqual(rejected.status_code, 400)
+        self.assertEqual(cross_origin_recovery.status_code, 403)
+        self.assertEqual(opened.status_code, 302)
+        self.assertEqual(opened.headers["Location"], "https://chatgpt.com/c/conversation-raw-123")
+
+        with (
+            mock.patch.object(advisor_gui, "require_auth", return_value=self.auth),
+            mock.patch.object(
+                advisor_gui,
+                "adopt_current_cloud_branch",
+                side_effect=catalog.RecoveryStateChangedError("Recovery state changed."),
+            ),
+        ):
+            stale_recovery = client.post(
+                recovery_path,
+                json=recovery_body,
+                headers={"Origin": "http://localhost", "X-Advisor-Cloud": "1"},
+                environ_base={"REMOTE_ADDR": "127.0.0.1", "HTTP_HOST": "localhost"},
+            )
+        self.assertEqual(stale_recovery.status_code, 409)
+        self.assertEqual(stale_recovery.get_json()["error"]["code"], "recovery_state_changed")
         self.assertEqual(client.get("/private/").status_code, 404)
         self.assertEqual(client.get("/backend-api/v2/models").status_code, 404)
         denied = client.get("/chat/", environ_base={"REMOTE_ADDR": "203.0.113.10"})
@@ -1532,6 +2036,16 @@ class AdvisorGuiTest(unittest.TestCase):
         except ImportError as exc:  # pragma: no cover - setup installs Flask
             self.skipTest(str(exc))
         project_key, conversation_key = self.register()
+        catalog.update_remote_state(
+            project_key,
+            conversation_key,
+            self.auth,
+            {
+                "conversation_id": "conversation-raw-123",
+                "message_id": "assistant-old",
+                "parent_message_id": "assistant-old",
+            },
+        )
         app = Flask(__name__)
         captured: dict[str, object] = {}
 
@@ -1543,7 +2057,7 @@ class AdvisorGuiTest(unittest.TestCase):
                 {
                     "type": "request",
                     "request": {
-                        "messages": [{"id": "user-new", "author": {"role": "user"}}],
+                        "messages": [{"id": "user-one", "author": {"role": "user"}}],
                     },
                 },
                 {
@@ -1603,17 +2117,23 @@ class AdvisorGuiTest(unittest.TestCase):
         private_state = {
             "conversation_id": "conversation-raw-123",
             "project_id": "g-p-project123",
-            "message_id": "assistant-final",
+            "message_id": "assistant-old",
         }
         prepared = {
             "provider": "OpenaiAccount",
             "conversation": {
                 "conversation_id": "conversation-raw-123",
-                "message_id": "assistant-final",
-                "parent_message_id": "assistant-final",
+                "message_id": "assistant-old",
+                "parent_message_id": "assistant-old",
             },
             "gizmo_id": "g-p-project123",
         }
+        completed_graph = graph(
+            "conversation-raw-123",
+            "assistant-final",
+            user_prompt="Continue the analysis.",
+            prior_message_id="assistant-old",
+        )
         with (
             mock.patch.object(advisor_gui, "require_auth", return_value=self.auth),
             mock.patch.object(advisor_gui, "_prepare_cloud_turn", return_value=(prepared, private_state)),
@@ -1621,6 +2141,11 @@ class AdvisorGuiTest(unittest.TestCase):
                 advisor_gui.advisor,
                 "remote_conversation_stream_status",
                 return_value="COMPLETE",
+            ),
+            mock.patch.object(
+                advisor_gui,
+                "fetch_remote_conversation",
+                return_value=completed_graph,
             ),
             mock.patch.object(advisor_gui.concurrency, "remote_call_slot", return_value=remote_context),
             mock.patch.object(
@@ -1655,6 +2180,8 @@ class AdvisorGuiTest(unittest.TestCase):
         self.assertTrue(conversation_lease.released)
         self.assertTrue(remote_context.exited)
         self.assertFalse(catalog.submission_pending(project_key, conversation_key, self.auth))
+        record = catalog.conversation_record(project_key, conversation_key, self.auth)
+        self.assertEqual(record["message_id"], "assistant-final")
 
 
 if __name__ == "__main__":

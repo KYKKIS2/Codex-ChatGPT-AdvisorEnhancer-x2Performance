@@ -24,7 +24,11 @@
                     </div>
                 </div>
                 <button class="icon-button sidebar-close" id="sidebar-close" type="button"
-                        aria-label="Collapse conversations" title="Collapse conversations">‹</button>
+                        aria-label="Collapse conversations" title="Collapse conversations">
+                    <svg class="icon" viewBox="0 0 24 24" aria-hidden="true">
+                        <path d="m15 18-6-6 6-6"></path>
+                    </svg>
+                </button>
             </header>
 
             <div class="sidebar-controls">
@@ -33,10 +37,24 @@
 
                 <div class="search-row">
                     <label class="sr-only" for="conversation-search">Search conversations</label>
+                    <svg class="search-icon icon" viewBox="0 0 24 24" aria-hidden="true">
+                        <circle cx="11" cy="11" r="7"></circle>
+                        <path d="m20 20-3.5-3.5"></path>
+                    </svg>
                     <input id="conversation-search" name="conversation-search" type="search"
                            autocomplete="off" placeholder="Search conversations…">
                     <button class="icon-button" id="refresh-project" type="button"
-                            aria-label="Refresh conversations" title="Refresh conversations">↻</button>
+                            aria-label="Refresh conversations" title="Refresh conversations">
+                        <svg class="icon" viewBox="0 0 24 24" aria-hidden="true">
+                            <path d="M20 11a8.1 8.1 0 0 0-15.5-2M4 4v5h5"></path>
+                            <path d="M4 13a8.1 8.1 0 0 0 15.5 2M20 20v-5h-5"></path>
+                        </svg>
+                    </button>
+                </div>
+
+                <div class="conversation-list-meta">
+                    <span>Conversations</span>
+                    <span class="conversation-count" id="conversation-count">0</span>
                 </div>
             </div>
 
@@ -55,33 +73,86 @@
         <main class="advisor-main" id="advisor-main">
             <header class="conversation-header">
                 <button class="icon-button sidebar-open" id="sidebar-open" type="button"
-                        aria-label="Open conversations" title="Open conversations">☰</button>
+                        aria-label="Open conversations" title="Open conversations">
+                    <svg class="icon" viewBox="0 0 24 24" aria-hidden="true">
+                        <path d="M4 6h16M4 12h16M4 18h16"></path>
+                    </svg>
+                </button>
                 <div class="conversation-heading">
                     <span class="eyebrow" id="conversation-project">ChatGPT Project</span>
                     <h2 id="conversation-title">No conversation selected</h2>
                 </div>
                 <div class="header-actions">
-                    <label class="mode-control" for="mode-select">
-                        <span>Mode</span>
-                        <select id="mode-select" name="mode" autocomplete="off" aria-label="ChatGPT mode">
-                            <option value="thinking">Thinking Max</option>
-                            <option value="pro">Pro Extended</option>
-                        </select>
-                    </label>
+                    <div class="mode-control" aria-label="ChatGPT mode">
+                        <span aria-hidden="true">Mode</span>
+                        <div class="mode-switch" id="mode-select" role="group" aria-label="ChatGPT mode">
+                            <button class="mode-option active" type="button" data-mode="thinking"
+                                    aria-pressed="true" aria-label="Thinking Max" title="Use Thinking Max">
+                                <span class="mode-full">Thinking Max</span><span class="mode-compact">Max</span>
+                            </button>
+                            <button class="mode-option" type="button" data-mode="pro"
+                                    aria-pressed="false" aria-label="Pro Extended" title="Use Pro Extended">
+                                <span class="mode-full">Pro Extended</span><span class="mode-compact">Pro</span>
+                            </button>
+                        </div>
+                    </div>
                     <span class="cloud-state" id="cloud-state">
-                        <span aria-hidden="true"></span>Cloud linked
+                        <svg class="icon" viewBox="0 0 24 24" aria-hidden="true">
+                            <path d="M17.5 19H9a7 7 0 1 1 6.7-9h1.8a4.5 4.5 0 1 1 0 9Z"></path>
+                            <path d="m10 14 2 2 4-4"></path>
+                        </svg>
+                        Cloud linked
                     </span>
                 </div>
             </header>
 
-            <section class="empty-state" id="empty-state" aria-labelledby="empty-title">
-                <div class="empty-mark" aria-hidden="true">AC</div>
-                <h2 id="empty-title">No conversation selected</h2>
-            </section>
+            <div class="conversation-stage">
+                <section class="empty-state" id="empty-state" aria-labelledby="empty-title" data-state="idle">
+                    <div class="empty-visual" aria-hidden="true">
+                        <div class="empty-mark">AC</div>
+                        <span class="empty-signal"></span>
+                    </div>
+                    <div class="empty-copy">
+                        <h2 id="empty-title">No conversation selected</h2>
+                        <p id="empty-detail" hidden></p>
+                    </div>
+                    <div class="empty-actions">
+                        <button class="secondary-button" id="cancel-load" type="button" hidden>Cancel</button>
+                        <button class="secondary-button" id="retry-load" type="button" hidden>Retry</button>
+                    </div>
+                </section>
 
-            <section class="transcript" id="transcript" aria-label="Conversation messages" hidden></section>
+                <section class="transcript" id="transcript" aria-label="Conversation messages" hidden></section>
+
+                <button class="jump-latest" id="jump-latest" type="button"
+                        aria-label="Scroll to latest message" title="Scroll to latest message" hidden>
+                    <svg class="icon" viewBox="0 0 24 24" aria-hidden="true">
+                        <path d="m6 9 6 6 6-6"></path>
+                    </svg>
+                    <span>Latest</span>
+                </button>
+            </div>
 
             <footer class="composer-region" id="composer-region" hidden>
+                <section class="recovery-panel" id="recovery-panel" aria-labelledby="recovery-title" hidden>
+                    <div class="recovery-copy">
+                        <svg class="icon" viewBox="0 0 24 24" aria-hidden="true">
+                            <circle cx="12" cy="12" r="9"></circle>
+                            <path d="M12 7v6M12 17h.01"></path>
+                        </svg>
+                        <div>
+                            <strong id="recovery-title">Cloud turn unresolved</strong>
+                            <span>ChatGPT finished, but the interrupted local send cannot be matched to this branch.</span>
+                        </div>
+                    </div>
+                    <div class="recovery-actions">
+                        <button class="secondary-button" id="recheck-recovery" type="button">Recheck</button>
+                        <button class="secondary-button" id="open-cloud-chat" type="button">Open ChatGPT</button>
+                        <button class="secondary-button recovery-adopt" id="adopt-current-branch" type="button">
+                            Use current branch
+                        </button>
+                    </div>
+                </section>
                 <form class="composer" id="composer-form">
                     <div class="attachment-tray" id="attachment-tray"
                          aria-label="Attached images" aria-live="polite" hidden></div>
@@ -93,15 +164,26 @@
                     <div class="composer-footer">
                         <div class="composer-context">
                             <button class="icon-button attach-button" id="attach-images" type="button"
-                                    aria-label="Attach images" title="Attach images">+</button>
+                                    aria-label="Attach images" title="Attach images">
+                                <svg class="icon" viewBox="0 0 24 24" aria-hidden="true">
+                                    <path d="m21.4 11.6-8.9 8.9a6 6 0 0 1-8.5-8.5l9.6-9.6a4 4 0 0 1 5.7 5.7l-9.6 9.6a2 2 0 1 1-2.8-2.8l8.9-8.9"></path>
+                                </svg>
+                            </button>
                             <span class="turn-state" id="turn-state" role="status" aria-live="polite">Ready</span>
                         </div>
                         <div class="composer-actions">
                             <button class="icon-button stop-button" id="stop-turn" type="button"
-                                    aria-label="Stop receiving" title="Stop receiving" hidden>■</button>
+                                    aria-label="Stop receiving" title="Stop receiving" hidden>
+                                <svg class="icon" viewBox="0 0 24 24" aria-hidden="true">
+                                    <rect x="7" y="7" width="10" height="10" rx="1"></rect>
+                                </svg>
+                            </button>
                             <button class="send-button" id="send-message" type="submit"
                                     aria-label="Send message" title="Send message">
-                                <span>Send</span><span aria-hidden="true">↑</span>
+                                <span>Send</span>
+                                <svg class="icon" viewBox="0 0 24 24" aria-hidden="true">
+                                    <path d="m12 19V5M5 12l7-7 7 7"></path>
+                                </svg>
                             </button>
                         </div>
                     </div>
@@ -109,6 +191,20 @@
             </footer>
         </main>
     </div>
+
+    <dialog class="recovery-dialog" id="recovery-dialog" aria-labelledby="recovery-dialog-title">
+        <div class="recovery-dialog-copy">
+            <span class="eyebrow">Recovery</span>
+            <h2 id="recovery-dialog-title">Use the current ChatGPT branch?</h2>
+            <p>The unresolved local send will be archived and never resent. The conversation will continue from the branch currently visible on ChatGPT.</p>
+        </div>
+        <div class="recovery-dialog-actions">
+            <button class="secondary-button" id="cancel-adopt" type="button">Cancel</button>
+            <button class="secondary-button recovery-adopt" id="confirm-adopt" type="button">
+                Use current branch
+            </button>
+        </div>
+    </dialog>
 
     <div class="toast" id="toast" role="status" aria-live="polite" hidden></div>
 </body>

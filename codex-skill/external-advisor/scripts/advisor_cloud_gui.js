@@ -9,11 +9,23 @@
     const MAX_IMAGE_COUNT = 4;
     const MAX_IMAGE_BYTES = 8 * 1024 * 1024;
     const MAX_TOTAL_IMAGE_BYTES = 20 * 1024 * 1024;
+    const MAX_CLOUD_HISTORY_ATTEMPTS = 3;
+    const RECOVERY_POLL_INTERVAL_MS = 5000;
+    const RECOVERY_RATE_LIMIT_MIN_MS = 60000;
+    const RECOVERY_RATE_LIMIT_MAX_MS = 120000;
+    const RECOVERY_TOKEN_PATTERN = /^[a-f0-9]{32}$/;
     const RECOVERABLE_IMPORT_CODES = new Set([
         "cloud_history_pending",
+        "remote_read_rate_limited",
+        "remote_read_unavailable",
         "remote_status_unavailable",
         "remote_turn_running",
     ]);
+    const RECOVERABLE_IMPORT_STATUSES = Object.freeze({
+        pending: "cloud_history_pending",
+        running: "remote_turn_running",
+        unknown: "remote_status_unavailable",
+    });
 
     const state = {
         projects: [],
@@ -21,12 +33,16 @@
         projectKey: "",
         selectedKey: "",
         selectedConversation: null,
+        mode: "thinking",
         busy: false,
         sending: false,
         reconciliationRequired: false,
+        recoveryUnresolved: false,
         controller: null,
+        openController: null,
         toastTimer: null,
         attachments: [],
+        followLatest: true,
     };
 
     const ui = {
@@ -35,6 +51,7 @@
         projectSelect: document.getElementById("project-select"),
         search: document.getElementById("conversation-search"),
         refresh: document.getElementById("refresh-project"),
+        conversationCount: document.getElementById("conversation-count"),
         list: document.getElementById("conversation-list"),
         clearView: document.getElementById("clear-view"),
         sidebarOpen: document.getElementById("sidebar-open"),
@@ -42,11 +59,22 @@
         sidebarBackdrop: document.getElementById("sidebar-backdrop"),
         conversationProject: document.getElementById("conversation-project"),
         conversationTitle: document.getElementById("conversation-title"),
-        mode: document.getElementById("mode-select"),
+        modeOptions: Array.from(document.querySelectorAll(".mode-option")),
         empty: document.getElementById("empty-state"),
         emptyTitle: document.getElementById("empty-title"),
+        emptyDetail: document.getElementById("empty-detail"),
+        cancelLoad: document.getElementById("cancel-load"),
+        retryLoad: document.getElementById("retry-load"),
         transcript: document.getElementById("transcript"),
+        jumpLatest: document.getElementById("jump-latest"),
         composerRegion: document.getElementById("composer-region"),
+        recoveryPanel: document.getElementById("recovery-panel"),
+        recheckRecovery: document.getElementById("recheck-recovery"),
+        openCloudChat: document.getElementById("open-cloud-chat"),
+        adoptCurrentBranch: document.getElementById("adopt-current-branch"),
+        recoveryDialog: document.getElementById("recovery-dialog"),
+        cancelAdopt: document.getElementById("cancel-adopt"),
+        confirmAdopt: document.getElementById("confirm-adopt"),
         form: document.getElementById("composer-form"),
         input: document.getElementById("message-input"),
         imageInput: document.getElementById("image-input"),
@@ -97,6 +125,7 @@
     };
 
     const setConversationReadyState = (conversation) => {
+        hideRecoveryState();
         const continuationFromTool = conversation?.advisorCloud?.continuationFromTool === true;
         setTurnState(
             continuationFromTool ? "Previous turn ended without a final answer" : "Ready",
@@ -104,6 +133,26 @@
             false,
             continuationFromTool,
         );
+    };
+
+    const hideRecoveryState = () => {
+        state.recoveryUnresolved = false;
+        ui.recoveryPanel.hidden = true;
+        if (ui.recoveryDialog.open) ui.recoveryDialog.close();
+    };
+
+    const showUnresolvedRecovery = () => {
+        state.recoveryUnresolved = true;
+        state.reconciliationRequired = true;
+        ui.recoveryPanel.hidden = false;
+        ui.composerRegion.hidden = false;
+        setTurnState("Cloud turn unresolved", false, false, true);
+        updateComposerState();
+    };
+
+    const currentRecoveryToken = () => {
+        const value = state.selectedConversation?.advisorCloud?.recoveryToken;
+        return typeof value === "string" && RECOVERY_TOKEN_PATTERN.test(value) ? value : "";
     };
 
     const showToast = (message, error = false) => {
@@ -116,6 +165,43 @@
         }, 5000);
     };
 
+    const setEmptyState = (kind, title, detail = "", actions = {}) => {
+        ui.empty.dataset.state = kind;
+        ui.emptyTitle.textContent = title;
+        ui.emptyDetail.textContent = detail;
+        ui.emptyDetail.hidden = !detail;
+        ui.cancelLoad.hidden = actions.cancel !== true;
+        ui.retryLoad.hidden = actions.retry !== true;
+    };
+
+    const isRecoverableCloudReadError = (error) => (
+        RECOVERABLE_IMPORT_CODES.has(error?.code) || error?.name === "TypeError"
+    );
+
+    const recoveryDelayForError = (error) => {
+        if (error?.code === "remote_read_rate_limited") {
+            const requested = Number(error?.retryAfterSeconds || 0) * 1000;
+            return Math.min(
+                RECOVERY_RATE_LIMIT_MAX_MS,
+                Math.max(RECOVERY_RATE_LIMIT_MIN_MS, requested || 0),
+            );
+        }
+        if (["remote_read_unavailable", "remote_status_unavailable"].includes(error?.code)
+                || error?.name === "TypeError") {
+            return RECOVERY_POLL_INTERVAL_MS;
+        }
+        return 0;
+    };
+
+    const showRecoveryProgress = (title, detail = "") => {
+        if (!ui.transcript.hidden && state.selectedConversation) {
+            setTurnState(title, false, true);
+            return;
+        }
+        setEmptyState("loading", title, detail, {cancel: true});
+        ui.empty.hidden = false;
+    };
+
     const renderAttachmentTray = () => {
         ui.attachmentTray.replaceChildren();
         ui.attachmentTray.hidden = state.attachments.length === 0;
@@ -125,6 +211,9 @@
             const image = document.createElement("img");
             image.src = attachment.url;
             image.alt = "";
+            image.width = 72;
+            image.height = 72;
+            image.decoding = "async";
             const remove = document.createElement("button");
             remove.type = "button";
             remove.className = "attachment-remove";
@@ -202,8 +291,13 @@
         ui.input.disabled = unavailable;
         ui.attach.disabled = unavailable;
         ui.send.disabled = unavailable || !ui.input.value.trim();
-        ui.mode.disabled = state.sending;
-        ui.stop.hidden = !state.sending;
+        ui.modeOptions.forEach((button) => { button.disabled = state.sending; });
+        ui.recheckRecovery.disabled = state.busy || state.sending;
+        ui.adoptCurrentBranch.disabled = state.busy || state.sending || !currentRecoveryToken();
+        const observing = Boolean(state.openController && state.busy && !state.sending);
+        ui.stop.hidden = !state.sending && !observing;
+        ui.stop.setAttribute("aria-label", observing ? "Stop synchronization" : "Stop receiving");
+        ui.stop.title = observing ? "Stop synchronization" : "Stop receiving";
         ui.attachmentTray.querySelectorAll("button").forEach((button) => {
             button.disabled = unavailable;
         });
@@ -223,6 +317,7 @@
     };
 
     const renderLoadingRows = () => {
+        ui.conversationCount.textContent = "…";
         ui.list.replaceChildren();
         for (let index = 0; index < 7; index += 1) {
             const row = document.createElement("div");
@@ -233,11 +328,34 @@
     };
 
     const renderListState = (message) => {
+        ui.conversationCount.textContent = "0";
         ui.list.replaceChildren();
         const empty = document.createElement("div");
         empty.className = "list-state";
         empty.textContent = message;
         ui.list.appendChild(empty);
+    };
+
+    const LOCAL_KEY_PATTERN = /^[a-f0-9]{32}$/;
+
+    const readLocationSelection = () => {
+        const parameters = new URLSearchParams(location.hash.startsWith("#")
+            ? location.hash.slice(1)
+            : "");
+        const projectKey = parameters.get("project") || "";
+        const conversationKey = parameters.get("chat") || "";
+        return {
+            projectKey: LOCAL_KEY_PATTERN.test(projectKey) ? projectKey : "",
+            conversationKey: LOCAL_KEY_PATTERN.test(conversationKey) ? conversationKey : "",
+        };
+    };
+
+    const conversationLocation = (conversationKey) => {
+        const parameters = new URLSearchParams({
+            project: state.projectKey,
+            chat: conversationKey,
+        });
+        return `${location.pathname}#${parameters.toString()}`;
     };
 
     const activeProject = () => state.projects.find((item) => item.key === state.projectKey) || null;
@@ -248,6 +366,7 @@
             const title = String(item.title || "").toLocaleLowerCase();
             return !query || title.includes(query);
         });
+        ui.conversationCount.textContent = String(matches.length);
         ui.list.replaceChildren();
 
         for (const item of matches) {
@@ -262,6 +381,7 @@
             copy.className = "conversation-copy";
             const title = document.createElement("strong");
             title.textContent = item.title || "Untitled conversation";
+            title.title = title.textContent;
             const updated = document.createElement("span");
             updated.textContent = formatDate(item.updatedAt || item.createdAt);
             copy.append(title, updated);
@@ -270,7 +390,6 @@
             if (item.needsRefresh) {
                 const marker = document.createElement("span");
                 marker.className = "conversation-refresh";
-                marker.textContent = "↻";
                 marker.title = "Refresh required";
                 marker.setAttribute("aria-label", "Refresh required");
                 button.appendChild(marker);
@@ -314,24 +433,32 @@
         state.selectedKey = "";
         state.selectedConversation = null;
         state.reconciliationRequired = false;
+        hideRecoveryState();
         ui.transcript.replaceChildren();
         ui.transcript.hidden = true;
+        ui.jumpLatest.hidden = true;
         ui.composerRegion.hidden = true;
         ui.empty.hidden = false;
-        ui.emptyTitle.textContent = "No conversation selected";
+        setEmptyState("idle", "No conversation selected");
         ui.conversationProject.textContent = activeProject()?.name || "ChatGPT Project";
         ui.conversationTitle.textContent = "No conversation selected";
         history.replaceState(null, "", location.pathname);
         setTurnState("Ready");
+        state.followLatest = true;
         renderConversationList();
         updateComposerState();
     };
 
-    const showConversationPlaceholder = (item, message) => {
+    const showConversationPlaceholder = (item, message, kind = "loading", detail = "") => {
+        hideRecoveryState();
         ui.transcript.replaceChildren();
         ui.transcript.hidden = true;
+        ui.jumpLatest.hidden = true;
         ui.composerRegion.hidden = true;
-        ui.emptyTitle.textContent = message;
+        setEmptyState(kind, message, detail, {
+            cancel: kind === "loading",
+            retry: kind === "error",
+        });
         ui.empty.hidden = false;
         ui.conversationProject.textContent = activeProject()?.name || "ChatGPT Project";
         ui.conversationTitle.textContent = item?.title || "Untitled conversation";
@@ -351,11 +478,24 @@
                 option.textContent = item.name;
                 ui.projectSelect.appendChild(option);
             }
-            state.projectKey = state.projects[0]?.key || "";
+            const locationSelection = readLocationSelection();
+            state.projectKey = state.projects.some((item) => item.key === locationSelection.projectKey)
+                ? locationSelection.projectKey
+                : state.projects[0]?.key || "";
             ui.projectSelect.value = state.projectKey;
             setSessionState("connected", "ChatGPT connected");
             if (state.projectKey) {
                 await refreshProject(true);
+                if (locationSelection.conversationKey && !locationSelection.projectKey
+                        && !state.selectedKey) {
+                    for (const project of state.projects) {
+                        if (project.key === state.projectKey) continue;
+                        state.projectKey = project.key;
+                        ui.projectSelect.value = project.key;
+                        await refreshProject(true);
+                        if (state.selectedKey) break;
+                    }
+                }
             } else {
                 renderListState("No registered Projects");
             }
@@ -385,10 +525,10 @@
             setSessionState("connected", "ChatGPT connected");
             renderConversationList();
 
-            const hashKey = location.hash.startsWith("#chat=") ? location.hash.slice(6) : "";
-            if (!state.selectedKey && /^[a-f0-9]{32}$/.test(hashKey)
-                    && state.conversations.some((item) => item.key === hashKey)) {
-                await openConversation(hashKey, true);
+            const {conversationKey} = readLocationSelection();
+            if (!state.selectedKey && conversationKey
+                    && state.conversations.some((item) => item.key === conversationKey)) {
+                await openConversation(conversationKey, true);
             }
         } catch (error) {
             state.conversations = [];
@@ -848,6 +988,7 @@
         const imageCount = Number.isInteger(options.imageCount) ? Math.max(0, options.imageCount) : 0;
         const article = document.createElement("article");
         article.className = `message ${role === "assistant" ? "assistant" : "user"}`;
+        article.classList.toggle("fresh", streaming || options.fresh === true);
         const avatar = document.createElement("div");
         avatar.className = "message-avatar";
         avatar.setAttribute("aria-hidden", "true");
@@ -863,6 +1004,10 @@
             const image = document.createElement("img");
             image.src = attachment.url;
             image.alt = attachment.file.name || "Attached image";
+            image.width = 180;
+            image.height = 180;
+            image.loading = "lazy";
+            image.decoding = "async";
             attachments.appendChild(image);
         }
         if (!images.length && imageCount) {
@@ -900,7 +1045,6 @@
         const icon = document.createElement("span");
         icon.className = "activity-icon";
         icon.setAttribute("aria-hidden", "true");
-        icon.textContent = "↻";
         const text = document.createElement("span");
         text.className = "activity-text";
         text.textContent = content;
@@ -916,11 +1060,28 @@
         activity.row.removeAttribute("aria-atomic");
     };
 
-    const scrollTranscript = () => {
+    const transcriptNearLatest = () => (
+        ui.transcript.scrollHeight - ui.transcript.scrollTop - ui.transcript.clientHeight < 120
+    );
+
+    const updateLatestControl = () => {
+        ui.jumpLatest.hidden = ui.transcript.hidden || transcriptNearLatest();
+    };
+
+    const scrollTranscript = (force = false) => {
+        if (!force && !state.followLatest) {
+            updateLatestControl();
+            return;
+        }
         ui.transcript.scrollTop = ui.transcript.scrollHeight;
+        state.followLatest = true;
+        updateLatestControl();
     };
 
     const renderTranscript = (conversation, live = false) => {
+        const wasVisible = !ui.transcript.hidden;
+        const previousScrollTop = ui.transcript.scrollTop;
+        const shouldFollowLatest = !wasVisible || state.followLatest || transcriptNearLatest();
         ui.transcript.replaceChildren();
         const items = Array.isArray(conversation.items) ? conversation.items : [];
         const liveActivityIndex = live
@@ -946,45 +1107,133 @@
         ui.empty.hidden = true;
         ui.transcript.hidden = false;
         ui.composerRegion.hidden = false;
-        requestAnimationFrame(scrollTranscript);
+        requestAnimationFrame(() => {
+            if (shouldFollowLatest) {
+                scrollTranscript(true);
+            } else {
+                ui.transcript.scrollTop = previousScrollTop;
+                state.followLatest = false;
+                updateLatestControl();
+            }
+        });
     };
 
-    const importConversation = async (conversationKey) => requestJson(
-        `/advisor-api/projects/${encodeURIComponent(state.projectKey)}/conversations/${encodeURIComponent(conversationKey)}/import`,
-        {
+    const importConversation = async (conversationKey, signal = undefined) => {
+        const payload = await requestJson(
+            `/advisor-api/projects/${encodeURIComponent(state.projectKey)}`
+            + `/conversations/${encodeURIComponent(conversationKey)}/import`,
+            {
             method: "POST",
+            signal,
             headers: {"Content-Type": "application/json", "X-Advisor-Cloud": "1"},
             body: "{}",
-        },
-    );
+            },
+        );
+        if (payload?.status === "unresolved") {
+            const error = new Error(payload.message || "Cloud turn unresolved");
+            error.code = "cloud_history_unresolved";
+            throw error;
+        }
+        const recoveryCode = RECOVERABLE_IMPORT_STATUSES[payload?.status];
+        if (recoveryCode) {
+            const error = new Error(payload.message || "Cloud conversation reconciliation is pending");
+            error.code = recoveryCode;
+            throw error;
+        }
+        return payload;
+    };
 
-    const observeConversation = async (conversationKey) => requestJson(
+    const observeConversation = async (conversationKey, signal = undefined) => requestJson(
         `/advisor-api/projects/${encodeURIComponent(state.projectKey)}/conversations/${encodeURIComponent(conversationKey)}/observe`,
+        {signal},
     );
 
-    const waitForRecoveryPoll = (milliseconds) => new Promise((resolve) => {
-        window.setTimeout(resolve, milliseconds);
+    const waitForRecoveryPoll = (milliseconds, signal = undefined) => new Promise((resolve, reject) => {
+        if (signal?.aborted) {
+            reject(new DOMException("Cloud conversation loading was cancelled", "AbortError"));
+            return;
+        }
+        const finish = () => {
+            window.clearTimeout(timer);
+            signal?.removeEventListener("abort", cancel);
+            resolve();
+        };
+        const cancel = () => {
+            window.clearTimeout(timer);
+            reject(new DOMException("Cloud conversation loading was cancelled", "AbortError"));
+        };
+        const timer = window.setTimeout(finish, milliseconds);
+        signal?.addEventListener("abort", cancel, {once: true});
     });
 
     const recoverConversationUntilReady = async (
         conversationKey,
-        {renderSnapshots = false, observeFirst = true} = {},
+        {renderSnapshots = false, observeFirst = true, signal = undefined} = {},
     ) => {
+        const projectKey = state.projectKey;
+        const ensureCurrentRecovery = () => {
+            if (signal?.aborted
+                    || state.projectKey !== projectKey
+                    || state.selectedKey !== conversationKey) {
+                throw new DOMException("Cloud conversation loading was cancelled", "AbortError");
+            }
+        };
         let shouldImport = !observeFirst;
-        while (state.selectedKey === conversationKey) {
+        let cloudHistoryAttempts = 0;
+        while (state.projectKey === projectKey && state.selectedKey === conversationKey) {
+            ensureCurrentRecovery();
             if (shouldImport) {
                 try {
-                    return await importConversation(conversationKey);
+                    const payload = await importConversation(conversationKey, signal);
+                    ensureCurrentRecovery();
+                    return payload;
                 } catch (error) {
-                    if (!RECOVERABLE_IMPORT_CODES.has(error?.code)) throw error;
+                    if (error?.name === "AbortError") throw error;
+                    if (error?.code === "cloud_history_unresolved") throw error;
+                    if (!isRecoverableCloudReadError(error)) throw error;
+                    if (error?.code === "cloud_history_pending") {
+                        cloudHistoryAttempts += 1;
+                    }
+                    const delayMs = recoveryDelayForError(error);
+                    if (delayMs) {
+                        shouldImport = false;
+                        const rateLimited = error?.code === "remote_read_rate_limited";
+                        showRecoveryProgress(
+                            rateLimited ? "ChatGPT is rate limited" : "Cloud connection interrupted",
+                            rateLimited
+                                ? `Retrying read-only synchronization in ${Math.ceil(delayMs / 1000)} seconds…`
+                                : "Retrying read-only synchronization…",
+                        );
+                        await waitForRecoveryPoll(delayMs, signal);
+                        continue;
+                    }
                 }
             }
 
-            const observed = await observeConversation(conversationKey);
+            let observed;
+            try {
+                observed = await observeConversation(conversationKey, signal);
+                ensureCurrentRecovery();
+            } catch (error) {
+                if (error?.name === "AbortError") throw error;
+                if (!isRecoverableCloudReadError(error)) throw error;
+                const delayMs = recoveryDelayForError(error) || RECOVERY_POLL_INTERVAL_MS;
+                const rateLimited = error?.code === "remote_read_rate_limited";
+                showRecoveryProgress(
+                    rateLimited ? "ChatGPT is rate limited" : "Cloud connection interrupted",
+                    rateLimited
+                        ? `Retrying read-only synchronization in ${Math.ceil(delayMs / 1000)} seconds…`
+                        : "Retrying read-only synchronization…",
+                );
+                await waitForRecoveryPoll(delayMs, signal);
+                shouldImport = false;
+                continue;
+            }
             const conversation = observed?.conversation;
             if (renderSnapshots && conversation?.id && Array.isArray(conversation.items)) {
                 state.selectedConversation = conversation;
                 renderTranscript(conversation, observed?.status === "streaming");
+                updateComposerState();
             }
 
             if (observed?.status === "ready") {
@@ -992,23 +1241,28 @@
                 continue;
             }
             if (observed?.status === "complete") {
+                if (cloudHistoryAttempts >= MAX_CLOUD_HISTORY_ATTEMPTS) {
+                    const error = new Error(
+                        "ChatGPT finished, but the interrupted local send cannot be matched to the current cloud branch.",
+                    );
+                    error.code = "cloud_history_unresolved";
+                    throw error;
+                }
                 shouldImport = true;
-                setTurnState("Synchronizing cloud history…", false, true);
-                await waitForRecoveryPoll(1000);
+                showRecoveryProgress("Synchronizing cloud history…");
+                await waitForRecoveryPoll(1000, signal);
                 continue;
             }
 
             shouldImport = false;
-            setTurnState(
+            showRecoveryProgress(
                 observed?.status === "streaming"
                     ? "ChatGPT is still working…"
                     : "Connection interrupted; checking ChatGPT…",
-                false,
-                true,
             );
-            await waitForRecoveryPoll(5000);
+            await waitForRecoveryPoll(RECOVERY_POLL_INTERVAL_MS, signal);
         }
-        throw new Error("Cloud conversation recovery was interrupted");
+        throw new DOMException("Cloud conversation loading was cancelled", "AbortError");
     };
 
     const waitForActivityPoll = (signal, delayMs = 5000) => new Promise((resolve) => {
@@ -1062,12 +1316,18 @@
         if (state.selectedKey && state.selectedKey !== conversationKey) clearAttachments();
         state.selectedKey = conversationKey;
         state.reconciliationRequired = false;
+        state.followLatest = true;
+        history.replaceState(null, "", conversationLocation(conversationKey));
+        const openController = new AbortController();
+        state.openController = openController;
         renderConversationList();
         setBusy(true);
         const recovering = Boolean(item.needsRefresh);
         showConversationPlaceholder(
             item,
             recovering ? "Recovering cloud conversation" : "Loading cloud conversation",
+            "loading",
+            recovering ? "Waiting for the active ChatGPT turn to settle…" : "Synchronizing visible cloud history…",
         );
         setTurnState(
             recovering ? "Waiting for ChatGPT to finish…" : "Refreshing cloud conversation…",
@@ -1079,16 +1339,16 @@
             if (recovering) {
                 payload = await recoverConversationUntilReady(
                     conversationKey,
-                    {renderSnapshots: true, observeFirst: true},
+                    {renderSnapshots: true, observeFirst: true, signal: openController.signal},
                 );
             } else {
                 try {
-                    payload = await importConversation(conversationKey);
+                    payload = await importConversation(conversationKey, openController.signal);
                 } catch (error) {
-                    if (!RECOVERABLE_IMPORT_CODES.has(error?.code)) throw error;
+                    if (!isRecoverableCloudReadError(error)) throw error;
                     payload = await recoverConversationUntilReady(
                         conversationKey,
-                        {renderSnapshots: true, observeFirst: true},
+                        {renderSnapshots: true, observeFirst: true, signal: openController.signal},
                     );
                 }
             }
@@ -1102,16 +1362,27 @@
             ui.conversationTitle.textContent = conversation.title || item.title || "Untitled conversation";
             renderTranscript(conversation);
             if (conversation.recoveredSubmission) clearAttachments();
-            history.replaceState(null, "", `${location.pathname}#chat=${conversationKey}`);
             setConversationReadyState(conversation);
             if (window.matchMedia("(max-width: 820px)").matches) closeSidebar();
         } catch (error) {
+            if (error?.name === "AbortError") return;
+            if (error?.code === "cloud_history_unresolved" && state.selectedConversation) {
+                showUnresolvedRecovery();
+                showToast("Cloud history needs a recovery decision", true);
+                return;
+            }
             state.selectedConversation = null;
             state.reconciliationRequired = true;
-            showConversationPlaceholder(item, "Refresh required");
+            showConversationPlaceholder(
+                item,
+                "Refresh required",
+                "error",
+                "The cloud turn may still be active. Retry performs a read-only reconciliation first.",
+            );
             setTurnState("Refresh required", true);
             showToast(error?.message || "Could not open conversation", true);
         } finally {
+            if (state.openController === openController) state.openController = null;
             setBusy(false);
             updateComposerState();
         }
@@ -1165,10 +1436,10 @@
         const prompt = ui.input.value.trim();
         if (!prompt || !state.selectedKey || state.sending || state.reconciliationRequired) return;
 
-        const mode = MODES[ui.mode.value] || MODES.thinking;
+        const mode = MODES[state.mode] || MODES.thinking;
         const selectedKey = state.selectedKey;
         const outgoingAttachments = state.attachments.slice();
-        const userMessage = createMessage("user", prompt, {images: outgoingAttachments});
+        const userMessage = createMessage("user", prompt, {images: outgoingAttachments, fresh: true});
         let activeAssistant = null;
         let activeStreamText = null;
         let activeSegmentText = "";
@@ -1241,6 +1512,14 @@
         state.controller = new AbortController();
         let activityController = null;
         let activityPoll = null;
+        const stopActivityPolling = async () => {
+            const controller = activityController;
+            const poll = activityPoll;
+            activityController = null;
+            activityPoll = null;
+            controller?.abort();
+            if (poll) await poll;
+        };
         setSending(true);
         setTurnState("Submitting once…", false, true);
 
@@ -1326,6 +1605,7 @@
                     throw new Error(payload.error || "ChatGPT rejected the cloud turn");
                 }
             });
+            await stopActivityPolling();
 
             finishAssistantSegment();
             finishActiveActivity(true);
@@ -1340,6 +1620,7 @@
             clearAttachments();
             setConversationReadyState(payload.conversation);
         } catch (error) {
+            await stopActivityPolling();
             finishAssistantSegment();
             finishActiveActivity(!streamedText && !lastActivityText);
             state.reconciliationRequired = true;
@@ -1376,17 +1657,21 @@
                 setConversationReadyState(payload.conversation);
             } catch (recoveryError) {
                 state.reconciliationRequired = true;
-                setTurnState("Refresh required", true);
-                showToast(
-                    aborted
-                        ? "Turn stopped locally; refresh before sending again"
-                        : (recoveryError?.message || error?.message || "Cloud turn failed"),
-                    true,
-                );
+                if (recoveryError?.code === "cloud_history_unresolved") {
+                    showUnresolvedRecovery();
+                    showToast("Cloud history needs a recovery decision", true);
+                } else {
+                    setTurnState("Refresh required", true);
+                    showToast(
+                        aborted
+                            ? "Turn stopped locally; refresh before sending again"
+                            : (recoveryError?.message || error?.message || "Cloud turn failed"),
+                        true,
+                    );
+                }
             }
         } finally {
-            activityController?.abort();
-            if (activityPoll) await activityPoll;
+            await stopActivityPolling();
             state.controller = null;
             setSending(false);
         }
@@ -1398,6 +1683,86 @@
         updateComposerState();
     };
 
+    const cancelConversationLoad = () => {
+        if (!state.openController) return;
+        state.openController.abort();
+        clearView();
+        showToast("Cloud conversation loading stopped");
+    };
+
+    const retryConversationLoad = () => {
+        if (!state.selectedKey || state.busy || state.sending) return;
+        state.reconciliationRequired = false;
+        openConversation(state.selectedKey);
+    };
+
+    const openCurrentConversationInChatGPT = () => {
+        if (!state.projectKey || !state.selectedKey) return;
+        const url = `/advisor-api/projects/${encodeURIComponent(state.projectKey)}`
+            + `/conversations/${encodeURIComponent(state.selectedKey)}/open-chatgpt`;
+        window.open(url, "_blank", "noopener,noreferrer");
+    };
+
+    const adoptCurrentCloudBranch = async () => {
+        if (!state.projectKey || !state.selectedKey || state.busy || state.sending) return;
+        const projectKey = state.projectKey;
+        const conversationKey = state.selectedKey;
+        const recoveryToken = currentRecoveryToken();
+        if (!recoveryToken) {
+            showToast("Recovery state changed; refresh this conversation", true);
+            return;
+        }
+        let recoveryStateChanged = false;
+        setBusy(true);
+        setTurnState("Adopting current cloud branch…", false, true);
+        try {
+            const payload = await requestJson(
+                `/advisor-api/projects/${encodeURIComponent(projectKey)}`
+                + `/conversations/${encodeURIComponent(conversationKey)}/adopt-current`,
+                {
+                    method: "POST",
+                    headers: {"Content-Type": "application/json", "X-Advisor-Cloud": "1"},
+                    body: JSON.stringify({
+                        acknowledge: "do_not_resend",
+                        recovery_token: recoveryToken,
+                        resolution: "adopt_current_branch",
+                    }),
+                },
+            );
+            const conversation = payload.conversation;
+            if (!conversation?.id || !Array.isArray(conversation.items)) {
+                throw new Error("The recovered cloud conversation returned an invalid response");
+            }
+            if (state.projectKey !== projectKey || state.selectedKey !== conversationKey) return;
+            state.selectedConversation = conversation;
+            state.reconciliationRequired = false;
+            markConversationReconciled(conversationKey);
+            renderTranscript(conversation);
+            setConversationReadyState(conversation);
+            showToast("Current ChatGPT branch adopted; no prompt was resent");
+            ui.input.focus({preventScroll: true});
+        } catch (error) {
+            state.reconciliationRequired = true;
+            if (error?.code === "recovery_state_changed") {
+                recoveryStateChanged = true;
+                hideRecoveryState();
+                showToast("Recovery state changed; refreshing the conversation", true);
+            } else {
+                showUnresolvedRecovery();
+                showToast(error?.message || "Could not adopt the current cloud branch", true);
+            }
+        } finally {
+            setBusy(false);
+            updateComposerState();
+        }
+        if (recoveryStateChanged
+                && state.projectKey === projectKey
+                && state.selectedKey === conversationKey) {
+            state.reconciliationRequired = false;
+            await openConversation(conversationKey);
+        }
+    };
+
     ui.projectSelect.addEventListener("change", () => {
         if (state.sending) return;
         state.projectKey = ui.projectSelect.value;
@@ -1406,6 +1771,17 @@
         refreshProject();
     });
     ui.search.addEventListener("input", renderConversationList);
+    ui.modeOptions.forEach((button) => {
+        button.addEventListener("click", () => {
+            if (state.sending || !MODES[button.dataset.mode]) return;
+            state.mode = button.dataset.mode;
+            ui.modeOptions.forEach((option) => {
+                const active = option.dataset.mode === state.mode;
+                option.classList.toggle("active", active);
+                option.setAttribute("aria-pressed", String(active));
+            });
+        });
+    });
     ui.refresh.addEventListener("click", async () => {
         if (state.selectedKey && state.reconciliationRequired) {
             const selected = state.selectedKey;
@@ -1416,6 +1792,20 @@
         }
     });
     ui.clearView.addEventListener("click", clearView);
+    ui.cancelLoad.addEventListener("click", cancelConversationLoad);
+    ui.retryLoad.addEventListener("click", retryConversationLoad);
+    ui.recheckRecovery.addEventListener("click", retryConversationLoad);
+    ui.openCloudChat.addEventListener("click", openCurrentConversationInChatGPT);
+    ui.adoptCurrentBranch.addEventListener("click", () => {
+        if (!state.recoveryUnresolved || state.busy || state.sending) return;
+        ui.recoveryDialog.showModal();
+        ui.cancelAdopt.focus({preventScroll: true});
+    });
+    ui.cancelAdopt.addEventListener("click", () => ui.recoveryDialog.close());
+    ui.confirmAdopt.addEventListener("click", () => {
+        ui.recoveryDialog.close();
+        adoptCurrentCloudBranch();
+    });
     ui.sidebarOpen.addEventListener("click", openSidebar);
     ui.sidebarClose.addEventListener("click", closeSidebar);
     ui.sidebarBackdrop.addEventListener("click", closeSidebar);
@@ -1452,10 +1842,25 @@
             submitMessage();
         }
     });
-    ui.stop.addEventListener("click", () => state.controller?.abort());
+    ui.transcript.addEventListener("scroll", () => {
+        state.followLatest = transcriptNearLatest();
+        updateLatestControl();
+    }, {passive: true});
+    ui.jumpLatest.addEventListener("click", () => scrollTranscript(true));
+    ui.stop.addEventListener("click", () => {
+        if (state.sending) {
+            state.controller?.abort();
+        } else {
+            cancelConversationLoad();
+        }
+    });
     document.addEventListener("keydown", (event) => {
-        if (event.key === "Escape" && document.body.classList.contains("sidebar-visible")) {
-            closeSidebar();
+        if (event.key === "Escape") {
+            if (state.openController) {
+                cancelConversationLoad();
+            } else if (document.body.classList.contains("sidebar-visible")) {
+                closeSidebar();
+            }
         }
     });
     window.addEventListener("pagehide", () => {
