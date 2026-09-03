@@ -767,6 +767,33 @@ def test_process_identity_uncertainty_fails_closed() -> None:
         concurrency.process_identity = original
 
 
+def test_process_alive_probe_cannot_terminate_caller() -> None:
+    probe = "\n".join(
+        (
+            "import json, os, sys",
+            f"sys.path.insert(0, {str(SCRIPTS)!r})",
+            "import advisor_concurrency as concurrency",
+            "alive = concurrency.process_alive(os.getpid())",
+            "print(json.dumps({'alive': alive, 'survived': True}), flush=True)",
+        )
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", probe],
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=False,
+    )
+    if result.returncode != 0:
+        raise AssertionError(
+            "the process-liveness probe terminated its caller: "
+            f"returncode={result.returncode}, stderr={result.stderr!r}"
+        )
+    payload = json.loads(result.stdout)
+    if payload != {"alive": True, "survived": True}:
+        raise AssertionError(f"unexpected process-liveness result: {payload!r}")
+
+
 def test_recorded_transient_log_cleanup(root: Path) -> None:
     runtime = root / "transient-log-cleanup-runtime"
     previous_runtime = os.environ.get("ADVISOR_RUNTIME_DIR")
@@ -1426,6 +1453,7 @@ def main() -> int:
         test_pool_helpers()
         test_loopback_transport_is_proxy_free_and_rejects_redirects()
         test_process_identity_uncertainty_fails_closed()
+        test_process_alive_probe_cannot_terminate_caller()
         test_recorded_transient_log_cleanup(root)
         test_cancelled_transient_start_does_not_leak_worker(root)
         test_exited_transient_worker_removes_log_after_request_race(root)

@@ -501,6 +501,28 @@ class AdvisorGuiTest(unittest.TestCase):
         catalog.clear_submission_after_refresh(project_key, conversation_key, self.auth)
         self.assertFalse(catalog.submission_pending(project_key, conversation_key, self.auth))
 
+    def test_submission_journal_opens_fsync_target_writable(self) -> None:
+        project_key, conversation_key = self.register()
+        real_open = Path.open
+        fsync_modes: list[str] = []
+
+        def tracked_open(path: Path, mode: str = "r", *args: object, **kwargs: object):
+            if path == catalog.catalog_path():
+                fsync_modes.append(mode)
+            return real_open(path, mode, *args, **kwargs)
+
+        with mock.patch.object(Path, "open", tracked_open):
+            catalog.begin_submission(
+                project_key,
+                conversation_key,
+                self.auth,
+                "nonce-one",
+                prompt_sha256=prompt_sha256(),
+            )
+
+        self.assertIn("r+b", fsync_modes)
+        self.assertTrue(catalog.submission_pending(project_key, conversation_key, self.auth))
+
     def test_provider_finish_preserves_journal_until_remote_status_is_complete(self) -> None:
         project_key, conversation_key = self.register()
         catalog.update_remote_state(

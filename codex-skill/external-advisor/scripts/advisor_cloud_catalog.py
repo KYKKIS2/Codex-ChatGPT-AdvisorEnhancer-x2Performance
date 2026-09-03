@@ -92,7 +92,10 @@ def _durably_save_submission_unlocked(data: dict[str, Any]) -> None:
     _save_unlocked(data)
     path = catalog_path()
     try:
-        with path.open("rb") as handle:
+        # Windows CPython maps fsync() to _commit(), which rejects a read-only
+        # descriptor with EBADF. Open the already-written journal without
+        # truncation but with write access for cross-platform behavior.
+        with path.open("r+b") as handle:
             os.fsync(handle.fileno())
         if os.name == "posix":
             flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)

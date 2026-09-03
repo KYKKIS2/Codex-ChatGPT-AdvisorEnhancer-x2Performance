@@ -221,14 +221,62 @@ def process_state(pid: int) -> str:
         return ""
 
 
+def windows_process_alive(pid: int) -> bool:
+    """Query Windows process state without using os.kill(pid, 0).
+
+    Unlike POSIX, Windows may implement os.kill with TerminateProcess.  A
+    liveness probe must therefore use a read-only process handle.
+    """
+    if pid <= 0 or os.name != "nt":
+        return False
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        process_query_limited_information = 0x1000
+        still_active = 259
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        kernel32.OpenProcess.restype = wintypes.HANDLE
+        kernel32.GetExitCodeProcess.argtypes = [
+            wintypes.HANDLE,
+            ctypes.POINTER(wintypes.DWORD),
+        ]
+        kernel32.GetExitCodeProcess.restype = wintypes.BOOL
+        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+        kernel32.CloseHandle.restype = wintypes.BOOL
+        handle = kernel32.OpenProcess(
+            process_query_limited_information,
+            False,
+            pid,
+        )
+        if not handle:
+            return False
+        exit_code = wintypes.DWORD()
+        try:
+            return bool(kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code))) and (
+                exit_code.value == still_active
+            )
+        finally:
+            kernel32.CloseHandle(handle)
+    except (AttributeError, OSError, ValueError):
+        return False
+
+
 def process_alive(pid: int, expected_identity: str = "") -> bool:
     if pid <= 0:
         return False
-    try:
-        os.kill(pid, 0)
-    except (ProcessLookupError, OSError):
-        return False
-    if process_state(pid) == "Z":
+    if os.name == "nt":
+        if not windows_process_alive(pid):
+            return False
+    elif os.name == "posix":
+        try:
+            os.kill(pid, 0)
+        except (ProcessLookupError, OSError):
+            return False
+        if process_state(pid) == "Z":
+            return False
+    else:
         return False
     if expected_identity:
         current = process_identity(pid)
